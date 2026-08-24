@@ -17,9 +17,7 @@ message PathManifestEntry {
   repeated string references = 4;
   // Standard nix narinfo signatures for backward compatibility.
   repeated string signatures = 5;
-  // Certificate-based signatures (one per signing service for threshold policies).
-  repeated CertSignature cert_signatures = 15;
-  // Deprecated: single cert signature (kept for wire compat, use cert_signatures).
+  // Certificate-based signature (optional, alongside standard sigs).
   CertSignature cert_signature = 6;
   // Content-addressed hash (if applicable).
   string ca = 7;
@@ -28,12 +26,6 @@ message PathManifestEntry {
   Compression compression = 9;
   string file_hash = 10;
   uint64 file_size = 11;
-  // Delta transfer: store path hash of the base NAR (empty if no delta).
-  string delta_base_hash = 12;
-  // Relative URL to download the delta.
-  string delta_url = 13;
-  // Size of the delta in bytes.
-  uint64 delta_size = 14;
 }
 
 message DownloadPlan {

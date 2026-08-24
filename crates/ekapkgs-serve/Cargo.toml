@@ -11,8 +11,6 @@ path = "src/main.rs"
 ekapkgs-protocol.workspace = true
 ekapkgs-nix.workspace = true
 ekapkgs-ui.workspace = true
-tonic.workspace = true
-prost.workspace = true
 clap.workspace = true
 clap-verbosity-flag.workspace = true
 color-eyre.workspace = true
@@ -20,36 +18,11 @@ tracing.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
-tokio-stream.workspace = true
 axum.workspace = true
 tower.workspace = true
 tower-http.workspace = true
 toml.workspace = true
 ed25519-dalek.workspace = true
-getrandom.workspace = true
-subtle.workspace = true
 data-encoding.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
-rusqlite = { version = "0.32", features = ["bundled"] }
-blake3.workspace = true
-fastcdc.workspace = true
-zstd.workspace = true
-prometheus.workspace = true
-
-[features]
-s3 = ["dep:aws-sdk-s3", "dep:aws-config"]
-
-[dependencies.aws-sdk-s3]
-workspace = true
-optional = true
-
-[dependencies.aws-config]
-workspace = true
-optional = true
-
-[dev-dependencies]
-tempfile.workspace = true
-
-[lints]
-workspace = true
