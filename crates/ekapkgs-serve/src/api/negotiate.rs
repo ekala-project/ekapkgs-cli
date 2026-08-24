@@ -69,14 +69,14 @@ impl CacheService for NegotiateService {
                         file_hash: ni.file_hash,
                         file_size: ni.file_size,
                     });
-                }
+                },
                 Ok(None) => {
                     unavailable.push(hash.clone());
-                }
+                },
                 Err(e) => {
                     tracing::warn!("Failed to query narinfo for {hash}: {e}");
                     unavailable.push(hash.clone());
-                }
+                },
             }
         }
 
@@ -99,7 +99,12 @@ impl CacheService for NegotiateService {
         // Record accesses for GC tracking.
         if let Some(ref tracker) = self.state.gc_tracker {
             for entry in &available {
-                if let Some(hash) = entry.store_path.rsplit('/').next().and_then(|b| b.split('-').next()) {
+                if let Some(hash) = entry
+                    .store_path
+                    .rsplit('/')
+                    .next()
+                    .and_then(|b| b.split('-').next())
+                {
                     tracker.record_access(hash);
                 }
             }

@@ -56,8 +56,7 @@ pub fn init(verbosity: &clap_verbosity_flag::Verbosity) {
         EnvFilter::new(level.unwrap_or("info"))
     });
 
-    let fmt_layer = tracing_subscriber::fmt::layer()
-        .event_format(PrefixFormatter);
+    let fmt_layer = tracing_subscriber::fmt::layer().event_format(PrefixFormatter);
 
     tracing_subscriber::registry()
         .with(filter)

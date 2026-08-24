@@ -65,10 +65,9 @@ pub fn init(cache_root: &Path, config: GcConfig) -> color_eyre::Result<Arc<GcTra
     let scan_db = db_path;
     let scan_root = cache_root.to_path_buf();
     tokio::spawn(async move {
-        if let Err(e) =
-            tokio::task::spawn_blocking(move || initial_scan(&scan_db, &scan_root))
-                .await
-                .unwrap_or_else(|e| Err(color_eyre::eyre::eyre!("join error: {e}")))
+        if let Err(e) = tokio::task::spawn_blocking(move || initial_scan(&scan_db, &scan_root))
+            .await
+            .unwrap_or_else(|e| Err(color_eyre::eyre::eyre!("join error: {e}")))
         {
             tracing::error!("GC initial scan failed: {e}");
         }
@@ -166,7 +165,7 @@ fn flush_accesses(db_path: &Path, hashes: &[String]) {
         Err(e) => {
             tracing::warn!("GC flush: failed to open db: {e}");
             return;
-        }
+        },
     };
 
     let now = now_unix();
@@ -366,7 +365,10 @@ fn run_gc(
         [],
         |row| row.get(0),
     )?;
-    tracing::info!("GC complete: cache is now {}", format_bytes(remaining as u64));
+    tracing::info!(
+        "GC complete: cache is now {}",
+        format_bytes(remaining as u64)
+    );
 
     Ok(())
 }
@@ -414,9 +416,7 @@ fn initial_scan(db_path: &Path, cache_root: &Path) -> color_eyre::Result<()> {
 
         let narinfo_size = narinfo_text.len() as u64;
         let nar_path = cache_root.join(&narinfo.url);
-        let file_size = std::fs::metadata(&nar_path)
-            .map(|m| m.len())
-            .unwrap_or(0);
+        let file_size = std::fs::metadata(&nar_path).map(|m| m.len()).unwrap_or(0);
 
         tx.execute(
             "INSERT OR IGNORE INTO store_paths (hash, store_path, nar_url, file_size, narinfo_size, last_access, added_at)

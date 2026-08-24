@@ -33,11 +33,7 @@ impl NarInfo {
             let refs: Vec<&str> = self
                 .references
                 .iter()
-                .map(|r| {
-                    r.rsplit('/')
-                        .next()
-                        .unwrap_or(r.as_str())
-                })
+                .map(|r| r.rsplit('/').next().unwrap_or(r.as_str()))
                 .collect();
             s.push_str(&format!("References: {}\n", refs.join(" ")));
         }
@@ -79,11 +75,11 @@ impl NarInfo {
                 "NarSize" => nar_size = Some(value.parse().ok()?),
                 "References" => {
                     references = value.split_whitespace().map(String::from).collect();
-                }
+                },
                 "Deriver" => deriver = Some(value.to_string()),
                 "Sig" => signatures.push(value.to_string()),
                 "CA" => ca = Some(value.to_string()),
-                _ => {}
+                _ => {},
             }
         }
 
@@ -216,7 +212,9 @@ NarSize: 100
     #[test]
     fn parse_narinfo_missing_required_fields() {
         assert!(NarInfo::parse("URL: nar/x.nar\nNarHash: sha256:abc\nNarSize: 1\n").is_none());
-        assert!(NarInfo::parse("StorePath: /nix/store/x\nNarHash: sha256:abc\nNarSize: 1\n").is_none());
+        assert!(
+            NarInfo::parse("StorePath: /nix/store/x\nNarHash: sha256:abc\nNarSize: 1\n").is_none()
+        );
     }
 
     #[test]

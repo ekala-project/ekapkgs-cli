@@ -79,7 +79,7 @@ pub async fn download_and_import(
                 Ok(_hash) => bar.inc(1),
                 Err(e) => {
                     tracing::warn!("Download failed: {e}");
-                }
+                },
             }
         }
     }
@@ -105,9 +105,7 @@ pub async fn download_and_import(
         .collect();
 
     for entry in unplanned {
-        if let Err(e) =
-            download_single(&http_client, base_url, entry, staging_dir.path()).await
-        {
+        if let Err(e) = download_single(&http_client, base_url, entry, staging_dir.path()).await {
             tracing::warn!("Download failed for {}: {e}", entry.store_path);
         } else {
             bar.inc(1);
@@ -162,12 +160,7 @@ async fn download_single(
     let refs: Vec<String> = entry
         .references
         .iter()
-        .map(|r| {
-            r.rsplit('/')
-                .next()
-                .unwrap_or(r.as_str())
-                .to_string()
-        })
+        .map(|r| r.rsplit('/').next().unwrap_or(r.as_str()).to_string())
         .collect();
 
     let compression = match entry.compression {

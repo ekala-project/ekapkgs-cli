@@ -9,9 +9,17 @@ pub enum CertError {
     #[error("issuer '{issuer}' not in trusted roots")]
     UntrustedIssuer { issuer: String },
     #[error("certificate '{name}' has expired (not_after={not_after}, now={now})")]
-    Expired { name: String, not_after: u64, now: u64 },
+    Expired {
+        name: String,
+        not_after: u64,
+        now: u64,
+    },
     #[error("certificate '{name}' is not yet valid (not_before={not_before}, now={now})")]
-    NotYetValid { name: String, not_before: u64, now: u64 },
+    NotYetValid {
+        name: String,
+        not_before: u64,
+        now: u64,
+    },
     #[error("invalid issuer signature on certificate '{name}'")]
     InvalidIssuerSignature { name: String },
     #[error("invalid path signature: {0}")]
@@ -47,10 +55,7 @@ pub fn verify_chain(
     trusted_roots: &[TrustedRoot],
     now_unix: u64,
 ) -> Result<VerifyingKey, CertError> {
-    let cert = chain
-        .signing_cert
-        .as_ref()
-        .ok_or(CertError::MissingCert)?;
+    let cert = chain.signing_cert.as_ref().ok_or(CertError::MissingCert)?;
 
     // Find the trusted root that matches the issuer.
     let root = trusted_roots
@@ -78,30 +83,30 @@ pub fn verify_chain(
 
     // Verify issuer signature.
     let payload = certificate_sign_payload(cert);
-    let sig_bytes: [u8; 64] = cert
-        .issuer_signature
-        .as_slice()
-        .try_into()
-        .map_err(|_| CertError::InvalidKeyLength {
-            expected: 64,
-            got: cert.issuer_signature.len(),
-        })?;
+    let sig_bytes: [u8; 64] =
+        cert.issuer_signature
+            .as_slice()
+            .try_into()
+            .map_err(|_| CertError::InvalidKeyLength {
+                expected: 64,
+                got: cert.issuer_signature.len(),
+            })?;
     let signature = Signature::from_bytes(&sig_bytes);
-    root.public_key
-        .verify(&payload, &signature)
-        .map_err(|_| CertError::InvalidIssuerSignature {
+    root.public_key.verify(&payload, &signature).map_err(|_| {
+        CertError::InvalidIssuerSignature {
             name: cert.name.clone(),
-        })?;
+        }
+    })?;
 
     // Extract the cert's public key for verifying individual path signatures.
-    let key_bytes: [u8; 32] = cert
-        .public_key
-        .as_slice()
-        .try_into()
-        .map_err(|_| CertError::InvalidKeyLength {
-            expected: 32,
-            got: cert.public_key.len(),
-        })?;
+    let key_bytes: [u8; 32] =
+        cert.public_key
+            .as_slice()
+            .try_into()
+            .map_err(|_| CertError::InvalidKeyLength {
+                expected: 32,
+                got: cert.public_key.len(),
+            })?;
     let verifying_key = VerifyingKey::from_bytes(&key_bytes)?;
 
     Ok(verifying_key)
@@ -113,14 +118,15 @@ pub fn verify_path_signature(
     fingerprint: &str,
     cert_sig: &CertSignature,
 ) -> Result<(), CertError> {
-    let sig_bytes: [u8; 64] = cert_sig
-        .signature
-        .as_slice()
-        .try_into()
-        .map_err(|_| CertError::InvalidKeyLength {
-            expected: 64,
-            got: cert_sig.signature.len(),
-        })?;
+    let sig_bytes: [u8; 64] =
+        cert_sig
+            .signature
+            .as_slice()
+            .try_into()
+            .map_err(|_| CertError::InvalidKeyLength {
+                expected: 64,
+                got: cert_sig.signature.len(),
+            })?;
     let signature = Signature::from_bytes(&sig_bytes);
     verifying_key
         .verify(fingerprint.as_bytes(), &signature)
@@ -273,7 +279,10 @@ mod tests {
         }];
 
         let result = verify_chain(&chain, &roots, 1500);
-        assert!(matches!(result, Err(CertError::InvalidIssuerSignature { .. })));
+        assert!(matches!(
+            result,
+            Err(CertError::InvalidIssuerSignature { .. })
+        ));
     }
 
     #[test]

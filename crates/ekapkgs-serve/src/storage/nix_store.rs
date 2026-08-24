@@ -42,7 +42,7 @@ impl NixStoreBackend {
                 // nix path-info --json returns an array of path info objects
                 let infos: Vec<NixPathInfo> = serde_json::from_str(&stdout)?;
                 Ok(infos.into_iter().next().map(|i| i.path))
-            }
+            },
             Err(ekapkgs_nix::NixError::Failed { .. }) => Ok(None),
             Err(e) => Err(e.into()),
         }
@@ -58,7 +58,7 @@ impl NixStoreBackend {
                 let stdout = String::from_utf8_lossy(&output.stdout);
                 let infos: Vec<NixPathInfo> = serde_json::from_str(&stdout)?;
                 Ok(infos.into_iter().next())
-            }
+            },
             Err(ekapkgs_nix::NixError::Failed { .. }) => Ok(None),
             Err(e) => Err(e.into()),
         }

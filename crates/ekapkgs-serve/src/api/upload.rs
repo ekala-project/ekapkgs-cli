@@ -14,7 +14,7 @@ fn check_auth(state: &AppState, headers: &HeaderMap) -> Result<(), Response> {
         _ => {
             // No auth configured — reject all writes.
             return Err((StatusCode::FORBIDDEN, "push not enabled").into_response());
-        }
+        },
     };
 
     let auth = headers
@@ -62,7 +62,7 @@ pub async fn put_narinfo(
                 ni.signatures.push(sig);
             }
             ni
-        }
+        },
         None => return (StatusCode::BAD_REQUEST, "invalid narinfo").into_response(),
     };
 
@@ -76,12 +76,12 @@ pub async fn put_narinfo(
             }
             tracing::debug!("Stored narinfo for {hash}");
             (StatusCode::OK, "ok").into_response()
-        }
+        },
         Ok(false) => (StatusCode::METHOD_NOT_ALLOWED, "read-only backend").into_response(),
         Err(e) => {
             tracing::error!("Failed to store narinfo: {e}");
             (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
-        }
+        },
     }
 }
 
@@ -106,11 +106,11 @@ pub async fn put_nar(
             }
             tracing::debug!("Stored NAR {file}");
             (StatusCode::OK, "ok").into_response()
-        }
+        },
         Ok(false) => (StatusCode::METHOD_NOT_ALLOWED, "read-only backend").into_response(),
         Err(e) => {
             tracing::error!("Failed to store NAR: {e}");
             (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
-        }
+        },
     }
 }

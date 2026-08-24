@@ -31,7 +31,7 @@ fn cmd_push(paths: &[String], cache_url: Option<&str>) -> color_eyre::Result<()>
                 )
             })?;
             cache.url.clone()
-        }
+        },
     };
 
     let token = config.push_token(&server_url);
@@ -57,9 +57,7 @@ fn cmd_push(paths: &[String], cache_url: Option<&str>) -> color_eyre::Result<()>
                 let base = base_url.to_string();
                 let token = token.clone();
                 let path = path.clone();
-                async move {
-                    push_single_path(&client, &base, token.as_deref(), &path).await
-                }
+                async move { push_single_path(&client, &base, token.as_deref(), &path).await }
             })
             .buffer_unordered(8)
             .collect::<Vec<_>>()
@@ -74,16 +72,16 @@ fn cmd_push(paths: &[String], cache_url: Option<&str>) -> color_eyre::Result<()>
                 Ok(PushResult::Uploaded) => {
                     success += 1;
                     bar.inc(1);
-                }
+                },
                 Ok(PushResult::AlreadyExists) => {
                     skipped += 1;
                     bar.inc(1);
-                }
+                },
                 Err(e) => {
                     tracing::warn!("Push failed: {e}");
                     failed += 1;
                     bar.inc(1);
-                }
+                },
             }
         }
 
@@ -200,7 +198,9 @@ async fn push_single_path(
     if !resp.status().is_success() {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
-        return Err(color_eyre::eyre::eyre!("NAR upload failed: {status} {body}"));
+        return Err(color_eyre::eyre::eyre!(
+            "NAR upload failed: {status} {body}"
+        ));
     }
 
     let narinfo_url = format!("{base_url}/{hash}.narinfo");
@@ -253,10 +253,9 @@ fn resolve_store_paths(inputs: &[String]) -> color_eyre::Result<Vec<String>> {
 
             for build in outputs {
                 for out_path in build.outputs.values() {
-                    let closure_output =
-                        NixCommand::new(&["path-info", "--recursive", "--json"])
-                            .arg(out_path)
-                            .output()?;
+                    let closure_output = NixCommand::new(&["path-info", "--recursive", "--json"])
+                        .arg(out_path)
+                        .output()?;
                     let closure_str = String::from_utf8_lossy(&closure_output.stdout);
 
                     #[derive(serde::Deserialize)]
@@ -289,7 +288,7 @@ fn cmd_pull(paths: &[String], cache_url: Option<&str>) -> color_eyre::Result<()>
                 )
             })?;
             cache.url.clone()
-        }
+        },
     };
 
     // Resolve all inputs to closure paths and partition.
@@ -328,8 +327,7 @@ fn cmd_pull(paths: &[String], cache_url: Option<&str>) -> color_eyre::Result<()>
     rt.block_on(async {
         let spinner = ekapkgs_ui::progress::spinner("Negotiating with cache...");
 
-        let response =
-            crate::negotiate::negotiate(&server_url, want_hashes, have_hashes).await?;
+        let response = crate::negotiate::negotiate(&server_url, want_hashes, have_hashes).await?;
 
         spinner.finish_and_clear();
 
@@ -381,7 +379,7 @@ fn cmd_auth(command: AuthCommand) -> color_eyre::Result<()> {
             save_config(&config)?;
             tracing::info!("Token saved for {cache}");
             Ok(())
-        }
+        },
 
         AuthCommand::Logout { cache } => {
             let mut config = ClientConfig::load()?;
@@ -395,7 +393,7 @@ fn cmd_auth(command: AuthCommand) -> color_eyre::Result<()> {
             }
 
             Ok(())
-        }
+        },
 
         AuthCommand::Status => {
             let config = ClientConfig::load()?;
@@ -422,7 +420,7 @@ fn cmd_auth(command: AuthCommand) -> color_eyre::Result<()> {
             }
 
             Ok(())
-        }
+        },
     }
 }
 

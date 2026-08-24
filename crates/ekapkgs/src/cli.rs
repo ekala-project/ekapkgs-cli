@@ -1,7 +1,10 @@
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(name = "ekapkgs", about = "Nix CLI wrapper with negotiated binary cache")]
+#[command(
+    name = "ekapkgs",
+    about = "Nix CLI wrapper with negotiated binary cache"
+)]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Command,

@@ -50,11 +50,7 @@ impl TokenStore {
 
     /// Create a new token with the given name and permissions.
     /// Returns the generated token value.
-    pub fn create(
-        &mut self,
-        name: &str,
-        permissions: Permissions,
-    ) -> color_eyre::Result<String> {
+    pub fn create(&mut self, name: &str, permissions: Permissions) -> color_eyre::Result<String> {
         // Check for duplicate names.
         if self.tokens.iter().any(|t| t.name == name) {
             return Err(color_eyre::eyre::eyre!(
@@ -115,14 +111,12 @@ fn generate_token() -> String {
     } else {
         // Fallback: use a less ideal but functional source.
         for (i, b) in bytes.iter_mut().enumerate() {
-            *b = (i as u8)
-                .wrapping_mul(0x9E)
-                .wrapping_add(
-                    SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .subsec_nanos() as u8,
-                );
+            *b = (i as u8).wrapping_mul(0x9E).wrapping_add(
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .subsec_nanos() as u8,
+            );
         }
     }
 
@@ -168,9 +162,21 @@ mod tests {
     fn duplicate_name_rejected() {
         let mut store = TokenStore::default();
         store
-            .create("dup", Permissions { read: true, write: false })
+            .create(
+                "dup",
+                Permissions {
+                    read: true,
+                    write: false,
+                },
+            )
             .unwrap();
-        let result = store.create("dup", Permissions { read: true, write: true });
+        let result = store.create(
+            "dup",
+            Permissions {
+                read: true,
+                write: true,
+            },
+        );
         assert!(result.is_err());
     }
 
@@ -178,7 +184,13 @@ mod tests {
     fn revoke_removes_token() {
         let mut store = TokenStore::default();
         let token = store
-            .create("temp", Permissions { read: true, write: true })
+            .create(
+                "temp",
+                Permissions {
+                    read: true,
+                    write: true,
+                },
+            )
             .unwrap();
 
         assert!(store.validate(&token).is_some());
@@ -196,10 +208,22 @@ mod tests {
     fn write_tokens_filters_correctly() {
         let mut store = TokenStore::default();
         store
-            .create("rw", Permissions { read: true, write: true })
+            .create(
+                "rw",
+                Permissions {
+                    read: true,
+                    write: true,
+                },
+            )
             .unwrap();
         store
-            .create("ro", Permissions { read: true, write: false })
+            .create(
+                "ro",
+                Permissions {
+                    read: true,
+                    write: false,
+                },
+            )
             .unwrap();
 
         let wt = store.write_tokens();
@@ -213,10 +237,22 @@ mod tests {
 
         let mut store = TokenStore::default();
         let tok1 = store
-            .create("a", Permissions { read: true, write: true })
+            .create(
+                "a",
+                Permissions {
+                    read: true,
+                    write: true,
+                },
+            )
             .unwrap();
         let tok2 = store
-            .create("b", Permissions { read: true, write: false })
+            .create(
+                "b",
+                Permissions {
+                    read: true,
+                    write: false,
+                },
+            )
             .unwrap();
         store.save(&path).unwrap();
 
@@ -240,7 +276,13 @@ mod tests {
         let mut tokens = std::collections::HashSet::new();
         for i in 0..50 {
             let t = store
-                .create(&format!("t{i}"), Permissions { read: true, write: true })
+                .create(
+                    &format!("t{i}"),
+                    Permissions {
+                        read: true,
+                        write: true,
+                    },
+                )
                 .unwrap();
             assert!(tokens.insert(t), "duplicate token generated");
         }

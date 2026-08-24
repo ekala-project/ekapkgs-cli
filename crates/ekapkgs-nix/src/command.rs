@@ -149,10 +149,7 @@ pub enum NixError {
     Spawn(#[source] std::io::Error),
 
     #[error("nix exited with {status}: {stderr}")]
-    Failed {
-        status: ExitStatus,
-        stderr: String,
-    },
+    Failed { status: ExitStatus, stderr: String },
 
     #[error("failed to parse nix JSON output: {source}\noutput: {output}")]
     Json {

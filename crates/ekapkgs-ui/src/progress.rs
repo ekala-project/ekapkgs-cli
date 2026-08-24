@@ -31,9 +31,7 @@ pub fn item_bar(total: u64, unit: &str) -> ProgressBar {
     let pb = ProgressBar::new(total);
     pb.set_style(
         ProgressStyle::default_bar()
-            .template(&format!(
-                "  [{{bar:30.cyan/dim}}] {{pos}}/{{len}} {unit}"
-            ))
+            .template(&format!("  [{{bar:30.cyan/dim}}] {{pos}}/{{len}} {unit}"))
             .expect("valid template")
             .progress_chars("██░"),
     );

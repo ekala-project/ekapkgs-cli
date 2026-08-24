@@ -57,12 +57,8 @@ pub fn execute(installable: &str, extra: &[String]) -> color_eyre::Result<()> {
             rt.block_on(async {
                 let spinner = ekapkgs_ui::progress::spinner("Negotiating with cache...");
 
-                let response = crate::negotiate::negotiate(
-                    &server_url,
-                    want_hashes,
-                    have_hashes,
-                )
-                .await?;
+                let response =
+                    crate::negotiate::negotiate(&server_url, want_hashes, have_hashes).await?;
 
                 spinner.finish_and_clear();
 

@@ -236,7 +236,10 @@ struct CertFile {
     issuer_signature: String,
 }
 
-fn cmd_token(command: TokenCommand, config_path: Option<&std::path::Path>) -> color_eyre::Result<()> {
+fn cmd_token(
+    command: TokenCommand,
+    config_path: Option<&std::path::Path>,
+) -> color_eyre::Result<()> {
     let store_path = tokens::default_store_path(config_path);
 
     match command {
@@ -253,10 +256,13 @@ fn cmd_token(command: TokenCommand, config_path: Option<&std::path::Path>) -> co
 
             // Print the token — this is the only time it's shown in full.
             println!("{token_value}");
-            tracing::info!("Token '{name}' created ({})", if read_only { "read-only" } else { "read+write" });
+            tracing::info!(
+                "Token '{name}' created ({})",
+                if read_only { "read-only" } else { "read+write" }
+            );
 
             Ok(())
-        }
+        },
 
         TokenCommand::List => {
             let store = tokens::TokenStore::load(&store_path)?;
@@ -281,7 +287,7 @@ fn cmd_token(command: TokenCommand, config_path: Option<&std::path::Path>) -> co
             }
 
             Ok(())
-        }
+        },
 
         TokenCommand::Revoke { name } => {
             let mut store = tokens::TokenStore::load(&store_path)?;
@@ -294,7 +300,7 @@ fn cmd_token(command: TokenCommand, config_path: Option<&std::path::Path>) -> co
             }
 
             Ok(())
-        }
+        },
     }
 }
 
@@ -351,11 +357,11 @@ async fn cmd_serve(cli: Cli) -> color_eyre::Result<()> {
                 };
                 gc_tracker = gc_t;
                 Box::new(storage::filesystem::FilesystemBackend::new(path))
-            }
+            },
             config::StorageConfig::NixStore => {
                 gc_tracker = None;
                 Box::new(storage::nix_store::NixStoreBackend::new())
-            }
+            },
         };
         // Load tokens: from token store + any legacy config tokens.
         let store_path = tokens::default_store_path(Some(config_path));
@@ -393,9 +399,9 @@ async fn cmd_serve(cli: Cli) -> color_eyre::Result<()> {
         storage_backend = if storage_str == "nix-store" {
             Box::new(storage::nix_store::NixStoreBackend::new())
         } else {
-            Box::new(storage::filesystem::FilesystemBackend::new(
-                PathBuf::from(storage_str),
-            ))
+            Box::new(storage::filesystem::FilesystemBackend::new(PathBuf::from(
+                storage_str,
+            )))
         };
     }
 
@@ -413,10 +419,8 @@ async fn cmd_serve(cli: Cli) -> color_eyre::Result<()> {
         state: Arc::clone(&state),
     });
 
-    let app = build_http_router(state).route_service(
-        "/ekapkgs.v1.CacheService/Negotiate",
-        grpc_service,
-    );
+    let app =
+        build_http_router(state).route_service("/ekapkgs.v1.CacheService/Negotiate", grpc_service);
 
     tracing::info!("Listening on {addr} (gRPC + HTTP)");
 

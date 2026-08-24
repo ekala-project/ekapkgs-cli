@@ -10,9 +10,7 @@ pub fn partition_local(paths: &[String]) -> Result<(Vec<String>, Vec<String>), N
     // Query all paths at once. nix path-info exits non-zero if any path
     // is missing, so we query individually for reliable partitioning.
     for path in paths {
-        let result = NixCommand::new(&["path-info"])
-            .arg(path)
-            .output();
+        let result = NixCommand::new(&["path-info"]).arg(path).output();
 
         match result {
             Ok(_) => have.push(path.clone()),

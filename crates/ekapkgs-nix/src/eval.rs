@@ -39,9 +39,7 @@ pub fn eval_build_outputs(installable: &Installable) -> Result<Vec<BuildOutput>,
 ///
 /// Calls `nix derivation show -r <installable>` and extracts all output
 /// store paths from the derivation graph.
-pub fn derivation_closure_paths(
-    installable: &Installable,
-) -> Result<Vec<String>, NixError> {
+pub fn derivation_closure_paths(installable: &Installable) -> Result<Vec<String>, NixError> {
     let derivations: std::collections::HashMap<String, DerivationInfo> =
         NixCommand::new(&["derivation", "show"])
             .arg("-r")
