@@ -17,3 +17,6 @@ rand = "0.8"
 [[test]]
 name = "integration"
 path = "src/integration.rs"
+
+[lints]
+workspace = true

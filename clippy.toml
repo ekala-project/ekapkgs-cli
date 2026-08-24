@@ -1,0 +1,19 @@
+# Clippy lint configuration.
+#
+# Lint *selection* lives in `Cargo.toml [workspace.lints.clippy]`; this file
+# tunes thresholds and behavior for individual lints.
+
+# Match the project's MSRV.
+msrv = "1.85.0"
+
+# Allow longer literals than the default (5) -- hashes, SQL fragments, etc.
+literal-representation-threshold = 8
+
+# Allow longer enum variant name overlap before warning.
+enum-variant-name-threshold = 4
+
+# Allow up to 8 args before too_many_arguments fires.
+too-many-arguments-threshold = 8
+
+# Allow large enum variants up to this size before warning.
+enum-variant-size-threshold = 400

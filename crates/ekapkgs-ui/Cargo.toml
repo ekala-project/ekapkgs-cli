@@ -11,3 +11,6 @@ indicatif.workspace = true
 yansi.workspace = true
 clap-verbosity-flag.workspace = true
 log = "0.4"
+
+[lints]
+workspace = true

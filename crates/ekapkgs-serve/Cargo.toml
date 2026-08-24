@@ -32,3 +32,6 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 
 [dev-dependencies]
 tempfile.workspace = true
+
+[lints]
+workspace = true
