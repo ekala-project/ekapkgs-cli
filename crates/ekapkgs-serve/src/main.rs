@@ -3,6 +3,7 @@ mod config;
 mod gc;
 mod signing;
 mod storage;
+mod tokens;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -58,6 +59,12 @@ enum Command {
         output: PathBuf,
     },
 
+    /// Manage API tokens for cache access.
+    Token {
+        #[command(subcommand)]
+        command: TokenCommand,
+    },
+
     /// Issue a signing certificate signed by a CA.
     IssueCert {
         /// Name for the certificate (e.g., "cache.example.org-2025").
@@ -77,18 +84,46 @@ enum Command {
     },
 }
 
+#[derive(Subcommand)]
+enum TokenCommand {
+    /// Create a new API token.
+    Create {
+        /// Human-readable name for the token (e.g., "ci-main", "jon-laptop").
+        name: String,
+        /// Create a read-only token (no push permission).
+        #[arg(long)]
+        read_only: bool,
+    },
+
+    /// List all tokens.
+    List,
+
+    /// Revoke a token by name.
+    Revoke {
+        /// Name of the token to revoke.
+        name: String,
+    },
+}
+
 pub struct AppState {
     pub storage: Box<dyn StorageBackend>,
     pub signer: NarInfoSigner,
     pub cert_signer: Option<signing::CertSigner>,
     pub gc_tracker: Option<Arc<gc::GcTracker>>,
+    pub write_tokens: Option<Vec<String>>,
 }
 
 fn build_http_router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/nix-cache-info", get(api::compat::nix_cache_info))
-        .route("/{hash_narinfo}", get(api::compat::get_narinfo))
-        .route("/nar/{file}", get(api::compat::get_nar))
+        .route(
+            "/{hash_narinfo}",
+            get(api::compat::get_narinfo).put(api::upload::put_narinfo),
+        )
+        .route(
+            "/nar/{file}",
+            get(api::compat::get_nar).put(api::upload::put_nar),
+        )
         .with_state(state)
 }
 
@@ -108,6 +143,7 @@ async fn main() -> color_eyre::Result<()> {
             days,
             output,
         } => cmd_issue_cert(&name, &ca_key, &ca_name, days, &output),
+        Command::Token { command } => cmd_token(command, cli.config.as_deref()),
         Command::Serve => cmd_serve(cli).await,
     }
 }
@@ -200,12 +236,87 @@ struct CertFile {
     issuer_signature: String,
 }
 
+fn cmd_token(command: TokenCommand, config_path: Option<&std::path::Path>) -> color_eyre::Result<()> {
+    let store_path = tokens::default_store_path(config_path);
+
+    match command {
+        TokenCommand::Create { name, read_only } => {
+            let mut store = tokens::TokenStore::load(&store_path)?;
+
+            let permissions = tokens::Permissions {
+                read: true,
+                write: !read_only,
+            };
+
+            let token_value = store.create(&name, permissions)?;
+            store.save(&store_path)?;
+
+            // Print the token — this is the only time it's shown in full.
+            println!("{token_value}");
+            tracing::info!("Token '{name}' created ({})", if read_only { "read-only" } else { "read+write" });
+
+            Ok(())
+        }
+
+        TokenCommand::List => {
+            let store = tokens::TokenStore::load(&store_path)?;
+
+            if store.tokens.is_empty() {
+                tracing::info!("No tokens configured");
+                return Ok(());
+            }
+
+            for token in &store.tokens {
+                let perms = if token.permissions.write {
+                    "read+write"
+                } else {
+                    "read-only"
+                };
+                let preview = &token.token[..std::cmp::min(12, token.token.len())];
+                tracing::info!(
+                    "{} — {perms} — {preview}... — created {}",
+                    token.name,
+                    format_timestamp(token.created_at),
+                );
+            }
+
+            Ok(())
+        }
+
+        TokenCommand::Revoke { name } => {
+            let mut store = tokens::TokenStore::load(&store_path)?;
+
+            if store.revoke(&name) {
+                store.save(&store_path)?;
+                tracing::info!("Token '{name}' revoked");
+            } else {
+                tracing::warn!("No token named '{name}' found");
+            }
+
+            Ok(())
+        }
+    }
+}
+
+fn format_timestamp(unix: u64) -> String {
+    // Simple ISO-ish date without pulling in chrono.
+    let secs_per_day = 86400u64;
+    let days_since_epoch = unix / secs_per_day;
+    // Approximate — good enough for display.
+    let year = 1970 + days_since_epoch / 365;
+    let remaining = days_since_epoch % 365;
+    let month = remaining / 30 + 1;
+    let day = remaining % 30 + 1;
+    format!("{year}-{month:02}-{day:02}")
+}
+
 async fn cmd_serve(cli: Cli) -> color_eyre::Result<()> {
     let bind_addr: String;
     let storage_backend: Box<dyn StorageBackend>;
     let signer: NarInfoSigner;
     let cert_signer: Option<signing::CertSigner>;
     let gc_tracker: Option<Arc<gc::GcTracker>>;
+    let write_tokens: Option<Vec<String>>;
 
     if let Some(config_path) = &cli.config {
         let config = Config::load(config_path)?;
@@ -246,6 +357,18 @@ async fn cmd_serve(cli: Cli) -> color_eyre::Result<()> {
                 Box::new(storage::nix_store::NixStoreBackend::new())
             }
         };
+        // Load tokens: from token store + any legacy config tokens.
+        let store_path = tokens::default_store_path(Some(config_path));
+        let token_store = tokens::TokenStore::load(&store_path)?;
+        let mut all_tokens = token_store.write_tokens();
+        if let Some(auth) = config.auth {
+            all_tokens.extend(auth.write_tokens);
+        }
+        write_tokens = if all_tokens.is_empty() {
+            None
+        } else {
+            Some(all_tokens)
+        };
     } else {
         bind_addr = cli.bind.unwrap_or_else(|| "0.0.0.0:8080".to_string());
 
@@ -255,6 +378,16 @@ async fn cmd_serve(cli: Cli) -> color_eyre::Result<()> {
         signer = NarInfoSigner::from_file(&signing_key)?;
         cert_signer = None;
         gc_tracker = None;
+
+        // Load tokens from default location.
+        let store_path = tokens::default_store_path(cli.config.as_deref());
+        let token_store = tokens::TokenStore::load(&store_path)?;
+        let all_tokens = token_store.write_tokens();
+        write_tokens = if all_tokens.is_empty() {
+            None
+        } else {
+            Some(all_tokens)
+        };
 
         let storage_str = cli.storage.unwrap_or_else(|| "nix-store".to_string());
         storage_backend = if storage_str == "nix-store" {
@@ -271,6 +404,7 @@ async fn cmd_serve(cli: Cli) -> color_eyre::Result<()> {
         signer,
         cert_signer,
         gc_tracker,
+        write_tokens,
     });
 
     let addr: SocketAddr = bind_addr.parse()?;

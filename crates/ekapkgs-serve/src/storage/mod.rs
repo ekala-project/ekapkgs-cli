@@ -133,4 +133,16 @@ pub trait StorageBackend: Send + Sync {
 
     /// Get a NAR file as bytes. Returns `(data, content_type)`.
     fn get_nar(&self, file_path: &str) -> color_eyre::Result<Option<Vec<u8>>>;
+
+    /// Store a narinfo. Returns false if the backend is read-only.
+    fn put_narinfo(&self, hash: &str, content: &str) -> color_eyre::Result<bool> {
+        let _ = (hash, content);
+        Ok(false)
+    }
+
+    /// Store a NAR file. Returns false if the backend is read-only.
+    fn put_nar(&self, file_path: &str, data: &[u8]) -> color_eyre::Result<bool> {
+        let _ = (file_path, data);
+        Ok(false)
+    }
 }

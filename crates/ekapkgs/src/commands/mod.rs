@@ -1,4 +1,5 @@
 mod build;
+mod cache;
 mod run;
 mod shell;
 
@@ -18,5 +19,6 @@ pub fn run(command: Command) -> color_eyre::Result<()> {
             installable,
             extra,
         } => shell::execute(&installable, &extra),
+        Command::Cache { command } => cache::execute(command),
     }
 }

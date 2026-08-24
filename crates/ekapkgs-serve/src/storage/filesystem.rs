@@ -44,4 +44,19 @@ impl StorageBackend for FilesystemBackend {
         }
         Ok(Some(std::fs::read(path)?))
     }
+
+    fn put_narinfo(&self, hash: &str, content: &str) -> color_eyre::Result<bool> {
+        let path = self.root.join(format!("{hash}.narinfo"));
+        std::fs::write(path, content)?;
+        Ok(true)
+    }
+
+    fn put_nar(&self, file_path: &str, data: &[u8]) -> color_eyre::Result<bool> {
+        let path = self.root.join(file_path);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(path, data)?;
+        Ok(true)
+    }
 }

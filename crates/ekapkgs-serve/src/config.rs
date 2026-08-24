@@ -6,6 +6,7 @@ pub struct Config {
     pub server: ServerConfig,
     pub storage: StorageConfig,
     pub signing: SigningConfig,
+    pub auth: Option<AuthConfig>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -55,6 +56,13 @@ pub struct GcRawConfig {
 
 fn default_gc_interval() -> u64 {
     300
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AuthConfig {
+    /// Bearer tokens that are allowed to push to the cache.
+    #[serde(default)]
+    pub write_tokens: Vec<String>,
 }
 
 impl Config {
