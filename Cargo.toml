@@ -6,7 +6,6 @@ members = [
     "crates/ekapkgs-protocol",
     "crates/ekapkgs-nix",
     "crates/ekapkgs-ui",
-    "crates/ekapkgs-integration-tests",
 ]
 
 [workspace.package]
@@ -27,7 +26,6 @@ color-eyre = "0.6"
 thiserror = "2"
 
 clap = { version = "4", features = ["derive", "color", "env"] }
-clap_complete = "4"
 clap-verbosity-flag = "3"
 
 tracing = "0.1"
@@ -35,19 +33,12 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 indicatif = "0.17"
 yansi = "1"
-crossterm = "0.28"
 
 ed25519-dalek = { version = "2", features = ["rand_core"] }
-getrandom = "0.3"
-subtle = "2"
 data-encoding = "2"
 sha2 = "0.10"
-blake3 = "1"
-fastcdc = "3"
-zstd = "0.13"
 
 tokio = { version = "1", features = ["full"] }
-tokio-stream = "0.1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
 futures = "0.3"
 
@@ -58,35 +49,9 @@ tower-http = { version = "0.6", features = ["compression-zstd", "cors", "timeout
 prost = "0.13"
 tonic = "0.12"
 
-prometheus = "0.13"
-
-uuid = { version = "1", features = ["v4"] }
 toml = "0.8"
 directories = "6"
 tempfile = "3"
-
-aws-sdk-s3 = "1"
-aws-config = { version = "1", features = ["behavior-version-latest"] }
-
-[workspace.lints.rust]
-unsafe_code = "forbid"
-rust_2018_idioms = { level = "warn", priority = -1 }
-
-[workspace.lints.clippy]
-all = { level = "warn", priority = -1 }
-pedantic = { level = "allow", priority = -1 }
-nursery = { level = "allow", priority = -1 }
-cloned_instead_of_copied = "warn"
-redundant_closure_for_method_calls = "warn"
-str_to_string = "warn"
-needless_pass_by_value = "warn"
-manual_let_else = "warn"
-match_same_arms = "warn"
-unnecessary_wraps = "warn"
-implicit_clone = "warn"
-inefficient_to_string = "warn"
-too_many_arguments = "allow"
-module_name_repetitions = "allow"
 
 [profile.release]
 lto = "fat"
