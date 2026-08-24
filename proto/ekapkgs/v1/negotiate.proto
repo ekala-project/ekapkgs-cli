@@ -1,0 +1,35 @@
+syntax = "proto3";
+package ekapkgs.v1;
+
+import "ekapkgs/v1/manifest.proto";
+import "ekapkgs/v1/signing.proto";
+
+service CacheService {
+  // Single round-trip closure negotiation.
+  rpc Negotiate(NegotiateRequest) returns (NegotiateResponse);
+}
+
+message NegotiateRequest {
+  // Store path hashes the client needs (not in its local store).
+  repeated string want = 1;
+  // Store path hashes the client already has locally.
+  repeated string have = 2;
+  // Preferred compression algorithms, in priority order.
+  repeated Compression accept_compression = 3;
+  // Client's trust roots for certificate-based verification.
+  repeated TrustRoot trust_roots = 4;
+}
+
+message NegotiateResponse {
+  // Narinfo-equivalent metadata for each path the server can provide.
+  repeated PathManifestEntry available = 1;
+  // Store path hashes the server does not have.
+  repeated string unavailable = 2;
+  // Server's signing certificate chain (if using cert-based trust).
+  CertificateChain certificate_chain = 3;
+  // Topologically-sorted download plan.
+  DownloadPlan download_plan = 4;
+  // Aggregate sizes for progress display.
+  uint64 total_download_size = 5;
+  uint64 total_nar_size = 6;
+}

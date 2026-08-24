@@ -1,0 +1,44 @@
+syntax = "proto3";
+package ekapkgs.v1;
+
+message TrustRoot {
+  oneof root {
+    CertificateAuthority ca = 1;
+    PublicKey public_key = 2;
+  }
+}
+
+message CertificateAuthority {
+  // Base64-encoded ed25519 public key.
+  string public_key = 1;
+}
+
+message PublicKey {
+  string name = 1;
+  // Base64-encoded ed25519 public key.
+  string key = 2;
+}
+
+message SigningCertificate {
+  string name = 1;
+  // 32 bytes ed25519 public key.
+  bytes public_key = 2;
+  // Unix timestamps for validity period.
+  uint64 not_before = 3;
+  uint64 not_after = 4;
+  // Name of the issuer CA that signed this certificate.
+  string issuer = 5;
+  // 64 bytes ed25519 signature over the certificate fields.
+  bytes issuer_signature = 6;
+}
+
+message CertificateChain {
+  SigningCertificate signing_cert = 1;
+  repeated SigningCertificate intermediates = 2;
+}
+
+message CertSignature {
+  string cert_name = 1;
+  // 64 bytes ed25519 signature over the narinfo fingerprint.
+  bytes signature = 2;
+}

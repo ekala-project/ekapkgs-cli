@@ -1,0 +1,40 @@
+syntax = "proto3";
+package ekapkgs.v1;
+
+import "ekapkgs/v1/signing.proto";
+
+enum Compression {
+  COMPRESSION_UNSPECIFIED = 0;
+  COMPRESSION_ZSTD = 1;
+  COMPRESSION_XZ = 2;
+  COMPRESSION_NONE = 3;
+}
+
+message PathManifestEntry {
+  string store_path = 1;
+  string nar_hash = 2;
+  uint64 nar_size = 3;
+  repeated string references = 4;
+  // Standard nix narinfo signatures for backward compatibility.
+  repeated string signatures = 5;
+  // Certificate-based signature (optional, alongside standard sigs).
+  CertSignature cert_signature = 6;
+  // Content-addressed hash (if applicable).
+  string ca = 7;
+  // Relative URL for NAR download.
+  string url = 8;
+  Compression compression = 9;
+  string file_hash = 10;
+  uint64 file_size = 11;
+}
+
+message DownloadPlan {
+  // Batches are ordered: dependencies before dependents. Paths within
+  // a batch have no mutual dependencies and can be downloaded in parallel.
+  repeated DownloadBatch batches = 1;
+}
+
+message DownloadBatch {
+  repeated string paths = 1;
+  uint32 priority = 2;
+}

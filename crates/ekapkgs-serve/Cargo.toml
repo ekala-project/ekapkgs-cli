@@ -9,8 +9,20 @@ path = "src/main.rs"
 
 [dependencies]
 ekapkgs-protocol.workspace = true
+ekapkgs-nix.workspace = true
 ekapkgs-ui.workspace = true
 clap.workspace = true
+clap-verbosity-flag.workspace = true
 color-eyre.workspace = true
 tracing.workspace = true
-clap-verbosity-flag.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+axum.workspace = true
+tower.workspace = true
+tower-http.workspace = true
+toml.workspace = true
+ed25519-dalek.workspace = true
+data-encoding.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
