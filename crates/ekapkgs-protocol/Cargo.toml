@@ -7,6 +7,9 @@ edition.workspace = true
 prost.workspace = true
 tonic.workspace = true
 thiserror.workspace = true
+ed25519-dalek.workspace = true
+data-encoding.workspace = true
+rand = "0.8"
 
 [build-dependencies]
 tonic-build = "0.12"

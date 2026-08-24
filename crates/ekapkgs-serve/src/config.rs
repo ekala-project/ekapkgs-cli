@@ -30,6 +30,13 @@ pub enum StorageConfig {
 #[derive(Debug, Deserialize)]
 pub struct SigningConfig {
     pub secret_key_file: PathBuf,
+    pub certificate: Option<CertificateConfig>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CertificateConfig {
+    pub cert_file: PathBuf,
+    pub private_key_file: PathBuf,
 }
 
 impl Config {

@@ -80,13 +80,29 @@ impl CacheService for NegotiateService {
             }
         }
 
+        // Apply certificate-based signatures if configured.
+        let certificate_chain = if let Some(ref cert_signer) = self.state.cert_signer {
+            for entry in &mut available {
+                let fingerprint = crate::signing::NarInfoSigner::fingerprint(
+                    &entry.store_path,
+                    &entry.nar_hash,
+                    entry.nar_size,
+                    &entry.references,
+                );
+                entry.cert_signature = Some(cert_signer.sign(&fingerprint));
+            }
+            Some(cert_signer.chain.clone())
+        } else {
+            None
+        };
+
         // Build download plan: topological sort by references.
         let download_plan = build_download_plan(&available, &have_set);
 
         Ok(Response::new(NegotiateResponse {
             available,
             unavailable,
-            certificate_chain: None,
+            certificate_chain,
             download_plan: Some(download_plan),
             total_download_size,
             total_nar_size,
