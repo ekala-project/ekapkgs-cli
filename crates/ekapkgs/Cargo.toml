@@ -8,9 +8,20 @@ name = "ekapkgs"
 path = "src/main.rs"
 
 [dependencies]
+ekapkgs-protocol.workspace = true
 ekapkgs-nix.workspace = true
 ekapkgs-ui.workspace = true
 clap.workspace = true
 clap-verbosity-flag.workspace = true
 color-eyre.workspace = true
 tracing.workspace = true
+tokio.workspace = true
+tonic.workspace = true
+reqwest.workspace = true
+futures.workspace = true
+indicatif.workspace = true
+tempfile.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+directories.workspace = true

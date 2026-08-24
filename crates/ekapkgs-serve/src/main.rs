@@ -11,6 +11,8 @@ use axum::Router;
 use axum::routing::get;
 use clap::Parser;
 
+use ekapkgs_protocol::ekapkgs::v1::cache_service_server::CacheServiceServer;
+
 use config::Config;
 use signing::NarInfoSigner;
 use storage::StorageBackend;
@@ -43,7 +45,7 @@ pub struct AppState {
     pub signer: NarInfoSigner,
 }
 
-fn build_router(state: Arc<AppState>) -> Router {
+fn build_http_router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/nix-cache-info", get(api::compat::nix_cache_info))
         .route("/{hash_narinfo}", get(api::compat::get_narinfo))
@@ -77,13 +79,9 @@ async fn main() -> color_eyre::Result<()> {
     } else {
         bind_addr = cli.bind.unwrap_or_else(|| "0.0.0.0:8080".to_string());
 
-        let signing_key = cli
-            .signing_key
-            .ok_or_else(|| {
-                color_eyre::eyre::eyre!(
-                    "either --config or --signing-key is required"
-                )
-            })?;
+        let signing_key = cli.signing_key.ok_or_else(|| {
+            color_eyre::eyre::eyre!("either --config or --signing-key is required")
+        })?;
         signer = NarInfoSigner::from_file(&signing_key)?;
 
         let storage_str = cli.storage.unwrap_or_else(|| "nix-store".to_string());
@@ -101,10 +99,24 @@ async fn main() -> color_eyre::Result<()> {
         signer,
     });
 
-    let app = build_router(state);
-
     let addr: SocketAddr = bind_addr.parse()?;
-    tracing::info!("Listening on {addr}");
+
+    // Build gRPC service.
+    let grpc_service = CacheServiceServer::new(api::negotiate::NegotiateService {
+        state: Arc::clone(&state),
+    });
+
+    // Build HTTP router for nix binary cache compat.
+    // Mount the gRPC service under the axum router so both are served on
+    // the same port. The tonic service handles `application/grpc` requests;
+    // axum handles everything else.
+    let app = build_http_router(state)
+        .route_service(
+            "/ekapkgs.v1.CacheService/Negotiate",
+            grpc_service,
+        );
+
+    tracing::info!("Listening on {addr} (gRPC + HTTP)");
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app).await?;
