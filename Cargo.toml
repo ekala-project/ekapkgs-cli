@@ -6,6 +6,7 @@ members = [
     "crates/ekapkgs-protocol",
     "crates/ekapkgs-nix",
     "crates/ekapkgs-ui",
+    "crates/ekapkgs-integration-tests",
 ]
 
 [workspace.package]

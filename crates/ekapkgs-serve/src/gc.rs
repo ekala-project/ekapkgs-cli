@@ -498,3 +498,47 @@ fn format_bytes(bytes: u64) -> String {
         format!("{bytes} B")
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_byte_size_gib() {
+        assert_eq!(parse_byte_size("50GiB").unwrap(), 50 * 1_073_741_824);
+    }
+
+    #[test]
+    fn parse_byte_size_gb() {
+        assert_eq!(parse_byte_size("100GB").unwrap(), 100_000_000_000);
+    }
+
+    #[test]
+    fn parse_byte_size_mib() {
+        assert_eq!(parse_byte_size("512MiB").unwrap(), 512 * 1_048_576);
+    }
+
+    #[test]
+    fn parse_byte_size_bytes() {
+        assert_eq!(parse_byte_size("1024").unwrap(), 1024);
+        assert_eq!(parse_byte_size("1024B").unwrap(), 1024);
+    }
+
+    #[test]
+    fn parse_byte_size_fractional() {
+        assert_eq!(parse_byte_size("1.5GiB").unwrap(), 1_610_612_736);
+    }
+
+    #[test]
+    fn parse_byte_size_invalid() {
+        assert!(parse_byte_size("abc").is_err());
+        assert!(parse_byte_size("50XYZ").is_err());
+    }
+
+    #[test]
+    fn format_bytes_display() {
+        assert_eq!(format_bytes(500), "500 B");
+        assert_eq!(format_bytes(1_048_576), "1.0 MiB");
+        assert_eq!(format_bytes(1_073_741_824), "1.0 GiB");
+    }
+}

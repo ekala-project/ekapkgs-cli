@@ -161,3 +161,176 @@ pub fn issue_certificate(
         ..cert
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ekapkgs::v1::CertificateChain;
+
+    #[test]
+    fn issue_and_verify_certificate() {
+        let (ca_secret, ca_public) = generate_keypair();
+        let (_cert_secret, cert_public) = generate_keypair();
+
+        let cert = issue_certificate(
+            &ca_secret,
+            "test-ca",
+            "test-cert-2025",
+            &cert_public,
+            1000,
+            2000,
+        );
+
+        let chain = CertificateChain {
+            signing_cert: Some(cert),
+            intermediates: Vec::new(),
+        };
+
+        let roots = vec![TrustedRoot {
+            name: "test-ca".to_string(),
+            public_key: ca_public,
+        }];
+
+        // Should verify at time 1500 (within validity).
+        let key = verify_chain(&chain, &roots, 1500).expect("should verify");
+        assert_eq!(key.as_bytes(), cert_public.as_bytes());
+    }
+
+    #[test]
+    fn verify_rejects_expired_cert() {
+        let (ca_secret, ca_public) = generate_keypair();
+        let (_cert_secret, cert_public) = generate_keypair();
+
+        let cert = issue_certificate(&ca_secret, "ca", "cert", &cert_public, 1000, 2000);
+        let chain = CertificateChain {
+            signing_cert: Some(cert),
+            intermediates: Vec::new(),
+        };
+        let roots = vec![TrustedRoot {
+            name: "ca".to_string(),
+            public_key: ca_public,
+        }];
+
+        let result = verify_chain(&chain, &roots, 3000);
+        assert!(matches!(result, Err(CertError::Expired { .. })));
+    }
+
+    #[test]
+    fn verify_rejects_not_yet_valid() {
+        let (ca_secret, ca_public) = generate_keypair();
+        let (_cert_secret, cert_public) = generate_keypair();
+
+        let cert = issue_certificate(&ca_secret, "ca", "cert", &cert_public, 1000, 2000);
+        let chain = CertificateChain {
+            signing_cert: Some(cert),
+            intermediates: Vec::new(),
+        };
+        let roots = vec![TrustedRoot {
+            name: "ca".to_string(),
+            public_key: ca_public,
+        }];
+
+        let result = verify_chain(&chain, &roots, 500);
+        assert!(matches!(result, Err(CertError::NotYetValid { .. })));
+    }
+
+    #[test]
+    fn verify_rejects_untrusted_issuer() {
+        let (ca_secret, _ca_public) = generate_keypair();
+        let (_other_secret, other_public) = generate_keypair();
+        let (_cert_secret, cert_public) = generate_keypair();
+
+        let cert = issue_certificate(&ca_secret, "real-ca", "cert", &cert_public, 1000, 2000);
+        let chain = CertificateChain {
+            signing_cert: Some(cert),
+            intermediates: Vec::new(),
+        };
+        // Root has a different name.
+        let roots = vec![TrustedRoot {
+            name: "other-ca".to_string(),
+            public_key: other_public,
+        }];
+
+        let result = verify_chain(&chain, &roots, 1500);
+        assert!(matches!(result, Err(CertError::UntrustedIssuer { .. })));
+    }
+
+    #[test]
+    fn verify_rejects_wrong_ca_key() {
+        let (ca_secret, _ca_public) = generate_keypair();
+        let (_wrong_secret, wrong_public) = generate_keypair();
+        let (_cert_secret, cert_public) = generate_keypair();
+
+        // Cert signed by real CA, but root has wrong key under the same name.
+        let cert = issue_certificate(&ca_secret, "ca", "cert", &cert_public, 1000, 2000);
+        let chain = CertificateChain {
+            signing_cert: Some(cert),
+            intermediates: Vec::new(),
+        };
+        let roots = vec![TrustedRoot {
+            name: "ca".to_string(),
+            public_key: wrong_public,
+        }];
+
+        let result = verify_chain(&chain, &roots, 1500);
+        assert!(matches!(result, Err(CertError::InvalidIssuerSignature { .. })));
+    }
+
+    #[test]
+    fn sign_and_verify_path() {
+        let (ca_secret, ca_public) = generate_keypair();
+        let (cert_secret, cert_public) = generate_keypair();
+
+        let cert = issue_certificate(&ca_secret, "ca", "cert", &cert_public, 0, u64::MAX);
+        let chain = CertificateChain {
+            signing_cert: Some(cert),
+            intermediates: Vec::new(),
+        };
+        let roots = vec![TrustedRoot {
+            name: "ca".to_string(),
+            public_key: ca_public,
+        }];
+
+        let verifying_key = verify_chain(&chain, &roots, 1000).unwrap();
+
+        // Sign a fingerprint.
+        let fingerprint = "1;/nix/store/abc-hello;sha256:deadbeef;12345;";
+        let sig = cert_secret.sign(fingerprint.as_bytes());
+        let cert_sig = crate::ekapkgs::v1::CertSignature {
+            cert_name: "cert".to_string(),
+            signature: sig.to_bytes().to_vec(),
+        };
+
+        verify_path_signature(&verifying_key, fingerprint, &cert_sig)
+            .expect("path signature should verify");
+    }
+
+    #[test]
+    fn verify_path_rejects_tampered_fingerprint() {
+        let (ca_secret, ca_public) = generate_keypair();
+        let (cert_secret, cert_public) = generate_keypair();
+
+        let cert = issue_certificate(&ca_secret, "ca", "cert", &cert_public, 0, u64::MAX);
+        let chain = CertificateChain {
+            signing_cert: Some(cert),
+            intermediates: Vec::new(),
+        };
+        let roots = vec![TrustedRoot {
+            name: "ca".to_string(),
+            public_key: ca_public,
+        }];
+
+        let verifying_key = verify_chain(&chain, &roots, 1000).unwrap();
+
+        let fingerprint = "1;/nix/store/abc-hello;sha256:deadbeef;12345;";
+        let sig = cert_secret.sign(fingerprint.as_bytes());
+        let cert_sig = crate::ekapkgs::v1::CertSignature {
+            cert_name: "cert".to_string(),
+            signature: sig.to_bytes().to_vec(),
+        };
+
+        // Verify against a different fingerprint.
+        let result = verify_path_signature(&verifying_key, "tampered", &cert_sig);
+        assert!(result.is_err());
+    }
+}

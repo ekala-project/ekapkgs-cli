@@ -27,7 +27,7 @@ fn default_parallel() -> usize {
     8
 }
 
-#[allow(dead_code)] // trust fields used in Phase 4
+#[allow(dead_code)] // trust fields used by cert verification
 #[derive(Debug, Deserialize, Clone)]
 pub struct CacheConfig {
     pub url: String,

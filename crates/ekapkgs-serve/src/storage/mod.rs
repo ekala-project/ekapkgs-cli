@@ -146,3 +146,91 @@ pub trait StorageBackend: Send + Sync {
         Ok(false)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SAMPLE_NARINFO: &str = "\
+StorePath: /nix/store/abc123def456-hello-2.12.1
+URL: nar/abc123def456.nar.xz
+Compression: xz
+FileHash: sha256:1b2c3d4e5f
+FileSize: 12345
+NarHash: sha256:a1b2c3d4e5
+NarSize: 67890
+References: abc123def456-hello-2.12.1 xyz789-glibc-2.39
+Deriver: qqq111-hello-2.12.1.drv
+Sig: cache.example.org-1:base64sig==
+CA: text:sha256:cafebabe
+";
+
+    #[test]
+    fn parse_narinfo_roundtrip() {
+        let ni = NarInfo::parse(SAMPLE_NARINFO).expect("should parse");
+        assert_eq!(ni.store_path, "/nix/store/abc123def456-hello-2.12.1");
+        assert_eq!(ni.url, "nar/abc123def456.nar.xz");
+        assert_eq!(ni.compression, "xz");
+        assert_eq!(ni.file_hash, "sha256:1b2c3d4e5f");
+        assert_eq!(ni.file_size, 12345);
+        assert_eq!(ni.nar_hash, "sha256:a1b2c3d4e5");
+        assert_eq!(ni.nar_size, 67890);
+        assert_eq!(ni.references.len(), 2);
+        assert_eq!(ni.deriver.as_deref(), Some("qqq111-hello-2.12.1.drv"));
+        assert_eq!(ni.signatures, vec!["cache.example.org-1:base64sig=="]);
+        assert_eq!(ni.ca.as_deref(), Some("text:sha256:cafebabe"));
+    }
+
+    #[test]
+    fn narinfo_store_path_hash() {
+        let ni = NarInfo::parse(SAMPLE_NARINFO).unwrap();
+        assert_eq!(ni.store_path_hash(), Some("abc123def456"));
+    }
+
+    #[test]
+    fn parse_narinfo_minimal() {
+        let text = "\
+StorePath: /nix/store/zzz-minimal-1.0
+URL: nar/zzz.nar
+NarHash: sha256:deadbeef
+NarSize: 100
+";
+        let ni = NarInfo::parse(text).expect("should parse minimal");
+        assert_eq!(ni.store_path, "/nix/store/zzz-minimal-1.0");
+        assert_eq!(ni.compression, "none");
+        assert!(ni.references.is_empty());
+        assert!(ni.signatures.is_empty());
+    }
+
+    #[test]
+    fn narinfo_serialize_deserialize() {
+        let ni = NarInfo::parse(SAMPLE_NARINFO).unwrap();
+        let text = ni.to_narinfo_string();
+        let ni2 = NarInfo::parse(&text).expect("should re-parse");
+        assert_eq!(ni.store_path, ni2.store_path);
+        assert_eq!(ni.nar_hash, ni2.nar_hash);
+        assert_eq!(ni.nar_size, ni2.nar_size);
+        assert_eq!(ni.file_size, ni2.file_size);
+    }
+
+    #[test]
+    fn parse_narinfo_missing_required_fields() {
+        assert!(NarInfo::parse("URL: nar/x.nar\nNarHash: sha256:abc\nNarSize: 1\n").is_none());
+        assert!(NarInfo::parse("StorePath: /nix/store/x\nNarHash: sha256:abc\nNarSize: 1\n").is_none());
+    }
+
+    #[test]
+    fn narinfo_multiple_signatures() {
+        let text = "\
+StorePath: /nix/store/aaa-pkg-1.0
+URL: nar/aaa.nar
+NarHash: sha256:abc
+NarSize: 100
+Sig: key1:sig1==
+Sig: key2:sig2==
+Sig: key3:sig3==
+";
+        let ni = NarInfo::parse(text).unwrap();
+        assert_eq!(ni.signatures.len(), 3);
+    }
+}

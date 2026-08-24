@@ -1,0 +1,19 @@
+[package]
+name = "ekapkgs-integration-tests"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+tempfile.workspace = true
+tokio.workspace = true
+reqwest.workspace = true
+serde_json.workspace = true
+serde.workspace = true
+data-encoding.workspace = true
+ed25519-dalek.workspace = true
+rand = "0.8"
+
+[[test]]
+name = "integration"
+path = "src/integration.rs"

@@ -138,3 +138,111 @@ pub fn default_store_path(config_path: Option<&Path>) -> PathBuf {
         PathBuf::from("/etc/ekapkgs-serve/tokens.json")
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn create_and_validate_token() {
+        let mut store = TokenStore::default();
+        let token = store
+            .create(
+                "test-ci",
+                Permissions {
+                    read: true,
+                    write: true,
+                },
+            )
+            .unwrap();
+
+        assert!(token.starts_with("ekap_"));
+        assert!(token.len() > 20);
+
+        let found = store.validate(&token).unwrap();
+        assert_eq!(found.name, "test-ci");
+        assert!(found.permissions.write);
+    }
+
+    #[test]
+    fn duplicate_name_rejected() {
+        let mut store = TokenStore::default();
+        store
+            .create("dup", Permissions { read: true, write: false })
+            .unwrap();
+        let result = store.create("dup", Permissions { read: true, write: true });
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn revoke_removes_token() {
+        let mut store = TokenStore::default();
+        let token = store
+            .create("temp", Permissions { read: true, write: true })
+            .unwrap();
+
+        assert!(store.validate(&token).is_some());
+        assert!(store.revoke("temp"));
+        assert!(store.validate(&token).is_none());
+    }
+
+    #[test]
+    fn revoke_nonexistent_returns_false() {
+        let mut store = TokenStore::default();
+        assert!(!store.revoke("nope"));
+    }
+
+    #[test]
+    fn write_tokens_filters_correctly() {
+        let mut store = TokenStore::default();
+        store
+            .create("rw", Permissions { read: true, write: true })
+            .unwrap();
+        store
+            .create("ro", Permissions { read: true, write: false })
+            .unwrap();
+
+        let wt = store.write_tokens();
+        assert_eq!(wt.len(), 1);
+    }
+
+    #[test]
+    fn save_and_load_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tokens.json");
+
+        let mut store = TokenStore::default();
+        let tok1 = store
+            .create("a", Permissions { read: true, write: true })
+            .unwrap();
+        let tok2 = store
+            .create("b", Permissions { read: true, write: false })
+            .unwrap();
+        store.save(&path).unwrap();
+
+        let loaded = TokenStore::load(&path).unwrap();
+        assert_eq!(loaded.tokens.len(), 2);
+        assert!(loaded.validate(&tok1).is_some());
+        assert!(loaded.validate(&tok2).is_some());
+        assert!(loaded.validate(&tok1).unwrap().permissions.write);
+        assert!(!loaded.validate(&tok2).unwrap().permissions.write);
+    }
+
+    #[test]
+    fn load_nonexistent_returns_empty() {
+        let store = TokenStore::load(Path::new("/nonexistent/tokens.json")).unwrap();
+        assert!(store.tokens.is_empty());
+    }
+
+    #[test]
+    fn token_has_sufficient_entropy() {
+        let mut store = TokenStore::default();
+        let mut tokens = std::collections::HashSet::new();
+        for i in 0..50 {
+            let t = store
+                .create(&format!("t{i}"), Permissions { read: true, write: true })
+                .unwrap();
+            assert!(tokens.insert(t), "duplicate token generated");
+        }
+    }
+}

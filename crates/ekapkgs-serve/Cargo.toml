@@ -29,3 +29,6 @@ data-encoding.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
 rusqlite = { version = "0.32", features = ["bundled"] }
+
+[dev-dependencies]
+tempfile.workspace = true
