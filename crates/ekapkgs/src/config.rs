@@ -33,6 +33,8 @@ pub struct CacheConfig {
     pub url: String,
     pub trusted_key: Option<String>,
     pub trust_root: Option<String>,
+    /// Bearer token for pushing to this cache.
+    pub token: Option<String>,
     #[serde(default = "default_priority")]
     pub priority: u32,
     #[serde(default)]
@@ -73,6 +75,14 @@ impl ClientConfig {
             .iter()
             .filter(|c| c.protocol != CacheProtocol::Legacy)
             .min_by_key(|c| c.priority)
+    }
+
+    /// Get the push token for a given cache URL.
+    pub fn push_token(&self, url: &str) -> Option<String> {
+        self.caches
+            .iter()
+            .find(|c| c.url == url)
+            .and_then(|c| c.token.clone())
     }
 }
 

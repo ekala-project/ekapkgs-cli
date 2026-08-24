@@ -1,7 +1,9 @@
 use std::path::PathBuf;
 
+use ekapkgs_nix::NixCommand;
+use ekapkgs_nix::eval;
 use ekapkgs_nix::installable::Installable;
-use ekapkgs_nix::{NixCommand, eval, store};
+use ekapkgs_nix::store;
 use futures::StreamExt;
 
 use crate::cli::{AuthCommand, CacheCommand};
@@ -9,31 +11,8 @@ use crate::config::ClientConfig;
 
 pub fn execute(command: CacheCommand) -> color_eyre::Result<()> {
     match command {
-        CacheCommand::Push {
-            paths,
-            cache,
-            sources_only,
-        } => {
-            if sources_only {
-                cmd_push_sources(&paths, cache.as_deref())
-            } else {
-                cmd_push(&paths, cache.as_deref())
-            }
-        },
+        CacheCommand::Push { paths, cache } => cmd_push(&paths, cache.as_deref()),
         CacheCommand::Pull { paths, cache } => cmd_pull(&paths, cache.as_deref()),
-        CacheCommand::Warm {
-            installable,
-            from_flake_lock_diff,
-            old,
-            new,
-            cache,
-        } => cmd_warm(
-            &installable,
-            from_flake_lock_diff.as_deref(),
-            old.as_deref(),
-            new.as_deref(),
-            cache.as_deref(),
-        ),
         CacheCommand::Auth { command } => cmd_auth(command),
     }
 }
@@ -44,7 +23,7 @@ fn cmd_push(paths: &[String], cache_url: Option<&str>) -> color_eyre::Result<()>
     let config = ClientConfig::load()?;
 
     let server_url = match cache_url {
-        Some(url) => url.to_owned(),
+        Some(url) => url.to_string(),
         None => {
             let cache = config.primary_cache().ok_or_else(|| {
                 color_eyre::eyre::eyre!(
@@ -52,7 +31,7 @@ fn cmd_push(paths: &[String], cache_url: Option<&str>) -> color_eyre::Result<()>
                 )
             })?;
             cache.url.clone()
-        },
+        }
     };
 
     let token = config.push_token(&server_url);
@@ -75,10 +54,12 @@ fn cmd_push(paths: &[String], cache_url: Option<&str>) -> color_eyre::Result<()>
         let results = futures::stream::iter(store_paths.iter())
             .map(|path| {
                 let client = client.clone();
-                let base = base_url.to_owned();
+                let base = base_url.to_string();
                 let token = token.clone();
                 let path = path.clone();
-                async move { push_single_path(&client, &base, token.as_deref(), &path).await }
+                async move {
+                    push_single_path(&client, &base, token.as_deref(), &path).await
+                }
             })
             .buffer_unordered(8)
             .collect::<Vec<_>>()
@@ -93,16 +74,16 @@ fn cmd_push(paths: &[String], cache_url: Option<&str>) -> color_eyre::Result<()>
                 Ok(PushResult::Uploaded) => {
                     success += 1;
                     bar.inc(1);
-                },
+                }
                 Ok(PushResult::AlreadyExists) => {
                     skipped += 1;
                     bar.inc(1);
-                },
+                }
                 Err(e) => {
                     tracing::warn!("Push failed: {e}");
                     failed += 1;
                     bar.inc(1);
-                },
+                }
             }
         }
 
@@ -120,152 +101,6 @@ fn cmd_push(paths: &[String], cache_url: Option<&str>) -> color_eyre::Result<()>
 
         Ok::<(), color_eyre::Report>(())
     })?;
-
-    Ok(())
-}
-
-// --- push --sources-only ---
-
-fn cmd_push_sources(paths: &[String], cache_url: Option<&str>) -> color_eyre::Result<()> {
-    let config = ClientConfig::load()?;
-
-    let server_url = match cache_url {
-        Some(url) => url.to_owned(),
-        None => {
-            let cache = config.primary_cache().ok_or_else(|| {
-                color_eyre::eyre::eyre!(
-                    "no cache configured — use --cache or configure in config.toml"
-                )
-            })?;
-            cache.url.clone()
-        },
-    };
-
-    let token = config.push_token(&server_url);
-    let base_url = server_url.trim_end_matches('/');
-
-    for input in paths {
-        let inst = Installable::new(input);
-
-        // 1. Get the derivation graph JSON (compressed for transfer).
-        tracing::info!("Evaluating derivation graph for {input}...");
-        let drv_graph_json = eval::derivation_graph_json(&inst)?;
-        let drv_graph_compressed = zstd::bulk::compress(&drv_graph_json, 3)
-            .map_err(|e| color_eyre::eyre::eyre!("zstd compress failed: {e}"))?;
-
-        tracing::info!(
-            "Derivation graph: {} ({} compressed)",
-            ekapkgs_ui::format::format_bytes(drv_graph_json.len() as u64),
-            ekapkgs_ui::format::format_bytes(drv_graph_compressed.len() as u64),
-        );
-
-        // 2. Identify FOD (fixed-output derivation) paths.
-        let fod_paths = eval::extract_fod_paths(&inst)?;
-        tracing::info!(
-            "Found {} fixed-output derivations (sources)",
-            fod_paths.len()
-        );
-
-        if fod_paths.is_empty() && drv_graph_json.is_empty() {
-            tracing::info!("Nothing to push for {input}");
-            continue;
-        }
-
-        // 3. Check which FODs the server already has.
-        let fod_hashes: Vec<String> = fod_paths
-            .iter()
-            .filter_map(|p| store::store_path_hash(p).map(String::from))
-            .collect();
-
-        let rt = tokio::runtime::Runtime::new()?;
-        rt.block_on(async {
-            let client = reqwest::Client::new();
-
-            // Check which FODs are already on the server.
-            let mut to_push = Vec::new();
-            let mut already_present = 0u64;
-
-            for (path, hash) in fod_paths.iter().zip(fod_hashes.iter()) {
-                let check_url = format!("{base_url}/{hash}.narinfo");
-                let resp = client.head(&check_url).send().await?;
-                if resp.status().is_success() {
-                    already_present += 1;
-                } else {
-                    to_push.push(path.clone());
-                }
-            }
-
-            if already_present > 0 {
-                tracing::info!("{already_present} FODs already on server");
-            }
-
-            if to_push.is_empty() {
-                tracing::info!("All FODs already present, pushing derivation graph only");
-            } else {
-                tracing::info!("{} FODs to push", to_push.len());
-
-                // Push FOD NARs.
-                let bar = ekapkgs_ui::progress::item_bar(to_push.len() as u64, "sources");
-                let results =
-                    futures::stream::iter(to_push.iter())
-                        .map(|path| {
-                            let client = client.clone();
-                            let base = base_url.to_owned();
-                            let token = token.clone();
-                            let path = path.clone();
-                            async move {
-                                push_single_path(&client, &base, token.as_deref(), &path).await
-                            }
-                        })
-                        .buffer_unordered(8)
-                        .collect::<Vec<_>>()
-                        .await;
-
-                for result in &results {
-                    match result {
-                        Ok(_) => bar.inc(1),
-                        Err(e) => {
-                            tracing::warn!("FOD push failed: {e}");
-                            bar.inc(1);
-                        },
-                    }
-                }
-                bar.finish_and_clear();
-            }
-
-            // 4. Push the compressed derivation graph as a special object.
-            let drv_url = format!("{base_url}/source-manifest");
-            let mut req = client
-                .put(&drv_url)
-                .header("Content-Type", "application/zstd")
-                .body(drv_graph_compressed);
-            if let Some(t) = &token {
-                req = req.header("Authorization", format!("Bearer {t}"));
-            }
-            match req.send().await {
-                Ok(resp) if resp.status().is_success() => {
-                    tracing::info!("Derivation graph uploaded");
-                },
-                Ok(resp) => {
-                    tracing::warn!(
-                        "Derivation graph upload returned {}: server may not support source-only \
-                         transfers yet",
-                        resp.status()
-                    );
-                },
-                Err(e) => {
-                    tracing::warn!("Derivation graph upload failed: {e}");
-                },
-            }
-
-            tracing::info!(
-                "Source-only push complete for {input}: {} FODs transferred",
-                to_push.len()
-            );
-
-            Ok::<(), color_eyre::Report>(())
-        })?;
-    }
 
     Ok(())
 }
@@ -335,7 +170,7 @@ async fn push_single_path(
     let refs: Vec<String> = info
         .references
         .iter()
-        .map(|r| r.rsplit('/').next().unwrap_or(r).to_owned())
+        .map(|r| r.rsplit('/').next().unwrap_or(r).to_string())
         .collect();
 
     let mut narinfo = String::new();
@@ -365,9 +200,7 @@ async fn push_single_path(
     if !resp.status().is_success() {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
-        return Err(color_eyre::eyre::eyre!(
-            "NAR upload failed: {status} {body}"
-        ));
+        return Err(color_eyre::eyre::eyre!("NAR upload failed: {status} {body}"));
     }
 
     let narinfo_url = format!("{base_url}/{hash}.narinfo");
@@ -420,9 +253,10 @@ fn resolve_store_paths(inputs: &[String]) -> color_eyre::Result<Vec<String>> {
 
             for build in outputs {
                 for out_path in build.outputs.values() {
-                    let closure_output = NixCommand::new(&["path-info", "--recursive", "--json"])
-                        .arg(out_path)
-                        .output()?;
+                    let closure_output =
+                        NixCommand::new(&["path-info", "--recursive", "--json"])
+                            .arg(out_path)
+                            .output()?;
                     let closure_str = String::from_utf8_lossy(&closure_output.stdout);
 
                     #[derive(serde::Deserialize)]
@@ -447,7 +281,7 @@ fn cmd_pull(paths: &[String], cache_url: Option<&str>) -> color_eyre::Result<()>
     let config = ClientConfig::load()?;
 
     let server_url = match cache_url {
-        Some(url) => url.to_owned(),
+        Some(url) => url.to_string(),
         None => {
             let cache = config.primary_cache().ok_or_else(|| {
                 color_eyre::eyre::eyre!(
@@ -455,7 +289,7 @@ fn cmd_pull(paths: &[String], cache_url: Option<&str>) -> color_eyre::Result<()>
                 )
             })?;
             cache.url.clone()
-        },
+        }
     };
 
     // Resolve all inputs to closure paths and partition.
@@ -495,8 +329,7 @@ fn cmd_pull(paths: &[String], cache_url: Option<&str>) -> color_eyre::Result<()>
         let spinner = ekapkgs_ui::progress::spinner("Negotiating with cache...");
 
         let response =
-            crate::negotiate::negotiate(&server_url, want_hashes.clone(), have_hashes.clone())
-                .await?;
+            crate::negotiate::negotiate(&server_url, want_hashes, have_hashes).await?;
 
         spinner.finish_and_clear();
 
@@ -505,35 +338,13 @@ fn cmd_pull(paths: &[String], cache_url: Option<&str>) -> color_eyre::Result<()>
 
         if avail > 0 {
             tracing::info!("{avail} paths available from cache");
-
-            // Try gRPC streaming first for a single-connection transfer.
-            // Fall back to individual HTTP downloads if the server doesn't
-            // support the StreamNars RPC.
-            match crate::download::stream_and_import(&server_url, &response).await {
-                Ok(()) => {
-                    tracing::info!("Imported {avail} paths (streamed)");
-                },
-                Err(e) => {
-                    // Check if this is an UNIMPLEMENTED gRPC status, meaning
-                    // the server doesn't support streaming.
-                    let is_unimplemented = e
-                        .downcast_ref::<tonic::Status>()
-                        .is_some_and(|s| s.code() == tonic::Code::Unimplemented);
-
-                    if is_unimplemented {
-                        tracing::info!("Server does not support streaming, using HTTP downloads");
-                        crate::download::download_and_import(
-                            &server_url,
-                            &response,
-                            config.defaults.max_parallel_downloads,
-                        )
-                        .await?;
-                        tracing::info!("Imported {avail} paths");
-                    } else {
-                        return Err(e);
-                    }
-                },
-            }
+            crate::download::download_and_import(
+                &server_url,
+                &response,
+                config.defaults.max_parallel_downloads,
+            )
+            .await?;
+            tracing::info!("Imported {avail} paths");
         }
 
         if unavail > 0 {
@@ -543,220 +354,6 @@ fn cmd_pull(paths: &[String], cache_url: Option<&str>) -> color_eyre::Result<()>
         Ok::<(), color_eyre::Report>(())
     })?;
 
-    Ok(())
-}
-
-// --- warm ---
-
-fn cmd_warm(
-    installable: &str,
-    from_flake_lock_diff: Option<&str>,
-    old_lock: Option<&str>,
-    new_lock: Option<&str>,
-    cache_url: Option<&str>,
-) -> color_eyre::Result<()> {
-    let config = ClientConfig::load()?;
-
-    let server_url = match cache_url {
-        Some(url) => url.to_owned(),
-        None => {
-            let cache = config.primary_cache().ok_or_else(|| {
-                color_eyre::eyre::eyre!(
-                    "no cache configured — use --cache or configure in config.toml"
-                )
-            })?;
-            cache.url.clone()
-        },
-    };
-
-    // Resolve old and new flake.lock contents.
-    let (old_lock_content, new_lock_content) = if let Some(diff_range) = from_flake_lock_diff {
-        // Parse "OLD..NEW" git range (e.g., "HEAD~1..HEAD").
-        let (old_ref, new_ref) = diff_range.split_once("..").ok_or_else(|| {
-            color_eyre::eyre::eyre!("invalid diff range: expected OLD..NEW, got {diff_range}")
-        })?;
-        let old = git_show_file(old_ref, "flake.lock")?;
-        let new = git_show_file(new_ref, "flake.lock")?;
-        (old, new)
-    } else {
-        let old_path = old_lock.ok_or_else(|| {
-            color_eyre::eyre::eyre!("either --from-flake-lock-diff or --old is required")
-        })?;
-        let new_path = new_lock.unwrap_or("flake.lock");
-        let old = std::fs::read_to_string(old_path)?;
-        let new = std::fs::read_to_string(new_path)?;
-        (old, new)
-    };
-
-    // Write temporary flake.lock files for evaluation.
-    let temp_dir = tempfile::tempdir()?;
-    let old_lock_path = temp_dir.path().join("flake.lock.old");
-    let new_lock_path = temp_dir.path().join("flake.lock.new");
-    std::fs::write(&old_lock_path, &old_lock_content)?;
-    std::fs::write(&new_lock_path, &new_lock_content)?;
-
-    // Evaluate closures at both flake.lock versions.
-    tracing::info!("Evaluating old closure...");
-    let old_closure = eval_with_lock(installable, &old_lock_path)?;
-    tracing::info!("Evaluating new closure...");
-    let new_closure = eval_with_lock(installable, &new_lock_path)?;
-
-    // Compute the diff: paths in new closure not in old closure.
-    let old_set: std::collections::HashSet<&str> = old_closure.iter().map(String::as_str).collect();
-    let diff_paths: Vec<&str> = new_closure
-        .iter()
-        .filter(|p| !old_set.contains(p.as_str()))
-        .map(String::as_str)
-        .collect();
-
-    tracing::info!(
-        "Closure diff: {} new paths ({} total in new, {} in old)",
-        diff_paths.len(),
-        new_closure.len(),
-        old_closure.len(),
-    );
-
-    if diff_paths.is_empty() {
-        tracing::info!("No new paths to warm");
-        return Ok(());
-    }
-
-    // Partition diff paths into local and remote.
-    let (have, want) = store::partition_local(
-        &diff_paths
-            .iter()
-            .map(|s| (*s).to_owned())
-            .collect::<Vec<_>>(),
-    )?;
-
-    if want.is_empty() {
-        tracing::info!("All {} diff paths already in local store", have.len());
-        return Ok(());
-    }
-
-    tracing::info!(
-        "{} paths to warm ({} already local)",
-        want.len(),
-        have.len()
-    );
-
-    let want_hashes: Vec<String> = want
-        .iter()
-        .filter_map(|p| store::store_path_hash(p).map(String::from))
-        .collect();
-    let have_hashes: Vec<String> = have
-        .iter()
-        .filter_map(|p| store::store_path_hash(p).map(String::from))
-        .collect();
-
-    let rt = tokio::runtime::Runtime::new()?;
-    rt.block_on(async {
-        let spinner = ekapkgs_ui::progress::spinner("Negotiating with cache...");
-
-        let response = crate::negotiate::negotiate(&server_url, want_hashes, have_hashes).await?;
-
-        spinner.finish_and_clear();
-
-        let avail = response.available.len();
-        let unavail = response.unavailable.len();
-
-        if avail > 0 {
-            tracing::info!("{avail} paths available from cache");
-            match crate::download::stream_and_import(&server_url, &response).await {
-                Ok(()) => {
-                    tracing::info!("Warmed {avail} paths (streamed)");
-                },
-                Err(e) => {
-                    let is_unimplemented = e
-                        .downcast_ref::<tonic::Status>()
-                        .is_some_and(|s| s.code() == tonic::Code::Unimplemented);
-                    if is_unimplemented {
-                        crate::download::download_and_import(
-                            &server_url,
-                            &response,
-                            config.defaults.max_parallel_downloads,
-                        )
-                        .await?;
-                        tracing::info!("Warmed {avail} paths");
-                    } else {
-                        return Err(e);
-                    }
-                },
-            }
-        }
-
-        if unavail > 0 {
-            tracing::warn!("{unavail} paths not available on cache");
-        }
-
-        Ok::<(), color_eyre::Report>(())
-    })?;
-
-    Ok(())
-}
-
-/// Get a file's content at a specific git revision.
-fn git_show_file(rev: &str, path: &str) -> color_eyre::Result<String> {
-    let output = std::process::Command::new("git")
-        .args(["show", &format!("{rev}:{path}")])
-        .output()?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(color_eyre::eyre::eyre!(
-            "git show {rev}:{path} failed: {stderr}"
-        ));
-    }
-
-    Ok(String::from_utf8(output.stdout)?)
-}
-
-/// Evaluate a closure with a specific flake.lock file.
-///
-/// Uses `--override-input` to pin the flake's lock to the specified file.
-/// Falls back to evaluating with the lock file copied into a temp flake.
-fn eval_with_lock(
-    installable: &str,
-    lock_path: &std::path::Path,
-) -> color_eyre::Result<Vec<String>> {
-    // Create a temporary directory with the current flake source and the
-    // overridden flake.lock.
-    let temp_dir = tempfile::tempdir()?;
-
-    // Copy the current directory's flake.nix (and other files) to temp.
-    // We only need flake.nix and the lock file.
-    if std::path::Path::new("flake.nix").exists() {
-        std::fs::copy("flake.nix", temp_dir.path().join("flake.nix"))?;
-    }
-    std::fs::copy(lock_path, temp_dir.path().join("flake.lock"))?;
-
-    // Copy nix/ directory if it exists (for overlays, modules).
-    if std::path::Path::new("nix").is_dir() {
-        copy_dir_recursive(std::path::Path::new("nix"), &temp_dir.path().join("nix"))?;
-    }
-
-    // Evaluate the installable in the temp directory.
-    let inst_path = format!(
-        "path:{}#{}",
-        temp_dir.path().display(),
-        installable.trim_start_matches(".#")
-    );
-    let inst = Installable::new(&inst_path);
-    eval::derivation_closure_paths(&inst).map_err(Into::into)
-}
-
-fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
-    std::fs::create_dir_all(dst)?;
-    for entry in std::fs::read_dir(src)? {
-        let entry = entry?;
-        let ty = entry.file_type()?;
-        let dst_path = dst.join(entry.file_name());
-        if ty.is_dir() {
-            copy_dir_recursive(&entry.path(), &dst_path)?;
-        } else {
-            std::fs::copy(entry.path(), dst_path)?;
-        }
-    }
     Ok(())
 }
 
@@ -784,7 +381,7 @@ fn cmd_auth(command: AuthCommand) -> color_eyre::Result<()> {
             save_config(&config)?;
             tracing::info!("Token saved for {cache}");
             Ok(())
-        },
+        }
 
         AuthCommand::Logout { cache } => {
             let mut config = ClientConfig::load()?;
@@ -798,7 +395,7 @@ fn cmd_auth(command: AuthCommand) -> color_eyre::Result<()> {
             }
 
             Ok(())
-        },
+        }
 
         AuthCommand::Status => {
             let config = ClientConfig::load()?;
@@ -825,7 +422,7 @@ fn cmd_auth(command: AuthCommand) -> color_eyre::Result<()> {
             }
 
             Ok(())
-        },
+        }
     }
 }
 
@@ -865,6 +462,19 @@ fn save_config(config: &ClientConfig) -> color_eyre::Result<()> {
         content.push('\n');
     }
 
-    std::fs::write(&config_path, content)?;
+    // Write with restrictive permissions since the file may contain tokens.
+    {
+        use std::io::Write;
+        #[cfg(unix)]
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        opts.mode(0o600);
+
+        let mut file = opts.open(&config_path)?;
+        file.write_all(content.as_bytes())?;
+    }
     Ok(())
 }

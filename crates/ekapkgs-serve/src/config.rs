@@ -6,6 +6,7 @@ pub struct Config {
     pub server: ServerConfig,
     pub storage: StorageConfig,
     pub signing: SigningConfig,
+    pub auth: Option<AuthConfig>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -30,6 +31,13 @@ pub enum StorageConfig {
 #[derive(Debug, Deserialize)]
 pub struct SigningConfig {
     pub secret_key_file: PathBuf,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AuthConfig {
+    /// Bearer tokens that are allowed to push to the cache.
+    #[serde(default)]
+    pub write_tokens: Vec<String>,
 }
 
 impl Config {
