@@ -134,7 +134,7 @@ in
 
     networking.firewall.allowedTCPPorts =
       let
-        port = cfg.settings.server.bind or "0.0.0.0:8080";
+        port = cfg.settings.server.bind or "127.0.0.1:8080";
         portNum = lib.toInt (lib.last (lib.splitString ":" port));
       in
       lib.mkIf cfg.openFirewall [ portNum ];
