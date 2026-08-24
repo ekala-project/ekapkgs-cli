@@ -52,6 +52,11 @@ pub async fn get_narinfo(
         }
     };
 
+    // Record access for GC tracking.
+    if let Some(ref tracker) = state.gc_tracker {
+        tracker.record_access(hash);
+    }
+
     let body = narinfo.to_narinfo_string();
     (
         StatusCode::OK,
@@ -70,6 +75,12 @@ pub async fn get_nar(
 
     match state.storage.get_nar(&nar_path) {
         Ok(Some(data)) => {
+            // Record access for GC tracking.
+            if let Some(ref tracker) = state.gc_tracker {
+                let hash = file.split('.').next().unwrap_or(&file);
+                tracker.record_access(hash);
+            }
+
             let content_type = if file.ends_with(".zst") {
                 "application/zstd"
             } else if file.ends_with(".xz") {

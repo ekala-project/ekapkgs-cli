@@ -96,6 +96,15 @@ impl CacheService for NegotiateService {
             None
         };
 
+        // Record accesses for GC tracking.
+        if let Some(ref tracker) = self.state.gc_tracker {
+            for entry in &available {
+                if let Some(hash) = entry.store_path.rsplit('/').next().and_then(|b| b.split('-').next()) {
+                    tracker.record_access(hash);
+                }
+            }
+        }
+
         // Build download plan: topological sort by references.
         let download_plan = build_download_plan(&available, &have_set);
 

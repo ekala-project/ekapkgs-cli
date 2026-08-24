@@ -1,5 +1,6 @@
 mod api;
 mod config;
+mod gc;
 mod signing;
 mod storage;
 
@@ -80,6 +81,7 @@ pub struct AppState {
     pub storage: Box<dyn StorageBackend>,
     pub signer: NarInfoSigner,
     pub cert_signer: Option<signing::CertSigner>,
+    pub gc_tracker: Option<Arc<gc::GcTracker>>,
 }
 
 fn build_http_router(state: Arc<AppState>) -> Router {
@@ -203,6 +205,7 @@ async fn cmd_serve(cli: Cli) -> color_eyre::Result<()> {
     let storage_backend: Box<dyn StorageBackend>;
     let signer: NarInfoSigner;
     let cert_signer: Option<signing::CertSigner>;
+    let gc_tracker: Option<Arc<gc::GcTracker>>;
 
     if let Some(config_path) = &cli.config {
         let config = Config::load(config_path)?;
@@ -217,10 +220,29 @@ async fn cmd_serve(cli: Cli) -> color_eyre::Result<()> {
             None
         };
         storage_backend = match config.storage {
-            config::StorageConfig::Filesystem { path } => {
+            config::StorageConfig::Filesystem { path, gc } => {
+                let gc_t = if let Some(gc_raw) = gc {
+                    let max_size = gc::parse_byte_size(&gc_raw.max_size)?;
+                    let target_size = gc_raw
+                        .target_size
+                        .as_deref()
+                        .map(gc::parse_byte_size)
+                        .transpose()?
+                        .unwrap_or(max_size * 4 / 5); // 80% default
+                    let gc_config = gc::GcConfig {
+                        max_size,
+                        target_size,
+                        gc_interval: std::time::Duration::from_secs(gc_raw.gc_interval_secs),
+                    };
+                    Some(gc::init(&path, gc_config)?)
+                } else {
+                    None
+                };
+                gc_tracker = gc_t;
                 Box::new(storage::filesystem::FilesystemBackend::new(path))
             }
             config::StorageConfig::NixStore => {
+                gc_tracker = None;
                 Box::new(storage::nix_store::NixStoreBackend::new())
             }
         };
@@ -232,6 +254,7 @@ async fn cmd_serve(cli: Cli) -> color_eyre::Result<()> {
         })?;
         signer = NarInfoSigner::from_file(&signing_key)?;
         cert_signer = None;
+        gc_tracker = None;
 
         let storage_str = cli.storage.unwrap_or_else(|| "nix-store".to_string());
         storage_backend = if storage_str == "nix-store" {
@@ -247,6 +270,7 @@ async fn cmd_serve(cli: Cli) -> color_eyre::Result<()> {
         storage: storage_backend,
         signer,
         cert_signer,
+        gc_tracker,
     });
 
     let addr: SocketAddr = bind_addr.parse()?;

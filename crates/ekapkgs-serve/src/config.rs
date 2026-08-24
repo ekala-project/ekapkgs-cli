@@ -22,7 +22,10 @@ fn default_bind() -> String {
 #[serde(tag = "backend")]
 pub enum StorageConfig {
     #[serde(rename = "filesystem")]
-    Filesystem { path: PathBuf },
+    Filesystem {
+        path: PathBuf,
+        gc: Option<GcRawConfig>,
+    },
     #[serde(rename = "nix-store")]
     NixStore,
 }
@@ -37,6 +40,21 @@ pub struct SigningConfig {
 pub struct CertificateConfig {
     pub cert_file: PathBuf,
     pub private_key_file: PathBuf,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct GcRawConfig {
+    /// Maximum cache size (e.g., "50GiB").
+    pub max_size: String,
+    /// GC target size (e.g., "40GiB"). Defaults to 80% of max_size.
+    pub target_size: Option<String>,
+    /// GC check interval in seconds. Default: 300.
+    #[serde(default = "default_gc_interval")]
+    pub gc_interval_secs: u64,
+}
+
+fn default_gc_interval() -> u64 {
+    300
 }
 
 impl Config {
