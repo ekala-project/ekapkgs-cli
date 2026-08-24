@@ -1,0 +1,16 @@
+[package]
+name = "ekapkgs"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "ekapkgs"
+path = "src/main.rs"
+
+[dependencies]
+ekapkgs-nix.workspace = true
+ekapkgs-ui.workspace = true
+clap.workspace = true
+clap-verbosity-flag.workspace = true
+color-eyre.workspace = true
+tracing.workspace = true

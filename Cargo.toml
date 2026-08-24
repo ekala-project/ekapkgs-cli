@@ -1,0 +1,59 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/ekapkgs",
+    "crates/ekapkgs-serve",
+    "crates/ekapkgs-protocol",
+    "crates/ekapkgs-nix",
+    "crates/ekapkgs-ui",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MPL-2.0"
+rust-version = "1.85"
+
+[workspace.dependencies]
+ekapkgs-protocol = { path = "crates/ekapkgs-protocol" }
+ekapkgs-nix = { path = "crates/ekapkgs-nix" }
+ekapkgs-ui = { path = "crates/ekapkgs-ui" }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+color-eyre = "0.6"
+thiserror = "2"
+
+clap = { version = "4", features = ["derive", "color", "env"] }
+clap-verbosity-flag = "3"
+
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+indicatif = "0.17"
+yansi = "1"
+
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+data-encoding = "2"
+sha2 = "0.10"
+
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", features = ["json", "stream", "rustls-tls"] }
+futures = "0.3"
+
+axum = "0.8"
+tower = "0.5"
+tower-http = { version = "0.6", features = ["compression-zstd", "cors", "trace"] }
+
+prost = "0.13"
+tonic = "0.12"
+
+toml = "0.8"
+directories = "6"
+tempfile = "3"
+
+[profile.release]
+lto = "fat"
+opt-level = 3
+strip = true

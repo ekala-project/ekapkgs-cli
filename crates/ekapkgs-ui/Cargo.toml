@@ -1,0 +1,13 @@
+[package]
+name = "ekapkgs-ui"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+color-eyre.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+indicatif.workspace = true
+yansi.workspace = true
+clap-verbosity-flag.workspace = true
+log = "0.4"
