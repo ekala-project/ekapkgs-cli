@@ -54,6 +54,8 @@ tower-http = { version = "0.6", features = ["compression-zstd", "cors", "trace"]
 prost = "0.13"
 tonic = "0.12"
 
+prometheus = "0.13"
+
 toml = "0.8"
 directories = "6"
 tempfile = "3"

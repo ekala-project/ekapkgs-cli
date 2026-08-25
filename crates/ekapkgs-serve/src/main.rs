@@ -1,6 +1,7 @@
 mod api;
 mod config;
 mod gc;
+pub mod metrics;
 mod signing;
 mod storage;
 mod tokens;
@@ -110,6 +111,7 @@ pub struct AppState {
     pub gc_tracker: Option<Arc<gc::GcTracker>>,
     pub write_tokens: Option<Vec<String>>,
     pub delta_cache: DeltaCache,
+    pub metrics: metrics::Metrics,
 }
 
 /// Cache for computed delta NARs, keyed by (base_hash, target_hash).
@@ -158,6 +160,19 @@ impl Default for DeltaCache {
     }
 }
 
+async fn metrics_handler(
+    axum::extract::State(state): axum::extract::State<Arc<AppState>>,
+) -> impl axum::response::IntoResponse {
+    (
+        axum::http::StatusCode::OK,
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; version=0.0.4",
+        )],
+        state.metrics.render(),
+    )
+}
+
 fn build_http_router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/nix-cache-info", get(api::compat::nix_cache_info))
@@ -177,6 +192,7 @@ fn build_http_router(state: Arc<AppState>) -> Router {
             "/delta/{base_hash}/{target_hash}",
             get(api::delta::get_delta),
         )
+        .route("/metrics", get(metrics_handler))
         .with_state(state)
 }
 
@@ -376,6 +392,15 @@ async fn cmd_serve(cli: Cli) -> color_eyre::Result<()> {
     let cert_signer: Option<signing::CertSigner>;
     let gc_tracker: Option<Arc<gc::GcTracker>>;
     let write_tokens: Option<Vec<String>>;
+    let server_metrics = metrics::Metrics::new();
+
+    let gc_metrics = gc::GcMetrics {
+        runs_total: server_metrics.gc_runs_total.clone(),
+        paths_evicted_total: server_metrics.gc_paths_evicted_total.clone(),
+        bytes_freed_total: server_metrics.gc_bytes_freed_total.clone(),
+        cache_size_bytes: server_metrics.cache_size_bytes.clone(),
+        cache_paths_total: server_metrics.cache_paths_total.clone(),
+    };
 
     if let Some(config_path) = &cli.config {
         let config = Config::load(config_path)?;
@@ -404,7 +429,7 @@ async fn cmd_serve(cli: Cli) -> color_eyre::Result<()> {
                         target_size,
                         gc_interval: std::time::Duration::from_secs(gc_raw.gc_interval_secs),
                     };
-                    Some(gc::init(&path, gc_config)?)
+                    Some(gc::init(&path, gc_config, Some(gc_metrics.clone()))?)
                 } else {
                     None
                 };
@@ -455,7 +480,7 @@ async fn cmd_serve(cli: Cli) -> color_eyre::Result<()> {
                         target_size,
                         gc_interval: std::time::Duration::from_secs(gc_raw.gc_interval_secs),
                     };
-                    Some(gc::init(&path, gc_config)?)
+                    Some(gc::init(&path, gc_config, Some(gc_metrics.clone()))?)
                 } else {
                     None
                 };
@@ -512,6 +537,7 @@ async fn cmd_serve(cli: Cli) -> color_eyre::Result<()> {
         gc_tracker,
         write_tokens,
         delta_cache: DeltaCache::new(),
+        metrics: server_metrics,
     });
 
     let addr: SocketAddr = bind_addr.parse()?;

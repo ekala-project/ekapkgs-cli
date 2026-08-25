@@ -33,6 +33,7 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 blake3.workspace = true
 fastcdc.workspace = true
 zstd.workspace = true
+prometheus.workspace = true
 
 [features]
 s3 = ["dep:aws-sdk-s3", "dep:aws-config"]
