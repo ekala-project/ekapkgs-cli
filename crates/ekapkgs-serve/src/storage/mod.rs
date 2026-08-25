@@ -1,4 +1,6 @@
+pub mod castore;
 pub mod filesystem;
+pub mod nar;
 pub mod nix_store;
 
 /// Parsed narinfo metadata.
@@ -66,19 +68,19 @@ impl NarInfo {
         for line in text.lines() {
             let (key, value) = line.split_once(": ")?;
             match key {
-                "StorePath" => store_path = Some(value.to_string()),
-                "URL" => url = Some(value.to_string()),
-                "Compression" => compression = Some(value.to_string()),
-                "FileHash" => file_hash = Some(value.to_string()),
+                "StorePath" => store_path = Some(value.to_owned()),
+                "URL" => url = Some(value.to_owned()),
+                "Compression" => compression = Some(value.to_owned()),
+                "FileHash" => file_hash = Some(value.to_owned()),
                 "FileSize" => file_size = Some(value.parse().ok()?),
-                "NarHash" => nar_hash = Some(value.to_string()),
+                "NarHash" => nar_hash = Some(value.to_owned()),
                 "NarSize" => nar_size = Some(value.parse().ok()?),
                 "References" => {
                     references = value.split_whitespace().map(String::from).collect();
                 },
-                "Deriver" => deriver = Some(value.to_string()),
-                "Sig" => signatures.push(value.to_string()),
-                "CA" => ca = Some(value.to_string()),
+                "Deriver" => deriver = Some(value.to_owned()),
+                "Sig" => signatures.push(value.to_owned()),
+                "CA" => ca = Some(value.to_owned()),
                 _ => {},
             }
         }
@@ -86,7 +88,7 @@ impl NarInfo {
         Some(NarInfo {
             store_path: store_path?,
             url: url?,
-            compression: compression.unwrap_or_else(|| "none".to_string()),
+            compression: compression.unwrap_or_else(|| "none".to_owned()),
             file_hash: file_hash.unwrap_or_default(),
             file_size: file_size.unwrap_or(0),
             nar_hash: nar_hash?,
@@ -107,6 +109,8 @@ impl NarInfo {
 
 /// Abstract storage backend for the binary cache server.
 pub trait StorageBackend: Send + Sync {
+    /// Downcast to a concrete type for backend-specific operations.
+    fn as_any(&self) -> &dyn std::any::Any;
     /// Check if a narinfo exists for the given store path hash.
     fn has_narinfo(&self, hash: &str) -> color_eyre::Result<bool>;
 
@@ -121,7 +125,7 @@ pub trait StorageBackend: Send + Sync {
         let mut available = Vec::new();
         for hash in hashes {
             if self.has_narinfo(hash)? {
-                available.push((*hash).to_string());
+                available.push((*hash).to_owned());
             }
         }
         Ok(available)
@@ -140,6 +144,21 @@ pub trait StorageBackend: Send + Sync {
     fn put_nar(&self, file_path: &str, data: &[u8]) -> color_eyre::Result<bool> {
         let _ = (file_path, data);
         Ok(false)
+    }
+
+    /// Whether this backend supports content-addressed chunk operations.
+    fn supports_cas(&self) -> bool {
+        false
+    }
+
+    /// Get a chunk by its blake3 digest.
+    fn get_chunk(&self, _digest: &[u8]) -> color_eyre::Result<Option<Vec<u8>>> {
+        Ok(None)
+    }
+
+    /// Get the serialized CaNode root for a store path hash.
+    fn get_cas_root(&self, _hash: &str) -> color_eyre::Result<Option<Vec<u8>>> {
+        Ok(None)
     }
 }
 

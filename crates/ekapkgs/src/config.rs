@@ -1,7 +1,8 @@
-use serde::Deserialize;
 use std::path::PathBuf;
 
-#[derive(Debug, Deserialize, Clone)]
+use serde::Deserialize;
+
+#[derive(Debug, Deserialize, Clone, Default)]
 pub struct ClientConfig {
     #[serde(default)]
     pub defaults: Defaults,
@@ -83,14 +84,5 @@ impl ClientConfig {
             .iter()
             .find(|c| c.url == url)
             .and_then(|c| c.token.clone())
-    }
-}
-
-impl Default for ClientConfig {
-    fn default() -> Self {
-        Self {
-            defaults: Defaults::default(),
-            caches: Vec::new(),
-        }
     }
 }

@@ -12,6 +12,7 @@ serde_json.workspace = true
 serde.workspace = true
 data-encoding.workspace = true
 ed25519-dalek.workspace = true
+blake3.workspace = true
 rand = "0.8"
 
 [[test]]

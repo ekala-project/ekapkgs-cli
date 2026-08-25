@@ -8,7 +8,7 @@ use crate::AppState;
 
 /// GET /nix-cache-info
 pub async fn nix_cache_info(State(_state): State<Arc<AppState>>) -> impl IntoResponse {
-    let body = format!("StoreDir: /nix/store\nWantMassQuery: 1\nPriority: 30\n");
+    let body = "StoreDir: /nix/store\nWantMassQuery: 1\nPriority: 30\n".to_owned();
     (
         StatusCode::OK,
         [(header::CONTENT_TYPE, "text/x-nix-cache-info")],

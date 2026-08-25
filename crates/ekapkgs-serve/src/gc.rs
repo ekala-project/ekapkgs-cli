@@ -30,7 +30,7 @@ impl GcTracker {
     /// Record that a store path hash was accessed. Non-blocking.
     pub fn record_access(&self, hash: &str) {
         let _ = self.event_tx.send(GcEvent::Access {
-            hash: hash.to_string(),
+            hash: hash.to_owned(),
         });
     }
 }
@@ -39,6 +39,7 @@ impl GcTracker {
 ///
 /// Returns the tracker to put in AppState. The background task is spawned
 /// automatically and runs for the server's lifetime.
+#[allow(clippy::needless_pass_by_value)]
 pub fn init(cache_root: &Path, config: GcConfig) -> color_eyre::Result<Arc<GcTracker>> {
     let db_path = cache_root.join(".ekapkgs-gc.db");
 
@@ -248,7 +249,7 @@ fn run_gc(
                 size: size as u64,
             })
         })?
-        .filter_map(|r| r.ok())
+        .filter_map(std::result::Result::ok)
         .collect();
 
     // Build reverse reference graph: referee -> set of referrers.
@@ -256,7 +257,7 @@ fn run_gc(
     let mut stmt = conn.prepare("SELECT referrer, referee FROM refs")?;
     let refs: Vec<(String, String)> = stmt
         .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
-        .filter_map(|r| r.ok())
+        .filter_map(std::result::Result::ok)
         .collect();
 
     let all_hashes: HashSet<&str> = entries.iter().map(|e| e.hash.as_str()).collect();
@@ -405,13 +406,11 @@ fn initial_scan(db_path: &Path, cache_root: &Path) -> color_eyre::Result<()> {
             continue;
         }
 
-        let narinfo_text = match std::fs::read_to_string(entry.path()) {
-            Ok(t) => t,
-            Err(_) => continue,
+        let Ok(narinfo_text) = std::fs::read_to_string(entry.path()) else {
+            continue;
         };
-        let narinfo = match crate::storage::NarInfo::parse(&narinfo_text) {
-            Some(ni) => ni,
-            None => continue,
+        let Some(narinfo) = crate::storage::NarInfo::parse(&narinfo_text) else {
+            continue;
         };
 
         let narinfo_size = narinfo_text.len() as u64;
@@ -419,7 +418,8 @@ fn initial_scan(db_path: &Path, cache_root: &Path) -> color_eyre::Result<()> {
         let file_size = std::fs::metadata(&nar_path).map(|m| m.len()).unwrap_or(0);
 
         tx.execute(
-            "INSERT OR IGNORE INTO store_paths (hash, store_path, nar_url, file_size, narinfo_size, last_access, added_at)
+            "INSERT OR IGNORE INTO store_paths (hash, store_path, nar_url, file_size, \
+             narinfo_size, last_access, added_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
                 hash,

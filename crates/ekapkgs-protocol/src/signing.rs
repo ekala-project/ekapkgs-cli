@@ -151,11 +151,11 @@ pub fn issue_certificate(
     not_after: u64,
 ) -> SigningCertificate {
     let cert = SigningCertificate {
-        name: cert_name.to_string(),
+        name: cert_name.to_owned(),
         public_key: cert_public_key.as_bytes().to_vec(),
         not_before,
         not_after,
-        issuer: ca_name.to_string(),
+        issuer: ca_name.to_owned(),
         issuer_signature: Vec::new(), // placeholder, computed below
     };
 

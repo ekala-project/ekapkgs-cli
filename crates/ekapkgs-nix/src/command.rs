@@ -22,7 +22,7 @@ impl NixCommand {
     /// ```
     pub fn new(subcommand: &[&str]) -> Self {
         Self {
-            subcommand: subcommand.iter().map(|s| (*s).to_string()).collect(),
+            subcommand: subcommand.iter().map(|s| (*s).to_owned()).collect(),
             args: Vec::new(),
             env: HashMap::new(),
         }

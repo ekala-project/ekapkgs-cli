@@ -65,7 +65,7 @@ impl TokenStore {
             .as_secs();
 
         self.tokens.push(Token {
-            name: name.to_string(),
+            name: name.to_owned(),
             token: token_value.clone(),
             permissions,
             created_at: now,

@@ -1,13 +1,12 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use tonic::{Request, Response, Status};
-
 use ekapkgs_protocol::ekapkgs::v1::cache_service_server::CacheService;
 use ekapkgs_protocol::ekapkgs::v1::{
-    Compression, DownloadBatch, DownloadPlan, NegotiateRequest, NegotiateResponse,
-    PathManifestEntry,
+    CaPathMapping, ChunkDownload, ChunkNegotiateRequest, ChunkNegotiateResponse, Compression,
+    DownloadBatch, DownloadPlan, NegotiateRequest, NegotiateResponse, PathManifestEntry,
 };
+use tonic::{Request, Response, Status};
 
 use crate::AppState;
 
@@ -23,7 +22,7 @@ impl CacheService for NegotiateService {
     ) -> Result<Response<NegotiateResponse>, Status> {
         let req = request.into_inner();
 
-        let have_set: HashSet<&str> = req.have.iter().map(|s| s.as_str()).collect();
+        let have_set: HashSet<&str> = req.have.iter().map(std::string::String::as_str).collect();
 
         let mut available = Vec::new();
         let mut unavailable = Vec::new();
@@ -113,6 +112,28 @@ impl CacheService for NegotiateService {
         // Build download plan: topological sort by references.
         let download_plan = build_download_plan(&available, &have_set);
 
+        // If client supports CAS and backend has CAS data, include path mappings.
+        let ca_path_mappings = if req.supports_cas && self.state.storage.supports_cas() {
+            available
+                .iter()
+                .filter_map(|entry| {
+                    let hash = entry
+                        .store_path
+                        .rsplit('/')
+                        .next()
+                        .and_then(|b| b.split('-').next())?;
+                    let root_bytes = self.state.storage.get_cas_root(hash).ok()??;
+                    let root_node = prost::Message::decode(root_bytes.as_slice()).ok()?;
+                    Some(CaPathMapping {
+                        store_path_hash: hash.to_owned(),
+                        root_node: Some(root_node),
+                    })
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+
         Ok(Response::new(NegotiateResponse {
             available,
             unavailable,
@@ -120,6 +141,96 @@ impl CacheService for NegotiateService {
             download_plan: Some(download_plan),
             total_download_size,
             total_nar_size,
+            ca_path_mappings,
+        }))
+    }
+
+    async fn negotiate_chunks(
+        &self,
+        request: Request<ChunkNegotiateRequest>,
+    ) -> Result<Response<ChunkNegotiateResponse>, Status> {
+        if !self.state.storage.supports_cas() {
+            return Err(Status::unimplemented("CAS storage not configured"));
+        }
+
+        let req = request.into_inner();
+
+        // Build the set of chunk digests the client already has.
+        let have_digests: std::collections::HashSet<[u8; 32]> = req
+            .have_chunks
+            .iter()
+            .filter_map(|d| d.digest.as_slice().try_into().ok())
+            .collect();
+
+        let mut path_mappings = Vec::new();
+        let mut unavailable = Vec::new();
+
+        // Collect root nodes for each wanted path.
+        let mut want_hashes = Vec::new();
+        for hash in &req.want {
+            match self.state.storage.get_cas_root(hash) {
+                Ok(Some(root_bytes)) => {
+                    if let Ok(root_node) = prost::Message::decode(root_bytes.as_slice()) {
+                        path_mappings.push(CaPathMapping {
+                            store_path_hash: hash.clone(),
+                            root_node: Some(root_node),
+                        });
+                        want_hashes.push(hash.as_str());
+                    } else {
+                        unavailable.push(hash.clone());
+                    }
+                },
+                Ok(None) => unavailable.push(hash.clone()),
+                Err(e) => {
+                    tracing::warn!("Failed to query CAS root for {hash}: {e}");
+                    unavailable.push(hash.clone());
+                },
+            }
+        }
+
+        // Walk the Merkle trees to find missing chunks. We need to downcast to
+        // CastoreBackend for the walk_missing_chunks method.
+        let missing_chunks = if let Some(castore) =
+            self.state
+                .storage
+                .as_any()
+                .downcast_ref::<crate::storage::castore::CastoreBackend>()
+        {
+            let chunks = castore
+                .walk_missing_chunks(&want_hashes, &have_digests)
+                .map_err(|e| Status::internal(format!("chunk walk failed: {e}")))?;
+
+            chunks
+                .into_iter()
+                .map(|cm| {
+                    let hex = cm
+                        .digest
+                        .as_ref()
+                        .map(|d| {
+                            d.digest
+                                .iter()
+                                .map(|b| format!("{b:02x}"))
+                                .collect::<String>()
+                        })
+                        .unwrap_or_default();
+                    ChunkDownload {
+                        digest: cm.digest,
+                        size: cm.size,
+                        url: format!("cas/chunk/{hex}"),
+                    }
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        let total_chunk_size: u64 = missing_chunks.iter().map(|c| c.size).sum();
+
+        Ok(Response::new(ChunkNegotiateResponse {
+            path_mappings,
+            missing_chunks,
+            unavailable,
+            total_chunk_size,
         }))
     }
 }
@@ -133,7 +244,7 @@ fn build_download_plan(entries: &[PathManifestEntry], have: &HashSet<&str>) -> D
     // Track which paths have been assigned to a batch.
     let mut assigned: HashSet<usize> = HashSet::new();
     // Track which hashes are "resolved" (available for dependents).
-    let mut resolved: HashSet<String> = have.iter().map(|s| (*s).to_string()).collect();
+    let mut resolved: HashSet<String> = have.iter().map(|s| (*s).to_owned()).collect();
 
     let mut batches = Vec::new();
 
@@ -162,7 +273,7 @@ fn build_download_plan(entries: &[PathManifestEntry], have: &HashSet<&str>) -> D
                     .next()
                     .and_then(|b| b.split('-').next())
                     .unwrap_or("")
-                    .to_string();
+                    .to_owned();
                 batch_paths.push(hash);
                 assigned.insert(i);
             }
@@ -178,7 +289,7 @@ fn build_download_plan(entries: &[PathManifestEntry], have: &HashSet<&str>) -> D
                         .next()
                         .and_then(|b| b.split('-').next())
                         .unwrap_or("")
-                        .to_string();
+                        .to_owned();
                     batch_paths.push(hash);
                 }
             }

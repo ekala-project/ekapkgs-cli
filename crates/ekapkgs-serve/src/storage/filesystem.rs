@@ -16,15 +16,18 @@ impl FilesystemBackend {
 }
 
 impl StorageBackend for FilesystemBackend {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     fn has_narinfo(&self, hash: &str) -> color_eyre::Result<bool> {
         let path = self.root.join(format!("{hash}.narinfo"));
         Ok(path.exists())
     }
 
     fn get_narinfo(&self, hash: &str) -> color_eyre::Result<Option<NarInfo>> {
-        let text = match self.get_narinfo_text(hash)? {
-            Some(t) => t,
-            None => return Ok(None),
+        let Some(text) = self.get_narinfo_text(hash)? else {
+            return Ok(None);
         };
         Ok(NarInfo::parse(&text))
     }

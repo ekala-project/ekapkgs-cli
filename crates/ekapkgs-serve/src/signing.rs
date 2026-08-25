@@ -15,7 +15,7 @@ impl NarInfoSigner {
     ///
     /// The file format is `key-name:base64-encoded-ed25519-secret-key`.
     pub fn from_file(path: &std::path::Path) -> color_eyre::Result<Self> {
-        let contents = std::fs::read_to_string(path)?.trim().to_string();
+        let contents = std::fs::read_to_string(path)?.trim().to_owned();
         let (name, key_b64) = contents
             .split_once(':')
             .ok_or_else(|| color_eyre::eyre::eyre!("invalid key format: expected name:base64"))?;
@@ -35,7 +35,7 @@ impl NarInfoSigner {
         let signing_key = SigningKey::from_bytes(&secret);
 
         Ok(Self {
-            key_name: name.to_string(),
+            key_name: name.to_owned(),
             signing_key,
         })
     }
@@ -79,7 +79,7 @@ impl CertSigner {
         let cert_json = std::fs::read_to_string(cert_path)?;
         let cert_file: CertFileFormat = serde_json::from_str(&cert_json)?;
 
-        let key_contents = std::fs::read_to_string(key_path)?.trim().to_string();
+        let key_contents = std::fs::read_to_string(key_path)?.trim().to_owned();
         let (_name, key_b64) = key_contents
             .split_once(':')
             .ok_or_else(|| color_eyre::eyre::eyre!("invalid key format"))?;

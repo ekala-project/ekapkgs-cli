@@ -1,0 +1,84 @@
+syntax = "proto3";
+package ekapkgs.v1;
+
+// A blake3 digest identifying a blob or directory in the content store.
+message B3Digest {
+  bytes digest = 1; // 32 bytes
+}
+
+// Metadata for a single chunk of a blob.
+message ChunkMeta {
+  B3Digest digest = 1;
+  uint64 size = 2;
+}
+
+// A node in the content-addressed filesystem tree.
+message CaNode {
+  oneof node {
+    CaDirectoryNode directory = 1;
+    CaFileNode file = 2;
+    CaSymlinkNode symlink = 3;
+  }
+}
+
+message CaDirectoryNode {
+  B3Digest digest = 1;
+  uint64 size = 2;
+}
+
+message CaFileNode {
+  B3Digest digest = 1;
+  uint64 size = 2;
+  bool executable = 3;
+}
+
+message CaSymlinkNode {
+  string target = 1;
+}
+
+// An entry within a content-addressed directory.
+message CaDirectoryEntry {
+  string name = 1;
+  CaNode node = 2;
+}
+
+// A content-addressed directory containing named entries.
+message CaDirectory {
+  repeated CaDirectoryEntry entries = 1;
+}
+
+// Mapping from a store path hash to its CAS root node.
+message CaPathMapping {
+  string store_path_hash = 1;
+  CaNode root_node = 2;
+}
+
+// Chunk-level negotiation request.
+message ChunkNegotiateRequest {
+  // Store path hashes the client needs.
+  repeated string want = 1;
+  // Blake3 digests of chunks the client already has locally.
+  repeated B3Digest have_chunks = 2;
+  // Store path hashes the client already has (for reference resolution).
+  repeated string have = 3;
+}
+
+// Chunk-level negotiation response.
+message ChunkNegotiateResponse {
+  // For each requested path, its CAS root node.
+  repeated CaPathMapping path_mappings = 1;
+  // Chunks the client needs to download (those not in have_chunks).
+  repeated ChunkDownload missing_chunks = 2;
+  // Store path hashes the server does not have.
+  repeated string unavailable = 3;
+  // Total size of missing chunks for progress display.
+  uint64 total_chunk_size = 4;
+}
+
+// A single chunk to download.
+message ChunkDownload {
+  B3Digest digest = 1;
+  uint64 size = 2;
+  // Relative URL for downloading this chunk.
+  string url = 3;
+}

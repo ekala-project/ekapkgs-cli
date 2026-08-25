@@ -9,7 +9,7 @@ pub fn spinner(message: &str) -> ProgressBar {
             .template("{spinner:.blue} {msg}")
             .expect("valid template"),
     );
-    pb.set_message(message.to_string());
+    pb.set_message(message.to_owned());
     pb.enable_steady_tick(std::time::Duration::from_millis(80));
     pb
 }
