@@ -23,9 +23,6 @@ const ACT_BUILD_WAITING: u32 = 111;
 const RES_SET_PHASE: u32 = 104;
 const RES_PROGRESS: u32 = 105;
 
-/// Maximum number of activity lines to show.
-const MAX_DISPLAY_LINES: usize = 12;
-
 // --- JSON event parsing ---
 
 #[derive(Debug, Deserialize)]
@@ -40,6 +37,8 @@ struct NixEvent {
     #[serde(rename = "type", default)]
     activity_type: u32,
     #[serde(default)]
+    parent: u64,
+    #[serde(default)]
     fields: Vec<serde_json::Value>,
     #[serde(default)]
     msg: String,
@@ -50,6 +49,8 @@ struct NixEvent {
 #[derive(Debug, Clone)]
 struct Activity {
     activity_type: u32,
+    #[allow(dead_code)]
+    parent: u64,
     text: String,
     drv_name: Option<String>,
     phase: Option<String>,
@@ -135,6 +136,7 @@ impl BuildMonitor {
 
         let activity = Activity {
             activity_type: event.activity_type,
+            parent: event.parent,
             text: event.text.clone(),
             drv_name,
             phase: None,
@@ -205,7 +207,7 @@ impl BuildMonitor {
         }
     }
 
-    /// Render the current state to stderr.
+    /// Render the current state to stderr with nom-style tree display.
     pub fn render(&mut self) {
         let mut stderr = std::io::stderr();
 
@@ -220,112 +222,150 @@ impl BuildMonitor {
 
         let mut lines: Vec<String> = Vec::new();
 
-        // Active builds.
-        let mut active: Vec<&Activity> = self
+        // ━━━ Build dependency tree ━━━
+        let mut active_builds: Vec<(&u64, &Activity)> = self
             .activities
-            .values()
-            .filter(|a| a.activity_type == ACT_BUILD)
+            .iter()
+            .filter(|(_, a)| a.activity_type == ACT_BUILD)
             .collect();
-        active.sort_by_key(|a| std::cmp::Reverse(a.started_at));
+        active_builds.sort_by_key(|(_, a)| a.started_at);
 
-        for activity in active.iter().take(MAX_DISPLAY_LINES / 2) {
-            let name = activity.drv_name.as_deref().unwrap_or(&activity.text);
-            let elapsed = format_duration(activity.started_at.elapsed());
-            let phase = activity
-                .phase
-                .as_deref()
-                .map(|p| format!(" ({p})"))
-                .unwrap_or_default();
-            lines.push(format!(
-                "  {} {}{phase}  {elapsed}",
-                "⏵".yellow().bold(),
-                name.bold(),
-            ));
-        }
-
-        // Waiting builds.
-        let waiting: Vec<&Activity> = self
+        let waiting_builds: Vec<(&u64, &Activity)> = self
             .activities
-            .values()
-            .filter(|a| a.activity_type == ACT_BUILD_WAITING)
+            .iter()
+            .filter(|(_, a)| a.activity_type == ACT_BUILD_WAITING)
             .collect();
-        for activity in waiting.iter().take(3) {
-            let name = activity.drv_name.as_deref().unwrap_or(&activity.text);
-            lines.push(format!("  {} {}", "⏸".blue(), name.dim()));
-        }
-        if waiting.len() > 3 {
-            lines.push(format!(
-                "  {} {} more waiting...",
-                "⏸".blue(),
-                waiting.len() - 3
-            ));
+
+        if !active_builds.is_empty() || !waiting_builds.is_empty() {
+            let total_tree_items = active_builds.len() + waiting_builds.len();
+
+            for (idx, (_id, activity)) in active_builds.iter().enumerate() {
+                let name = activity.drv_name.as_deref().unwrap_or(&activity.text);
+                let elapsed = format_duration(activity.started_at.elapsed());
+                let phase = activity
+                    .phase
+                    .as_deref()
+                    .map(|p| format!(" {}", p.dim()))
+                    .unwrap_or_default();
+                let is_last = idx == total_tree_items - 1 && waiting_builds.is_empty();
+                let branch = if is_last { "┗" } else { "┣" };
+                lines.push(format!(
+                    " {} {} {}{}  {}",
+                    branch.dim(),
+                    "⏵".yellow().bold(),
+                    name.yellow().bold(),
+                    phase,
+                    elapsed.dim(),
+                ));
+            }
+
+            for (idx, (_id, activity)) in waiting_builds.iter().enumerate() {
+                let name = activity.drv_name.as_deref().unwrap_or(&activity.text);
+                let is_last = idx == waiting_builds.len() - 1;
+                let branch = if is_last { "┗" } else { "┣" };
+                if idx < 3 {
+                    lines.push(format!(" {} {} {}", branch.dim(), "⏸".blue(), name.dim(),));
+                } else if idx == 3 {
+                    let remaining = waiting_builds.len() - 3;
+                    lines.push(format!(
+                        " {} {} {}",
+                        "┗".dim(),
+                        "⏸".blue(),
+                        format!("…{remaining} more queued").dim(),
+                    ));
+                    break;
+                }
+            }
         }
 
-        // Active downloads.
-        let downloads: Vec<&Activity> = self
+        // ━━━ Downloads ━━━
+        let mut downloads: Vec<&Activity> = self
             .activities
             .values()
             .filter(|a| a.activity_type == ACT_SUBSTITUTE || a.activity_type == ACT_COPY_PATH)
             .collect();
-        for activity in downloads.iter().take(3) {
-            let name = activity.drv_name.as_deref().unwrap_or(&activity.text);
-            let elapsed = format_duration(activity.started_at.elapsed());
-            lines.push(format!("  {} {}  {elapsed}", "↓".cyan().bold(), name,));
-        }
-        if downloads.len() > 3 {
-            lines.push(format!(
-                "  {} {} more downloading...",
-                "↓".cyan(),
-                downloads.len() - 3
-            ));
-        }
+        downloads.sort_by_key(|a| a.started_at);
 
-        // Recent completions (last 3).
-        let recent_completed: Vec<_> = self.completed.iter().rev().take(3).collect();
-        for (name, state, elapsed) in recent_completed.into_iter().rev() {
-            let dur = format_duration(*elapsed);
-            match state {
-                DrvState::Succeeded => {
-                    lines.push(format!("  {} {}  {dur}", "✔".green(), name.dim()));
-                },
-                DrvState::Failed => {
-                    lines.push(format!("  {} {}", "✘".red().bold(), name.red()));
-                },
-                DrvState::Downloading => {
-                    lines.push(format!("  {} {}  {dur}", "↓ ✔".green(), name.dim()));
-                },
+        if !downloads.is_empty() {
+            if !lines.is_empty() {
+                lines.push(String::new());
+            }
+            for (idx, activity) in downloads.iter().enumerate() {
+                let name = activity.drv_name.as_deref().unwrap_or(&activity.text);
+                let elapsed = format_duration(activity.started_at.elapsed());
+                if idx < 4 {
+                    let is_last = idx == downloads.len() - 1 || idx == 3;
+                    let branch = if is_last { "┗" } else { "┣" };
+                    lines.push(format!(
+                        " {} {} {}  {}",
+                        branch.dim(),
+                        "↓".cyan().bold(),
+                        name.cyan(),
+                        elapsed.dim(),
+                    ));
+                } else if idx == 4 {
+                    let remaining = downloads.len() - 4;
+                    lines.push(format!(
+                        " {} {} {}",
+                        "┗".dim(),
+                        "↓".cyan(),
+                        format!("…{remaining} more").dim(),
+                    ));
+                    break;
+                }
             }
         }
 
-        // Summary line.
+        // ━━━ Summary table ━━━
+        lines.push(String::new());
         let elapsed = format_duration(self.start_time.elapsed());
-        let mut summary_parts = Vec::new();
+        let sep = "━".repeat(42).dim().to_string();
+        lines.push(format!(" {sep}"));
 
-        if self.build_expected > 0 || self.build_done > 0 {
-            summary_parts.push(format!("{}/{} built", self.build_done, self.build_expected));
-        }
-        if self.build_running > 0 {
-            summary_parts.push(format!("{} building", self.build_running));
-        }
-        if self.download_done > 0 || self.download_expected > 0 {
-            summary_parts.push(format!(
-                "{}/{} downloaded",
-                self.download_done, self.download_expected
-            ));
-        }
+        // Builds row
+        let build_planned = self
+            .build_expected
+            .saturating_sub(self.build_done + self.build_running + self.build_failed);
+        lines.push(format!(
+            "  {} {} {}  {} {}  {} {}  {} {}",
+            "Builds".bold(),
+            "⏵".yellow().bold(),
+            self.build_running.to_string().yellow().bold(),
+            "✔".green(),
+            self.build_done.to_string().green(),
+            "⏸".blue(),
+            build_planned.to_string().blue(),
+            "∑".dim(),
+            self.build_expected.to_string().dim(),
+        ));
+
+        // Downloads row
+        let dl_running = self.download_expected.saturating_sub(self.download_done);
+        lines.push(format!(
+            "  {} {} {}  {} {}  {} {}",
+            "Down  ".bold(),
+            "↓".cyan().bold(),
+            dl_running.to_string().cyan().bold(),
+            "✔".green(),
+            self.download_done.to_string().green(),
+            "∑".dim(),
+            self.download_expected.to_string().dim(),
+        ));
+
+        // Failures row (only if any)
         if self.build_failed > 0 {
-            summary_parts.push(format!("{} {}", self.build_failed, "failed".red()));
-        }
-
-        if !summary_parts.is_empty() {
-            lines.push(String::new());
             lines.push(format!(
-                "  {}  {}  {} {elapsed}",
-                "∑".bold(),
-                summary_parts.join("  "),
-                "⏱".dim(),
+                "  {} {} {}",
+                "Errors".bold(),
+                "✘".red().bold(),
+                self.build_failed.to_string().red().bold(),
             ));
         }
+
+        // Time row
+        lines.push(format!("  {} {} {}", "Time  ".bold(), "⏱".dim(), elapsed,));
+
+        lines.push(format!(" {sep}"));
 
         // Write lines.
         for line in &lines {
@@ -356,33 +396,50 @@ impl BuildMonitor {
         let mut stderr = std::io::stderr();
 
         // Show all failures.
-        for (name, state, _) in &self.completed {
-            if *state == DrvState::Failed {
-                let _ = writeln!(stderr, "  {} {}", "✘".red().bold(), name.red());
-            }
-        }
-
-        // Final summary.
-        let mut parts = Vec::new();
-        if self.build_done > 0 {
-            parts.push(format!("{} {}", self.build_done, "built".green()));
-        }
-        if self.download_done > 0 {
-            parts.push(format!("{} {}", self.download_done, "downloaded".cyan()));
-        }
-        if self.build_failed > 0 {
-            parts.push(format!("{} {}", self.build_failed, "failed".red()));
-        }
-
-        if !parts.is_empty() {
+        let failures: Vec<_> = self
+            .completed
+            .iter()
+            .filter(|(_, s, _)| *s == DrvState::Failed)
+            .collect();
+        if !failures.is_empty() {
             let _ = writeln!(
                 stderr,
-                "  {} {}  {} {elapsed}",
-                "∑".bold(),
-                parts.join("  "),
-                "⏱".dim(),
+                " {} {}",
+                "Failures".red().bold(),
+                "━".repeat(34).dim()
+            );
+            for (name, ..) in &failures {
+                let _ = writeln!(stderr, "  {} {}", "✘".red().bold(), name.red());
+            }
+            let _ = writeln!(stderr);
+        }
+
+        // Final summary table.
+        let sep = format!(" {}", "━".repeat(42).dim());
+        let _ = writeln!(stderr, "{sep}");
+
+        if self.build_done > 0 || self.build_failed > 0 {
+            let _ = writeln!(
+                stderr,
+                "  {} {} {}  {} {}",
+                "Builds".bold(),
+                "✔".green(),
+                self.build_done.to_string().green(),
+                "✘".red(),
+                self.build_failed.to_string().red(),
             );
         }
+        if self.download_done > 0 {
+            let _ = writeln!(
+                stderr,
+                "  {} {} {}",
+                "Down  ".bold(),
+                "✔".green(),
+                self.download_done.to_string().green(),
+            );
+        }
+        let _ = writeln!(stderr, "  {} {} {}", "Time  ".bold(), "⏱".dim(), elapsed,);
+        let _ = writeln!(stderr, "{sep}");
     }
 }
 
