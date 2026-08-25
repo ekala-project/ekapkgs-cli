@@ -131,11 +131,16 @@ impl NixCommand {
         let reader = std::io::BufReader::new(stderr);
 
         let mut monitor = ekapkgs_ui::build_monitor::BuildMonitor::new();
+        let mut raw_stderr_lines = Vec::new();
 
         for line in reader.lines() {
             let Ok(line) = line else { break };
             monitor.process_line(&line);
             monitor.render();
+            // Also collect non-JSON lines as fallback.
+            if !line.starts_with("@nix ") && !line.is_empty() {
+                raw_stderr_lines.push(line);
+            }
         }
 
         let status = child.wait().map_err(NixError::Spawn)?;
@@ -143,9 +148,20 @@ impl NixCommand {
         monitor.finish();
 
         if !status.success() {
+            // Prefer error messages parsed from nix's JSON events.
+            // Fall back to raw non-JSON stderr lines if no JSON errors were captured.
+            let errors = monitor.error_messages();
+            let stderr_output = if errors.is_empty() {
+                raw_stderr_lines.join("\n")
+            } else {
+                errors.join("\n")
+            };
+            if !stderr_output.is_empty() {
+                eprintln!("{stderr_output}");
+            }
             return Err(NixError::Failed {
                 status,
-                stderr: String::new(),
+                stderr: stderr_output,
             });
         }
 

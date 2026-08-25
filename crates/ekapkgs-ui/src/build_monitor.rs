@@ -79,6 +79,16 @@ pub struct BuildMonitor {
     start_time: Instant,
     /// Number of lines we rendered last time (for clearing).
     last_render_lines: u16,
+    /// Error/warning messages from nix (level 0 and 1 msg events).
+    error_messages: Vec<String>,
+    /// Whether we've started rendering.
+    has_rendered: bool,
+    /// Whether we've seen any actual build activity (not just downloads).
+    /// Set to true when we see ACT_BUILD start or build_expected > 0.
+    saw_builds: bool,
+    /// Set to true once nix reports expected counts, so we know if there's
+    /// actually work to display.
+    saw_expected: bool,
 }
 
 impl BuildMonitor {
@@ -93,8 +103,37 @@ impl BuildMonitor {
             download_done: 0,
             download_expected: 0,
             start_time: Instant::now(),
+            error_messages: Vec::new(),
             last_render_lines: 0,
+            has_rendered: false,
+            saw_builds: false,
+            saw_expected: false,
         }
+    }
+
+    /// Return collected error/warning messages from nix.
+    pub fn error_messages(&self) -> &[String] {
+        &self.error_messages
+    }
+
+    /// Whether the monitor has determined there is work worth displaying.
+    ///
+    /// Returns false when everything is cached (0 expected builds) or when
+    /// nix hasn't reported any build activity yet.
+    fn should_render(&self) -> bool {
+        // If we've already rendered, keep rendering.
+        if self.has_rendered {
+            return true;
+        }
+        // If nix reported expected counts and there are actual builds, render.
+        if self.saw_expected && self.build_expected > 0 {
+            return true;
+        }
+        // If we see any active build derivation, render.
+        if self.saw_builds {
+            return true;
+        }
+        false
     }
 
     /// Process a single line from nix's stderr.
@@ -143,6 +182,10 @@ impl BuildMonitor {
             started_at: Instant::now(),
         };
 
+        if event.activity_type == ACT_BUILD {
+            self.saw_builds = true;
+        }
+
         self.activities.insert(event.id, activity);
     }
 
@@ -180,6 +223,7 @@ impl BuildMonitor {
                             self.build_done = event.fields[0].as_u64().unwrap_or(0);
                             self.build_expected = event.fields[1].as_u64().unwrap_or(0);
                             self.build_running = event.fields[2].as_u64().unwrap_or(0);
+                            self.saw_expected = true;
                             self.build_failed = event.fields[3].as_u64().unwrap_or(0);
                         },
                         ACT_COPY_PATHS => {
@@ -195,21 +239,38 @@ impl BuildMonitor {
     }
 
     fn handle_msg(&mut self, event: &NixEvent) {
-        // Error messages (level 0) from failed builds.
-        if event.level == 0 && !event.msg.is_empty() {
-            // Check if this references a build failure.
-            if event.msg.contains("failed") {
-                if let Some(name) = extract_drv_name(&event.msg) {
-                    self.completed
-                        .push((name, DrvState::Failed, self.start_time.elapsed()));
-                }
+        if event.msg.is_empty() {
+            return;
+        }
+
+        // Level 0 = error, level 1 = warning.
+        if event.level <= 1 {
+            self.error_messages.push(event.msg.clone());
+        }
+
+        // Track build failures for the DAG display.
+        if event.level == 0 && event.msg.contains("failed") {
+            if let Some(name) = extract_drv_name(&event.msg) {
+                self.completed
+                    .push((name, DrvState::Failed, self.start_time.elapsed()));
             }
         }
     }
 
     /// Render the current state to stderr with nom-style tree display.
+    ///
+    /// Suppresses rendering when there are no actual builds to show
+    /// (e.g., fully cached closures where nix reports 0 expected builds).
     pub fn render(&mut self) {
+        if !self.should_render() {
+            return;
+        }
+        self.has_rendered = true;
+
         let mut stderr = std::io::stderr();
+
+        // Hide cursor to prevent visible hopping during redraws.
+        let _ = crossterm::execute!(stderr, cursor::Hide);
 
         // Clear previous render.
         if self.last_render_lines > 0 {
@@ -367,12 +428,16 @@ impl BuildMonitor {
 
         lines.push(format!(" {sep}"));
 
-        // Write lines.
+        // Buffer the entire frame and write in one shot to avoid flicker.
+        let mut buf = String::new();
         for line in &lines {
-            let _ = writeln!(stderr, "{line}");
+            buf.push_str(line);
+            buf.push('\n');
         }
+        let _ = stderr.write_all(buf.as_bytes());
 
         self.last_render_lines = lines.len() as u16;
+        let _ = crossterm::execute!(stderr, cursor::Show);
         let _ = stderr.flush();
     }
 
@@ -389,8 +454,23 @@ impl BuildMonitor {
     }
 
     /// Print a final summary after the build completes.
+    ///
+    /// If the build completed before the render delay (instant/cached builds),
+    /// no output is produced to avoid flickering.
     pub fn finish(&mut self) {
+        // Always ensure cursor is visible when we're done.
+        let _ = crossterm::execute!(std::io::stderr(), cursor::Show);
+
+        if !self.has_rendered {
+            return;
+        }
         self.clear_display();
+
+        // If nothing was actually built (everything was cached/substituted),
+        // don't print the summary table.
+        if self.build_done == 0 && self.build_failed == 0 && self.download_done == 0 {
+            return;
+        }
 
         let elapsed = format_duration(self.start_time.elapsed());
         let mut stderr = std::io::stderr();

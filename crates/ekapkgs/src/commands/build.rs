@@ -1,5 +1,5 @@
 use ekapkgs_nix::installable::Installable;
-use ekapkgs_nix::{NixCommand, eval, store};
+use ekapkgs_nix::{NixCommand, NixError, eval, store};
 
 use crate::config::ClientConfig;
 
@@ -98,10 +98,18 @@ pub fn execute(installable: &str, extra: &[String]) -> color_eyre::Result<()> {
     for arg in extra {
         cmd = cmd.arg(arg);
     }
-    cmd.stream_with_monitor()?;
-
-    tracing::info!("Build complete");
-    Ok(())
+    match cmd.stream_with_monitor() {
+        Ok(_) => {
+            tracing::info!("Build complete");
+            Ok(())
+        },
+        Err(NixError::Failed { status, .. }) => {
+            // Nix's stderr was already printed by stream_with_monitor.
+            // Exit with nix's exit code without additional ekapkgs error output.
+            std::process::exit(status.code().unwrap_or(1));
+        },
+        Err(e) => Err(e.into()),
+    }
 }
 
 fn format_bytes(bytes: u64) -> String {
