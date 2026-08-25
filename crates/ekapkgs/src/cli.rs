@@ -57,6 +57,12 @@ pub enum Command {
         command: ClosureCommand,
     },
 
+    /// Flake introspection and management.
+    Flake {
+        #[command(subcommand)]
+        command: FlakeCommand,
+    },
+
     /// Manage the local nix store.
     Store {
         #[command(subcommand)]
@@ -232,5 +238,32 @@ pub enum StoreCommand {
         /// Minimum number of valid signatures required.
         #[arg(long)]
         sigs_needed: Option<u32>,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum FlakeCommand {
+    /// Pretty-print flake outputs tree.
+    Show {
+        /// Flake reference (default: current directory).
+        #[arg(default_value = ".")]
+        flake_ref: String,
+    },
+
+    /// Show flake input dependency tree.
+    Metadata {
+        /// Flake reference (default: current directory).
+        #[arg(default_value = ".")]
+        flake_ref: String,
+    },
+
+    /// Update a flake input and show closure size diff.
+    UpdateDiff {
+        /// The flake input to update.
+        input: String,
+
+        /// Installable to evaluate for closure comparison (default: `.`).
+        #[arg(long, default_value = ".")]
+        installable: String,
     },
 }
