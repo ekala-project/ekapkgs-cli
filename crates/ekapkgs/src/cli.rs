@@ -51,6 +51,9 @@ pub enum Command {
         command: CacheCommand,
     },
 
+    /// Check system health and configuration.
+    Doctor,
+
     /// Run a local substituter proxy for transparent nix integration.
     ///
     /// Starts an HTTP server implementing the nix binary cache protocol that
