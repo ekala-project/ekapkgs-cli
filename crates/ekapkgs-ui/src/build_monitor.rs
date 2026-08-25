@@ -79,6 +79,8 @@ pub struct BuildMonitor {
     start_time: Instant,
     /// Number of lines we rendered last time (for clearing).
     last_render_lines: u16,
+    /// Last rendered frame content (for diff-based redraw suppression).
+    last_frame: String,
     /// Error/warning messages from nix (level 0 and 1 msg events).
     error_messages: Vec<String>,
     /// Whether we've started rendering.
@@ -105,6 +107,7 @@ impl BuildMonitor {
             start_time: Instant::now(),
             error_messages: Vec::new(),
             last_render_lines: 0,
+            last_frame: String::new(),
             has_rendered: false,
             saw_builds: false,
             saw_expected: false,
@@ -267,20 +270,6 @@ impl BuildMonitor {
         }
         self.has_rendered = true;
 
-        let mut stderr = std::io::stderr();
-
-        // Hide cursor to prevent visible hopping during redraws.
-        let _ = crossterm::execute!(stderr, cursor::Hide);
-
-        // Clear previous render.
-        if self.last_render_lines > 0 {
-            let _ = crossterm::execute!(
-                stderr,
-                cursor::MoveUp(self.last_render_lines),
-                terminal::Clear(terminal::ClearType::FromCursorDown)
-            );
-        }
-
         let mut lines: Vec<String> = Vec::new();
 
         // ━━━ Build dependency tree ━━━
@@ -389,7 +378,7 @@ impl BuildMonitor {
             .saturating_sub(self.build_done + self.build_running + self.build_failed);
         lines.push(format!(
             "  {} {} {}  {} {}  {} {}  {} {}",
-            "Builds".bold(),
+            "Builds   ".bold(),
             "⏵".yellow().bold(),
             self.build_running.to_string().yellow().bold(),
             "✔".green(),
@@ -404,7 +393,7 @@ impl BuildMonitor {
         let dl_running = self.download_expected.saturating_sub(self.download_done);
         lines.push(format!(
             "  {} {} {}  {} {}  {} {}",
-            "Down  ".bold(),
+            "Downloads".bold(),
             "↓".cyan().bold(),
             dl_running.to_string().cyan().bold(),
             "✔".green(),
@@ -417,26 +406,49 @@ impl BuildMonitor {
         if self.build_failed > 0 {
             lines.push(format!(
                 "  {} {} {}",
-                "Errors".bold(),
+                "Errors   ".bold(),
                 "✘".red().bold(),
                 self.build_failed.to_string().red().bold(),
             ));
         }
 
         // Time row
-        lines.push(format!("  {} {} {}", "Time  ".bold(), "⏱".dim(), elapsed,));
+        lines.push(format!(
+            "  {} {} {}",
+            "Time     ".bold(),
+            "⏱".dim(),
+            elapsed,
+        ));
 
         lines.push(format!(" {sep}"));
 
-        // Buffer the entire frame and write in one shot to avoid flicker.
+        // Buffer the entire frame.
         let mut buf = String::new();
         for line in &lines {
             buf.push_str(line);
             buf.push('\n');
         }
-        let _ = stderr.write_all(buf.as_bytes());
 
+        // Skip redraw if the frame content hasn't changed.
+        if buf == self.last_frame {
+            return;
+        }
+
+        let mut stderr = std::io::stderr();
+
+        // Hide cursor, clear previous frame, write new frame, show cursor.
+        let _ = crossterm::execute!(stderr, cursor::Hide);
+        if self.last_render_lines > 0 {
+            let _ = crossterm::execute!(
+                stderr,
+                cursor::MoveUp(self.last_render_lines),
+                terminal::Clear(terminal::ClearType::FromCursorDown)
+            );
+        }
+
+        let _ = stderr.write_all(buf.as_bytes());
         self.last_render_lines = lines.len() as u16;
+        self.last_frame = buf;
         let _ = crossterm::execute!(stderr, cursor::Show);
         let _ = stderr.flush();
     }
@@ -502,7 +514,7 @@ impl BuildMonitor {
             let _ = writeln!(
                 stderr,
                 "  {} {} {}  {} {}",
-                "Builds".bold(),
+                "Builds   ".bold(),
                 "✔".green(),
                 self.build_done.to_string().green(),
                 "✘".red(),
@@ -513,12 +525,12 @@ impl BuildMonitor {
             let _ = writeln!(
                 stderr,
                 "  {} {} {}",
-                "Down  ".bold(),
+                "Downloads".bold(),
                 "✔".green(),
                 self.download_done.to_string().green(),
             );
         }
-        let _ = writeln!(stderr, "  {} {} {}", "Time  ".bold(), "⏱".dim(), elapsed,);
+        let _ = writeln!(stderr, "  {} {} {}", "Time     ".bold(), "⏱".dim(), elapsed,);
         let _ = writeln!(stderr, "{sep}");
     }
 }
