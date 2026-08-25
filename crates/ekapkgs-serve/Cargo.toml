@@ -32,6 +32,7 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 blake3.workspace = true
 fastcdc.workspace = true
 zstd.workspace = true
+prometheus.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

@@ -18,6 +18,16 @@ enum GcEvent {
     Access { hash: String },
 }
 
+/// Optional metrics for GC operations.
+#[derive(Clone)]
+pub struct GcMetrics {
+    pub runs_total: prometheus::IntCounter,
+    pub paths_evicted_total: prometheus::IntCounter,
+    pub bytes_freed_total: prometheus::IntCounter,
+    pub cache_size_bytes: prometheus::IntGauge,
+    pub cache_paths_total: prometheus::IntGauge,
+}
+
 /// Shared handle for recording accesses. Placed in AppState.
 ///
 /// API handlers call `record_access` after successful reads. Events are
@@ -40,7 +50,11 @@ impl GcTracker {
 /// Returns the tracker to put in AppState. The background task is spawned
 /// automatically and runs for the server's lifetime.
 #[allow(clippy::needless_pass_by_value)]
-pub fn init(cache_root: &Path, config: GcConfig) -> color_eyre::Result<Arc<GcTracker>> {
+pub fn init(
+    cache_root: &Path,
+    config: GcConfig,
+    gc_metrics: Option<GcMetrics>,
+) -> color_eyre::Result<Arc<GcTracker>> {
     let db_path = cache_root.join(".ekapkgs-gc.db");
 
     // Initialize database.
@@ -58,8 +72,18 @@ pub fn init(cache_root: &Path, config: GcConfig) -> color_eyre::Result<Arc<GcTra
     // Spawn the event flush + GC loop.
     let db = db_path.clone();
     let root = cache_root.to_path_buf();
+    let metrics = gc_metrics;
     tokio::spawn(async move {
-        gc_loop(event_rx, db, root, max_size, target_size, gc_interval).await;
+        gc_loop(
+            event_rx,
+            db,
+            root,
+            max_size,
+            target_size,
+            gc_interval,
+            metrics,
+        )
+        .await;
     });
 
     // Spawn the initial scan.
@@ -85,6 +109,7 @@ async fn gc_loop(
     max_size: u64,
     target_size: u64,
     gc_interval: Duration,
+    gc_metrics: Option<GcMetrics>,
 ) {
     let mut interval = tokio::time::interval(gc_interval);
     let mut pending: Vec<String> = Vec::new();
@@ -112,8 +137,9 @@ async fn gc_loop(
 
                 let db = db_path.clone();
                 let root = cache_root.clone();
+                let m = gc_metrics.clone();
                 let _ = tokio::task::spawn_blocking(move || {
-                    if let Err(e) = maybe_run_gc(&db, &root, max_size, target_size) {
+                    if let Err(e) = maybe_run_gc(&db, &root, max_size, target_size, m.as_ref()) {
                         tracing::error!("GC failed: {e}");
                     }
                 }).await;
@@ -189,6 +215,7 @@ fn maybe_run_gc(
     cache_root: &Path,
     max_size: u64,
     target_size: u64,
+    gc_metrics: Option<&GcMetrics>,
 ) -> color_eyre::Result<()> {
     let conn = open_db(db_path)?;
 
@@ -209,7 +236,7 @@ fn maybe_run_gc(
         format_bytes(total - max_size),
     );
 
-    run_gc(&conn, cache_root, total, target_size)
+    run_gc(&conn, cache_root, total, target_size, gc_metrics)
 }
 
 /// Reference-aware LRU eviction.
@@ -222,6 +249,7 @@ fn run_gc(
     cache_root: &Path,
     current_size: u64,
     target_size: u64,
+    gc_metrics: Option<&GcMetrics>,
 ) -> color_eyre::Result<()> {
     let to_free = current_size.saturating_sub(target_size);
     if to_free == 0 {
@@ -361,11 +389,26 @@ fn run_gc(
         tx.commit()?;
     }
 
+    // Update metrics.
+    if let Some(m) = gc_metrics {
+        m.runs_total.inc();
+        m.paths_evicted_total.inc_by(evict_set.len() as u64);
+        m.bytes_freed_total.inc_by(freed);
+    }
+
     let remaining: i64 = conn.query_row(
         "SELECT COALESCE(SUM(file_size + narinfo_size), 0) FROM store_paths",
         [],
         |row| row.get(0),
     )?;
+    let path_count: i64 =
+        conn.query_row("SELECT COUNT(*) FROM store_paths", [], |row| row.get(0))?;
+
+    if let Some(m) = gc_metrics {
+        m.cache_size_bytes.set(remaining);
+        m.cache_paths_total.set(path_count);
+    }
+
     tracing::info!(
         "GC complete: cache is now {}",
         format_bytes(remaining as u64)

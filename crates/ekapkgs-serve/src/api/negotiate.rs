@@ -37,6 +37,13 @@ impl CacheService for NegotiateService {
             )));
         }
 
+        self.state.metrics.negotiate_requests_total.inc();
+        self.state
+            .metrics
+            .negotiate_paths_requested
+            .with_label_values(&[])
+            .observe(req.want.len() as f64);
+
         let have_set: HashSet<&str> = req.have.iter().map(std::string::String::as_str).collect();
 
         let mut available = Vec::new();
@@ -151,6 +158,12 @@ impl CacheService for NegotiateService {
         } else {
             Vec::new()
         };
+
+        self.state
+            .metrics
+            .negotiate_paths_available
+            .with_label_values(&[])
+            .observe(available.len() as f64);
 
         // Compute delta transfers: for each available path, check if the client
         // has an older version of the same package that can serve as a delta base.

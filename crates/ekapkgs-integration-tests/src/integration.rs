@@ -895,6 +895,67 @@ async fn test_stream_nars_file_size_on_first_chunk() {
     assert_eq!(total_bytes, 200_000);
 }
 
+// ===== Metrics tests =====
+
+#[tokio::test]
+async fn test_metrics_endpoint() {
+    let server = TestServer::start();
+    let client = reqwest::Client::new();
+
+    // Write a narinfo and fetch it to generate some metrics.
+    server.write_narinfo(
+        "met111",
+        "StorePath: /nix/store/met111-pkg-1.0\nURL: nar/met111.nar\nCompression: none\nNarHash: \
+         sha256:met1\nNarSize: 10\n",
+    );
+    server.write_nar("met111.nar", b"nar-data");
+
+    // Fetch narinfo to increment counters.
+    let resp = client
+        .get(format!("{}/met111.narinfo", server.base_url()))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    // Fetch NAR.
+    let resp = client
+        .get(format!("{}/nar/met111.nar", server.base_url()))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    // Fetch a missing narinfo to increment miss counter.
+    let _ = client
+        .get(format!("{}/missing.narinfo", server.base_url()))
+        .send()
+        .await
+        .unwrap();
+
+    // Check metrics endpoint.
+    let resp = client
+        .get(format!("{}/metrics", server.base_url()))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body = resp.text().await.unwrap();
+
+    // Verify expected metrics are present.
+    assert!(body.contains("ekapkgs_negotiate_requests_total"));
+    assert!(body.contains("ekapkgs_narinfo_requests_total"));
+    assert!(body.contains("ekapkgs_nar_downloads_total"));
+    assert!(body.contains("ekapkgs_push_narinfo_total"));
+    assert!(body.contains("ekapkgs_gc_runs_total"));
+    assert!(body.contains("ekapkgs_cache_size_bytes"));
+
+    // Verify counters were incremented.
+    assert!(body.contains(r#"ekapkgs_narinfo_requests_total{status="hit"} 1"#));
+    assert!(body.contains(r#"ekapkgs_narinfo_requests_total{status="miss"} 1"#));
+    assert!(body.contains("ekapkgs_nar_downloads_total 1"));
+}
+
 // ===== Delta transfer tests =====
 
 #[tokio::test]

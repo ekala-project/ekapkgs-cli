@@ -70,6 +70,7 @@ pub async fn put_narinfo(
 
     match state.storage.put_narinfo(hash, &signed_content) {
         Ok(true) => {
+            state.metrics.push_narinfo_total.inc();
             // Register with GC tracker if present.
             if let Some(ref tracker) = state.gc_tracker {
                 tracker.record_access(hash);
@@ -100,6 +101,8 @@ pub async fn put_nar(
 
     match state.storage.put_nar(&nar_path, &body) {
         Ok(true) => {
+            state.metrics.push_nar_total.inc();
+            state.metrics.push_nar_bytes_total.inc_by(body.len() as u64);
             if let Some(ref tracker) = state.gc_tracker {
                 let hash = file.split('.').next().unwrap_or(&file);
                 tracker.record_access(hash);

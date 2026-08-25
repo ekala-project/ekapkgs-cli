@@ -26,6 +26,12 @@ pub async fn get_narinfo(
         .strip_suffix(".narinfo")
         .unwrap_or(&hash_narinfo);
 
+    state
+        .metrics
+        .narinfo_requests_total
+        .with_label_values(&["attempt"])
+        .inc();
+
     let narinfo = match state.storage.get_narinfo(hash) {
         Ok(Some(mut ni)) => {
             // Re-sign with our key if the narinfo doesn't already have our sig.
@@ -42,6 +48,11 @@ pub async fn get_narinfo(
             ni
         },
         Ok(None) => {
+            state
+                .metrics
+                .narinfo_requests_total
+                .with_label_values(&["miss"])
+                .inc();
             return (StatusCode::NOT_FOUND, "not found").into_response();
         },
         Err(e) => {
@@ -54,6 +65,12 @@ pub async fn get_narinfo(
     if let Some(ref tracker) = state.gc_tracker {
         tracker.record_access(hash);
     }
+
+    state
+        .metrics
+        .narinfo_requests_total
+        .with_label_values(&["hit"])
+        .inc();
 
     let body = narinfo.to_narinfo_string();
     (
@@ -70,6 +87,12 @@ pub async fn get_nar(State(state): State<Arc<AppState>>, Path(file): Path<String
 
     match state.storage.get_nar(&nar_path) {
         Ok(Some(data)) => {
+            state.metrics.nar_downloads_total.inc();
+            state
+                .metrics
+                .nar_download_bytes_total
+                .inc_by(data.len() as u64);
+
             // Record access for GC tracking.
             if let Some(ref tracker) = state.gc_tracker {
                 let hash = file.split('.').next().unwrap_or(&file);
