@@ -76,6 +76,7 @@ impl CacheService for NegotiateService {
                         references: ni.references,
                         signatures: ni.signatures,
                         cert_signature: None,
+                        cert_signatures: Vec::new(),
                         ca: ni.ca.unwrap_or_default(),
                         url: ni.url,
                         compression,
@@ -97,17 +98,43 @@ impl CacheService for NegotiateService {
         }
 
         // Apply certificate-based signatures if configured.
-        let certificate_chain = if let Some(ref cert_signer) = self.state.cert_signer {
-            for entry in &mut available {
-                let fingerprint = crate::signing::NarInfoSigner::fingerprint(
-                    &entry.store_path,
-                    &entry.nar_hash,
-                    entry.nar_size,
-                    &entry.references,
-                );
-                entry.cert_signature = Some(cert_signer.sign(&fingerprint));
+        // Collect all signers (primary + additional for threshold signing).
+        let mut all_signers: Vec<&crate::signing::CertSigner> = Vec::new();
+        if let Some(ref cs) = self.state.cert_signer {
+            all_signers.push(cs);
+        }
+        all_signers.extend(self.state.cert_signers.iter());
+
+        let certificate_chain = self.state.cert_signer.as_ref().map(|cs| cs.chain.clone());
+        let certificate_chains: Vec<_> = all_signers.iter().map(|cs| cs.chain.clone()).collect();
+
+        for entry in &mut available {
+            let fingerprint = crate::signing::NarInfoSigner::fingerprint(
+                &entry.store_path,
+                &entry.nar_hash,
+                entry.nar_size,
+                &entry.references,
+            );
+            // Sign with each cert signer and collect all signatures.
+            let mut cert_sigs = Vec::new();
+            for cs in &all_signers {
+                cert_sigs.push(cs.sign(&fingerprint));
             }
-            Some(cert_signer.chain.clone())
+            // Backward compat: set the singular field from the primary signer.
+            entry.cert_signature = cert_sigs.first().cloned();
+            entry.cert_signatures = cert_sigs;
+        }
+
+        // Build threshold policy if configured.
+        let threshold_policy = if self.state.signing_threshold > 0 {
+            let authorized_certs = all_signers
+                .iter()
+                .filter_map(|cs| cs.chain.signing_cert.clone())
+                .collect();
+            Some(ekapkgs_protocol::ekapkgs::v1::ThresholdPolicy {
+                threshold: self.state.signing_threshold,
+                authorized_certs,
+            })
         } else {
             None
         };
@@ -170,6 +197,8 @@ impl CacheService for NegotiateService {
             available,
             unavailable,
             certificate_chain,
+            certificate_chains,
+            threshold_policy,
             download_plan: Some(download_plan),
             total_download_size,
             total_nar_size,

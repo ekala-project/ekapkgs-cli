@@ -108,6 +108,10 @@ pub struct AppState {
     pub storage: Box<dyn StorageBackend>,
     pub signer: NarInfoSigner,
     pub cert_signer: Option<signing::CertSigner>,
+    /// Additional certificate signers for threshold signing.
+    pub cert_signers: Vec<signing::CertSigner>,
+    /// Threshold: require this many valid cert signatures. 0 = no threshold.
+    pub signing_threshold: u32,
     pub gc_tracker: Option<Arc<gc::GcTracker>>,
     pub write_tokens: Option<Vec<String>>,
     pub delta_cache: DeltaCache,
@@ -390,6 +394,8 @@ async fn cmd_serve(cli: Cli) -> color_eyre::Result<()> {
     let storage_backend: Box<dyn StorageBackend>;
     let signer: NarInfoSigner;
     let cert_signer: Option<signing::CertSigner>;
+    let mut extra_signers: Vec<signing::CertSigner> = Vec::new();
+    let mut threshold: u32 = 0;
     let gc_tracker: Option<Arc<gc::GcTracker>>;
     let write_tokens: Option<Vec<String>>;
     let server_metrics = metrics::Metrics::new();
@@ -414,6 +420,14 @@ async fn cmd_serve(cli: Cli) -> color_eyre::Result<()> {
         } else {
             None
         };
+        // Load additional certificate signers for threshold signing.
+        for cert_config in &config.signing.certificates {
+            extra_signers.push(signing::CertSigner::from_files(
+                &cert_config.cert_file,
+                &cert_config.private_key_file,
+            )?);
+        }
+        threshold = config.signing.threshold.unwrap_or(0);
         storage_backend = match config.storage {
             config::StorageConfig::Filesystem { path, gc } => {
                 let gc_t = if let Some(gc_raw) = gc {
@@ -534,6 +548,8 @@ async fn cmd_serve(cli: Cli) -> color_eyre::Result<()> {
         storage: storage_backend,
         signer,
         cert_signer,
+        cert_signers: extra_signers,
+        signing_threshold: threshold,
         gc_tracker,
         write_tokens,
         delta_cache: DeltaCache::new(),

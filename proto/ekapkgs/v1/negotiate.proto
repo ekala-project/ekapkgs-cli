@@ -32,8 +32,12 @@ message NegotiateResponse {
   repeated PathManifestEntry available = 1;
   // Store path hashes the server does not have.
   repeated string unavailable = 2;
-  // Server's signing certificate chain (if using cert-based trust).
+  // Server's signing certificate chains (one per signer, for threshold policies).
+  repeated CertificateChain certificate_chains = 8;
+  // Server's signing certificate chain (single signer, backward compat).
   CertificateChain certificate_chain = 3;
+  // Threshold signing policy (if configured).
+  ThresholdPolicy threshold_policy = 9;
   // Topologically-sorted download plan.
   DownloadPlan download_plan = 4;
   // Aggregate sizes for progress display.

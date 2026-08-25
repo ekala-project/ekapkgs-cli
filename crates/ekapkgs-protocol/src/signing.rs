@@ -26,6 +26,8 @@ pub enum CertError {
     InvalidPathSignature(String),
     #[error("invalid key length: expected {expected}, got {got}")]
     InvalidKeyLength { expected: usize, got: usize },
+    #[error("insufficient signatures: {valid}/{required} valid signatures")]
+    InsufficientSignatures { required: u32, valid: u32 },
     #[error("ed25519 error: {0}")]
     Ed25519(#[from] ed25519_dalek::SignatureError),
 }
@@ -131,6 +133,65 @@ pub fn verify_path_signature(
     verifying_key
         .verify(fingerprint.as_bytes(), &signature)
         .map_err(|e| CertError::InvalidPathSignature(e.to_string()))
+}
+
+/// Verify that at least `threshold` valid certificate-based signatures are
+/// present from distinct authorized certificates.
+///
+/// Each signature is verified against its matching certificate in
+/// `authorized_certs`. The certificate must be valid (not expired, properly
+/// signed by a trusted root), and the path signature must verify.
+pub fn verify_threshold(
+    threshold: u32,
+    authorized_certs: &[SigningCertificate],
+    cert_signatures: &[CertSignature],
+    trusted_roots: &[TrustedRoot],
+    fingerprint: &str,
+    now_unix: u64,
+) -> Result<(), CertError> {
+    if threshold == 0 {
+        return Ok(());
+    }
+
+    let mut valid_count = 0u32;
+    let mut seen_certs = std::collections::HashSet::new();
+
+    for cert_sig in cert_signatures {
+        // Find the matching authorized certificate.
+        let Some(cert) = authorized_certs
+            .iter()
+            .find(|c| c.name == cert_sig.cert_name)
+        else {
+            continue;
+        };
+
+        // Skip duplicate signatures from the same cert.
+        if !seen_certs.insert(&cert_sig.cert_name) {
+            continue;
+        }
+
+        // Verify the certificate chain.
+        let chain = CertificateChain {
+            signing_cert: Some(cert.clone()),
+            intermediates: Vec::new(),
+        };
+        let Ok(verifying_key) = verify_chain(&chain, trusted_roots, now_unix) else {
+            continue;
+        };
+
+        // Verify the path signature.
+        if verify_path_signature(&verifying_key, fingerprint, cert_sig).is_ok() {
+            valid_count += 1;
+            if valid_count >= threshold {
+                return Ok(());
+            }
+        }
+    }
+
+    Err(CertError::InsufficientSignatures {
+        required: threshold,
+        valid: valid_count,
+    })
 }
 
 /// Generate a new ed25519 keypair for use as a CA or signing key.
@@ -341,5 +402,99 @@ mod tests {
         // Verify against a different fingerprint.
         let result = verify_path_signature(&verifying_key, "tampered", &cert_sig);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn threshold_2_of_3() {
+        let (ca_secret, ca_public) = generate_keypair();
+        let roots = vec![TrustedRoot {
+            name: "ca".to_string(),
+            public_key: ca_public,
+        }];
+
+        // Issue 3 certificates.
+        let mut certs = Vec::new();
+        let mut cert_secrets = Vec::new();
+        for i in 0..3 {
+            let (secret, public) = generate_keypair();
+            let cert = issue_certificate(
+                &ca_secret,
+                "ca",
+                &format!("signer-{i}"),
+                &public,
+                0,
+                u64::MAX,
+            );
+            certs.push(cert);
+            cert_secrets.push(secret);
+        }
+
+        let fingerprint = "1;/nix/store/xyz-pkg;sha256:aabb;999;";
+
+        // Sign with all 3.
+        let sigs: Vec<_> = (0..3)
+            .map(|i| {
+                let sig = cert_secrets[i].sign(fingerprint.as_bytes());
+                CertSignature {
+                    cert_name: format!("signer-{i}"),
+                    signature: sig.to_bytes().to_vec(),
+                }
+            })
+            .collect();
+
+        // 2-of-3 with all 3 sigs → pass.
+        assert!(verify_threshold(2, &certs, &sigs, &roots, fingerprint, 1000).is_ok());
+
+        // 2-of-3 with first 2 sigs → pass.
+        assert!(verify_threshold(2, &certs, &sigs[..2], &roots, fingerprint, 1000).is_ok());
+
+        // 2-of-3 with only 1 sig → fail.
+        let result = verify_threshold(2, &certs, &sigs[..1], &roots, fingerprint, 1000);
+        assert!(matches!(
+            result,
+            Err(CertError::InsufficientSignatures {
+                required: 2,
+                valid: 1
+            })
+        ));
+
+        // 0 threshold → always pass.
+        assert!(verify_threshold(0, &certs, &[], &roots, fingerprint, 1000).is_ok());
+    }
+
+    #[test]
+    fn threshold_rejects_duplicate_sigs() {
+        let (ca_secret, ca_public) = generate_keypair();
+        let roots = vec![TrustedRoot {
+            name: "ca".to_string(),
+            public_key: ca_public,
+        }];
+
+        let (secret, public) = generate_keypair();
+        let cert = issue_certificate(&ca_secret, "ca", "signer-0", &public, 0, u64::MAX);
+
+        let fingerprint = "1;/nix/store/test;sha256:ff;1;";
+        let sig = secret.sign(fingerprint.as_bytes());
+
+        // Two copies of the same sig should count as 1.
+        let sigs = vec![
+            CertSignature {
+                cert_name: "signer-0".to_string(),
+                signature: sig.to_bytes().to_vec(),
+            },
+            CertSignature {
+                cert_name: "signer-0".to_string(),
+                signature: sig.to_bytes().to_vec(),
+            },
+        ];
+
+        let result = verify_threshold(2, &[cert], &sigs, &roots, fingerprint, 1000);
+        assert!(matches!(
+            result,
+            Err(CertError::InsufficientSignatures {
+                required: 2,
+                valid: 1
+            })
+        ));
     }
 }

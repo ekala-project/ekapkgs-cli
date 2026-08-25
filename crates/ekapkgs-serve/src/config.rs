@@ -61,6 +61,11 @@ fn default_region() -> String {
 pub struct SigningConfig {
     pub secret_key_file: PathBuf,
     pub certificate: Option<CertificateConfig>,
+    /// Additional certificates for threshold signing.
+    #[serde(default)]
+    pub certificates: Vec<CertificateConfig>,
+    /// Threshold policy: require this many valid cert signatures.
+    pub threshold: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
