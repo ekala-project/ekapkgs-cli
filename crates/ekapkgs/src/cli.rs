@@ -57,6 +57,22 @@ pub enum Command {
         command: ClosureCommand,
     },
 
+    /// Show build log for a derivation.
+    Log {
+        /// The installable to show logs for.
+        installable: String,
+    },
+
+    /// Show what will be built vs substituted (dry run).
+    DryRun {
+        /// The installable to analyze.
+        installable: String,
+
+        /// Extra arguments passed through to nix.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        extra: Vec<String>,
+    },
+
     /// Check system health and configuration.
     Doctor,
 
