@@ -26,6 +26,12 @@ message PathManifestEntry {
   Compression compression = 9;
   string file_hash = 10;
   uint64 file_size = 11;
+  // Delta transfer: store path hash of the base NAR (empty if no delta).
+  string delta_base_hash = 12;
+  // Relative URL to download the delta.
+  string delta_url = 13;
+  // Size of the delta in bytes.
+  uint64 delta_size = 14;
 }
 
 message DownloadPlan {

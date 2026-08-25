@@ -649,6 +649,7 @@ dependencies = [
  "toml",
  "tonic",
  "tracing",
+ "zstd",
 ]
 
 [[package]]
@@ -666,6 +667,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tonic",
+ "zstd",
 ]
 
 [[package]]
@@ -720,6 +722,7 @@ dependencies = [
  "tower 0.5.3",
  "tower-http",
  "tracing",
+ "zstd",
 ]
 
 [[package]]

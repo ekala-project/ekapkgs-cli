@@ -135,8 +135,49 @@ async fn download_single(
         .and_then(|b| b.split('-').next())
         .ok_or_else(|| color_eyre::eyre::eyre!("invalid store path: {}", entry.store_path))?;
 
-    // Download NAR.
-    let nar_url = format!("{base_url}/{}", entry.url);
+    // Try delta download if available, fall back to full NAR.
+    let nar_data = if !entry.delta_url.is_empty() && !entry.delta_base_hash.is_empty() {
+        let delta_url = format!("{base_url}/{}", entry.delta_url);
+        let resp = client.get(&delta_url).send().await?;
+
+        if resp.status().is_success() {
+            let delta_bytes = resp.bytes().await?;
+            match apply_delta(&delta_bytes, &entry.delta_base_hash) {
+                Ok(nar) => nar,
+                Err(e) => {
+                    tracing::warn!("Delta apply failed for {hash}, downloading full NAR: {e}");
+                    download_full_nar(client, base_url, &entry.url).await?
+                },
+            }
+        } else {
+            download_full_nar(client, base_url, &entry.url).await?
+        }
+    } else {
+        download_full_nar(client, base_url, &entry.url).await?
+    };
+
+    // Write NAR file.
+    let nar_path = staging_dir.join(&entry.url);
+    if let Some(parent) = nar_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&nar_path, &nar_data)?;
+
+    // Write narinfo file.
+    let narinfo_text = build_narinfo_text(entry);
+    let narinfo_path = staging_dir.join(format!("{hash}.narinfo"));
+    std::fs::write(&narinfo_path, narinfo_text)?;
+
+    Ok(())
+}
+
+/// Download a full NAR via HTTP GET.
+async fn download_full_nar(
+    client: &reqwest::Client,
+    base_url: &str,
+    url: &str,
+) -> color_eyre::Result<Vec<u8>> {
+    let nar_url = format!("{base_url}/{url}");
     let resp = client.get(&nar_url).send().await?;
 
     if !resp.status().is_success() {
@@ -147,54 +188,7 @@ async fn download_single(
         ));
     }
 
-    let nar_bytes = resp.bytes().await?;
-
-    // Write NAR file.
-    let nar_path = staging_dir.join(&entry.url);
-    if let Some(parent) = nar_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(&nar_path, &nar_bytes)?;
-
-    // Write narinfo file.
-    let refs: Vec<String> = entry
-        .references
-        .iter()
-        .map(|r| r.rsplit('/').next().unwrap_or(r.as_str()).to_owned())
-        .collect();
-
-    let compression = match entry.compression {
-        c if c == ekapkgs_protocol::ekapkgs::v1::Compression::Zstd as i32 => "zstd",
-        c if c == ekapkgs_protocol::ekapkgs::v1::Compression::Xz as i32 => "xz",
-        _ => "none",
-    };
-
-    let mut narinfo = String::new();
-    narinfo.push_str(&format!("StorePath: {}\n", entry.store_path));
-    narinfo.push_str(&format!("URL: {}\n", entry.url));
-    narinfo.push_str(&format!("Compression: {compression}\n"));
-    if !entry.file_hash.is_empty() {
-        narinfo.push_str(&format!("FileHash: {}\n", entry.file_hash));
-    }
-    if entry.file_size > 0 {
-        narinfo.push_str(&format!("FileSize: {}\n", entry.file_size));
-    }
-    narinfo.push_str(&format!("NarHash: {}\n", entry.nar_hash));
-    narinfo.push_str(&format!("NarSize: {}\n", entry.nar_size));
-    if !refs.is_empty() {
-        narinfo.push_str(&format!("References: {}\n", refs.join(" ")));
-    }
-    for sig in &entry.signatures {
-        narinfo.push_str(&format!("Sig: {sig}\n"));
-    }
-    if !entry.ca.is_empty() {
-        narinfo.push_str(&format!("CA: {}\n", entry.ca));
-    }
-
-    let narinfo_path = staging_dir.join(format!("{hash}.narinfo"));
-    std::fs::write(&narinfo_path, narinfo)?;
-
-    Ok(())
+    Ok(resp.bytes().await?.to_vec())
 }
 
 /// Download individual chunks from a CAS-aware server and reassemble NARs
@@ -354,12 +348,14 @@ pub async fn stream_and_import(
 
     let mut current_hash = String::new();
     let mut current_buf: Vec<u8> = Vec::new();
+    let mut current_is_delta = false;
     let mut paths_received = 0u64;
 
     while let Some(chunk) = stream.message().await? {
         if chunk.path_hash != current_hash {
             current_hash.clone_from(&chunk.path_hash);
             current_buf.clear();
+            current_is_delta = chunk.is_delta;
             if chunk.file_size > 0 {
                 current_buf.reserve(chunk.file_size as usize);
             }
@@ -369,13 +365,26 @@ pub async fn stream_and_import(
         current_buf.extend_from_slice(&chunk.data);
 
         if chunk.last {
-            // Write the completed NAR and narinfo to the staging directory.
             if let Some(entry) = entry_by_hash.get(current_hash.as_str()) {
+                // If this is a delta, decompress using the base NAR as dictionary.
+                let nar_data = if current_is_delta && !entry.delta_base_hash.is_empty() {
+                    match apply_delta(&current_buf, &entry.delta_base_hash) {
+                        Ok(data) => data,
+                        Err(e) => {
+                            tracing::warn!("Delta decompression failed for {current_hash}: {e}");
+                            current_buf.clear();
+                            continue;
+                        },
+                    }
+                } else {
+                    std::mem::take(&mut current_buf)
+                };
+
                 let nar_path = staging_dir.path().join(&entry.url);
                 if let Some(parent) = nar_path.parent() {
                     std::fs::create_dir_all(parent)?;
                 }
-                std::fs::write(&nar_path, &current_buf)?;
+                std::fs::write(&nar_path, &nar_data)?;
 
                 let narinfo_text = build_narinfo_text(entry);
                 let narinfo_path = staging_dir.path().join(format!("{current_hash}.narinfo"));
@@ -438,4 +447,32 @@ fn build_narinfo_text(entry: &PathManifestEntry) -> String {
         narinfo.push_str(&format!("CA: {}\n", entry.ca));
     }
     narinfo
+}
+
+/// Apply a zstd-dict-compressed delta to reconstruct a full NAR.
+///
+/// Reads the base NAR from the local nix store via `nix-store --dump`,
+/// then decompresses the delta using the base NAR as a zstd dictionary.
+fn apply_delta(delta: &[u8], base_hash: &str) -> color_eyre::Result<Vec<u8>> {
+    // Read the base NAR from the local store.
+    let output = std::process::Command::new("nix-store")
+        .arg("--dump")
+        .arg(format!("/nix/store/{base_hash}"))
+        .output()?;
+
+    if !output.status.success() {
+        return Err(color_eyre::eyre::eyre!(
+            "failed to dump base NAR for {base_hash}"
+        ));
+    }
+
+    let base_nar = output.stdout;
+
+    // Decompress the delta using the base NAR as dictionary.
+    use std::io::Read;
+    let mut decoder = zstd::Decoder::with_dictionary(delta, &base_nar)?;
+    let mut result = Vec::new();
+    decoder.read_to_end(&mut result)?;
+
+    Ok(result)
 }

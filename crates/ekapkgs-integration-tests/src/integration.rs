@@ -894,3 +894,268 @@ async fn test_stream_nars_file_size_on_first_chunk() {
     assert_eq!(first_file_size, 200_000);
     assert_eq!(total_bytes, 200_000);
 }
+
+// ===== Delta transfer tests =====
+
+#[tokio::test]
+async fn test_delta_negotiate() {
+    let server = TestServer::start_with_tokens(&["writer"]);
+    let client = reqwest::Client::new();
+    let base = server.base_url();
+
+    // Push two versions of the same "package" — they share a pname.
+    // Old version:
+    let old_nar_data = build_test_nar(b"shared content between versions, old version data here!");
+    let resp = client
+        .put(format!("{base}/nar/old111.nar"))
+        .header("Authorization", "Bearer test_token_writer")
+        .body(old_nar_data.clone())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let old_narinfo = format!(
+        "StorePath: /nix/store/old111-mypkg-1.0\nURL: nar/old111.nar\nCompression: none\nNarHash: \
+         sha256:old1\nNarSize: {}\nFileSize: {}\n",
+        old_nar_data.len(),
+        old_nar_data.len()
+    );
+    let resp = client
+        .put(format!("{base}/old111.narinfo"))
+        .header("Authorization", "Bearer test_token_writer")
+        .body(old_narinfo)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    // New version (same pname "mypkg", different hash/version):
+    let new_nar_data = build_test_nar(b"shared content between versions, new version data here!");
+    let resp = client
+        .put(format!("{base}/nar/new222.nar"))
+        .header("Authorization", "Bearer test_token_writer")
+        .body(new_nar_data.clone())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let new_narinfo = format!(
+        "StorePath: /nix/store/new222-mypkg-2.0\nURL: nar/new222.nar\nCompression: none\nNarHash: \
+         sha256:new2\nNarSize: {}\nFileSize: {}\n",
+        new_nar_data.len(),
+        new_nar_data.len()
+    );
+    let resp = client
+        .put(format!("{base}/new222.narinfo"))
+        .header("Authorization", "Bearer test_token_writer")
+        .body(new_narinfo)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    // Negotiate: client has old version, wants new version.
+    use ekapkgs_protocol::ekapkgs::v1::cache_service_client::CacheServiceClient;
+    use ekapkgs_protocol::ekapkgs::v1::{Compression, NegotiateRequest};
+
+    let mut grpc_client = CacheServiceClient::connect(base.clone()).await.unwrap();
+    let request = tonic::Request::new(NegotiateRequest {
+        want: vec!["new222".to_owned()],
+        have: vec!["old111".to_owned()],
+        accept_compression: vec![Compression::Zstd as i32],
+        trust_roots: Vec::new(),
+        supports_cas: false,
+    });
+    let response = grpc_client.negotiate(request).await.unwrap().into_inner();
+
+    assert_eq!(response.available.len(), 1);
+    let entry = &response.available[0];
+
+    // Should have delta fields populated.
+    assert_eq!(entry.delta_base_hash, "old111");
+    assert!(!entry.delta_url.is_empty());
+    assert!(entry.delta_size > 0);
+    // Delta should be smaller than the full NAR.
+    assert!(entry.delta_size < entry.file_size);
+}
+
+#[tokio::test]
+async fn test_delta_http_download() {
+    let server = TestServer::start_with_tokens(&["writer"]);
+    let client = reqwest::Client::new();
+    let base = server.base_url();
+
+    // Push two versions.
+    let old_nar = build_test_nar(b"shared package content - the original version of the pkg");
+    let resp = client
+        .put(format!("{base}/nar/dold1.nar"))
+        .header("Authorization", "Bearer test_token_writer")
+        .body(old_nar.clone())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let resp = client
+        .put(format!("{base}/dold1.narinfo"))
+        .header("Authorization", "Bearer test_token_writer")
+        .body(format!(
+            "StorePath: /nix/store/dold1-deltapkg-1.0\nURL: nar/dold1.nar\nCompression: \
+             none\nNarHash: sha256:do1\nNarSize: {}\nFileSize: {}\n",
+            old_nar.len(),
+            old_nar.len()
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let new_nar = build_test_nar(b"shared package content - the updated version of the pkg");
+    let resp = client
+        .put(format!("{base}/nar/dnew2.nar"))
+        .header("Authorization", "Bearer test_token_writer")
+        .body(new_nar.clone())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let resp = client
+        .put(format!("{base}/dnew2.narinfo"))
+        .header("Authorization", "Bearer test_token_writer")
+        .body(format!(
+            "StorePath: /nix/store/dnew2-deltapkg-2.0\nURL: nar/dnew2.nar\nCompression: \
+             none\nNarHash: sha256:dn2\nNarSize: {}\nFileSize: {}\n",
+            new_nar.len(),
+            new_nar.len()
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    // Negotiate to populate delta cache.
+    use ekapkgs_protocol::ekapkgs::v1::cache_service_client::CacheServiceClient;
+    use ekapkgs_protocol::ekapkgs::v1::{Compression, NegotiateRequest};
+
+    let mut grpc_client = CacheServiceClient::connect(base.clone()).await.unwrap();
+    let request = tonic::Request::new(NegotiateRequest {
+        want: vec!["dnew2".to_owned()],
+        have: vec!["dold1".to_owned()],
+        accept_compression: vec![Compression::Zstd as i32],
+        trust_roots: Vec::new(),
+        supports_cas: false,
+    });
+    let response = grpc_client.negotiate(request).await.unwrap().into_inner();
+    let entry = &response.available[0];
+    assert!(!entry.delta_url.is_empty());
+
+    // Download the delta via HTTP.
+    let delta_resp = client
+        .get(format!("{base}/{}", entry.delta_url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(delta_resp.status(), 200);
+    let delta_bytes = delta_resp.bytes().await.unwrap();
+
+    // Decompress using old NAR as dictionary to reconstruct new NAR.
+    use std::io::Read;
+    let mut decoder = zstd::Decoder::with_dictionary(&delta_bytes[..], &old_nar).unwrap();
+    let mut reconstructed = Vec::new();
+    decoder.read_to_end(&mut reconstructed).unwrap();
+
+    assert_eq!(reconstructed, new_nar);
+}
+
+#[tokio::test]
+async fn test_delta_stream() {
+    let server = TestServer::start_with_tokens(&["writer"]);
+    let client = reqwest::Client::new();
+    let base = server.base_url();
+
+    // Push two versions.
+    let old_nar = build_test_nar(b"streaming delta test - base version of the package content!");
+    let resp = client
+        .put(format!("{base}/nar/sold1.nar"))
+        .header("Authorization", "Bearer test_token_writer")
+        .body(old_nar.clone())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let resp = client
+        .put(format!("{base}/sold1.narinfo"))
+        .header("Authorization", "Bearer test_token_writer")
+        .body(format!(
+            "StorePath: /nix/store/sold1-streampkg-1.0\nURL: nar/sold1.nar\nCompression: \
+             none\nNarHash: sha256:so1\nNarSize: {}\nFileSize: {}\n",
+            old_nar.len(),
+            old_nar.len()
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let new_nar = build_test_nar(b"streaming delta test - new! version of the package content!");
+    let resp = client
+        .put(format!("{base}/nar/snew2.nar"))
+        .header("Authorization", "Bearer test_token_writer")
+        .body(new_nar.clone())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let resp = client
+        .put(format!("{base}/snew2.narinfo"))
+        .header("Authorization", "Bearer test_token_writer")
+        .body(format!(
+            "StorePath: /nix/store/snew2-streampkg-2.0\nURL: nar/snew2.nar\nCompression: \
+             none\nNarHash: sha256:sn2\nNarSize: {}\nFileSize: {}\n",
+            new_nar.len(),
+            new_nar.len()
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    // Negotiate to populate delta cache.
+    use ekapkgs_protocol::ekapkgs::v1::cache_service_client::CacheServiceClient;
+    use ekapkgs_protocol::ekapkgs::v1::{Compression, NegotiateRequest, StreamNarsRequest};
+
+    let mut grpc_client = CacheServiceClient::connect(base.clone()).await.unwrap();
+    let request = tonic::Request::new(NegotiateRequest {
+        want: vec!["snew2".to_owned()],
+        have: vec!["sold1".to_owned()],
+        accept_compression: vec![Compression::Zstd as i32],
+        trust_roots: Vec::new(),
+        supports_cas: false,
+    });
+    let response = grpc_client.negotiate(request).await.unwrap().into_inner();
+    assert!(!response.available[0].delta_base_hash.is_empty());
+
+    // Stream the NAR — should receive delta bytes.
+    let request = tonic::Request::new(StreamNarsRequest {
+        path_hashes: vec!["snew2".to_owned()],
+    });
+    let mut stream = grpc_client.stream_nars(request).await.unwrap().into_inner();
+
+    let mut received = Vec::new();
+    let mut is_delta = false;
+    while let Some(chunk) = stream.message().await.unwrap() {
+        is_delta = chunk.is_delta;
+        received.extend_from_slice(&chunk.data);
+    }
+
+    assert!(is_delta, "stream should have sent delta bytes");
+
+    // Decompress using old NAR as dictionary.
+    use std::io::Read;
+    let mut decoder = zstd::Decoder::with_dictionary(&received[..], &old_nar).unwrap();
+    let mut reconstructed = Vec::new();
+    decoder.read_to_end(&mut reconstructed).unwrap();
+
+    assert_eq!(reconstructed, new_nar);
+}

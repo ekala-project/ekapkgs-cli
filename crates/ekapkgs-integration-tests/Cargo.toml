@@ -15,6 +15,7 @@ ed25519-dalek.workspace = true
 blake3.workspace = true
 ekapkgs-protocol.workspace = true
 tonic.workspace = true
+zstd.workspace = true
 rand = "0.8"
 
 [[test]]

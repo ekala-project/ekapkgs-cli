@@ -109,6 +109,53 @@ pub struct AppState {
     pub cert_signer: Option<signing::CertSigner>,
     pub gc_tracker: Option<Arc<gc::GcTracker>>,
     pub write_tokens: Option<Vec<String>>,
+    pub delta_cache: DeltaCache,
+}
+
+/// Cache for computed delta NARs, keyed by (base_hash, target_hash).
+///
+/// Populated during negotiate when the server finds a suitable delta candidate,
+/// consumed by the delta HTTP endpoint and StreamNars handler.
+pub struct DeltaCache {
+    entries: std::sync::Mutex<std::collections::HashMap<(String, String), Vec<u8>>>,
+}
+
+impl DeltaCache {
+    pub fn new() -> Self {
+        Self {
+            entries: std::sync::Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    pub fn insert(&self, base_hash: String, target_hash: String, delta: Vec<u8>) {
+        self.entries
+            .lock()
+            .expect("delta cache lock")
+            .insert((base_hash, target_hash), delta);
+    }
+
+    pub fn get(&self, base_hash: &str, target_hash: &str) -> Option<Vec<u8>> {
+        self.entries
+            .lock()
+            .expect("delta cache lock")
+            .get(&(base_hash.to_owned(), target_hash.to_owned()))
+            .cloned()
+    }
+
+    /// Find any cached delta targeting the given hash.
+    pub fn get_for_target(&self, target_hash: &str) -> Option<Vec<u8>> {
+        let entries = self.entries.lock().expect("delta cache lock");
+        entries
+            .iter()
+            .find(|((_, t), _)| t == target_hash)
+            .map(|(_, delta)| delta.clone())
+    }
+}
+
+impl Default for DeltaCache {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 fn build_http_router(state: Arc<AppState>) -> Router {
@@ -125,6 +172,10 @@ fn build_http_router(state: Arc<AppState>) -> Router {
         .route(
             "/cas/chunk/{b3hex}",
             get(api::chunks::get_chunk).put(api::chunks::put_chunk),
+        )
+        .route(
+            "/delta/{base_hash}/{target_hash}",
+            get(api::delta::get_delta),
         )
         .with_state(state)
 }
@@ -434,6 +485,7 @@ async fn cmd_serve(cli: Cli) -> color_eyre::Result<()> {
         cert_signer,
         gc_tracker,
         write_tokens,
+        delta_cache: DeltaCache::new(),
     });
 
     let addr: SocketAddr = bind_addr.parse()?;

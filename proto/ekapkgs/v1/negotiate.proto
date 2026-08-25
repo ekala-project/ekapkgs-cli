@@ -58,4 +58,6 @@ message NarChunk {
   bool last = 3;
   // Total NAR file size (set on the first chunk only, for progress tracking).
   uint64 file_size = 4;
+  // True if the data is a zstd-dict-compressed delta rather than raw NAR bytes.
+  bool is_delta = 5;
 }
