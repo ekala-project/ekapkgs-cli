@@ -77,6 +77,11 @@ pub enum CacheCommand {
         /// Cache URL to push to (overrides config).
         #[arg(long)]
         cache: Option<String>,
+
+        /// Transfer only sources and derivation graph (for low-bandwidth links).
+        /// The remote machine rebuilds from source instead of receiving built NARs.
+        #[arg(long)]
+        sources_only: bool,
     },
 
     /// Pull (pre-fetch) store paths from a binary cache.

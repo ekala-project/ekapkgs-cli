@@ -20,8 +20,12 @@ pub struct DerivationInfo {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct DerivationOutput {
     pub path: Option<String>,
+    /// If set, this is a fixed-output derivation (FOD).
+    pub hash: Option<String>,
+    pub hash_algo: Option<String>,
 }
 
 /// Evaluate an installable and return its build output metadata.
@@ -58,4 +62,42 @@ pub fn derivation_closure_paths(installable: &Installable) -> Result<Vec<String>
     paths.sort();
     paths.dedup();
     Ok(paths)
+}
+
+/// Get the raw derivation graph JSON for an installable.
+///
+/// Returns the full output of `nix derivation show -r` as bytes.
+pub fn derivation_graph_json(installable: &Installable) -> Result<Vec<u8>, NixError> {
+    let output = NixCommand::new(&["derivation", "show"])
+        .arg("-r")
+        .arg(&installable.raw)
+        .output()?;
+    Ok(output.stdout)
+}
+
+/// Extract fixed-output derivation (FOD) output paths from a derivation graph.
+///
+/// FODs are derivations whose outputs have a `hash` field set. These represent
+/// fetched sources (tarballs, git checkouts, patches) rather than build results.
+pub fn extract_fod_paths(installable: &Installable) -> Result<Vec<String>, NixError> {
+    let derivations: std::collections::HashMap<String, DerivationInfo> =
+        NixCommand::new(&["derivation", "show"])
+            .arg("-r")
+            .arg(&installable.raw)
+            .json()?;
+
+    let mut fod_paths = Vec::new();
+    for drv in derivations.values() {
+        for output in drv.outputs.values() {
+            if output.hash.is_some() {
+                if let Some(path) = &output.path {
+                    fod_paths.push(path.clone());
+                }
+            }
+        }
+    }
+
+    fod_paths.sort();
+    fod_paths.dedup();
+    Ok(fod_paths)
 }

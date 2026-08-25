@@ -69,3 +69,24 @@ message NarChunk {
   // True if the data is a zstd-dict-compressed delta rather than raw NAR bytes.
   bool is_delta = 5;
 }
+
+// Transfer mode for low-bandwidth scenarios.
+enum TransferMode {
+  TRANSFER_MODE_UNSPECIFIED = 0;
+  // Standard: transfer built NARs.
+  TRANSFER_MODE_BUILT = 1;
+  // Transfer only FODs + derivation graph. Remote builds from source.
+  TRANSFER_MODE_SOURCES = 2;
+}
+
+// Manifest for source-only transfers (low-bandwidth mode).
+message SourceTransferManifest {
+  // Compressed derivation graph (JSON from nix derivation show -r).
+  bytes derivation_graph = 1;
+  // FOD outputs that need to be transferred (source tarballs, patches).
+  repeated PathManifestEntry fods = 2;
+  // FOD store path hashes the remote already has.
+  repeated string fods_present = 3;
+  // Total size of FOD data to transfer.
+  uint64 total_fod_size = 4;
+}

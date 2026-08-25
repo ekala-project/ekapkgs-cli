@@ -9,7 +9,17 @@ use crate::config::ClientConfig;
 
 pub fn execute(command: CacheCommand) -> color_eyre::Result<()> {
     match command {
-        CacheCommand::Push { paths, cache } => cmd_push(&paths, cache.as_deref()),
+        CacheCommand::Push {
+            paths,
+            cache,
+            sources_only,
+        } => {
+            if sources_only {
+                cmd_push_sources(&paths, cache.as_deref())
+            } else {
+                cmd_push(&paths, cache.as_deref())
+            }
+        },
         CacheCommand::Pull { paths, cache } => cmd_pull(&paths, cache.as_deref()),
         CacheCommand::Auth { command } => cmd_auth(command),
     }
@@ -99,6 +109,162 @@ fn cmd_push(paths: &[String], cache_url: Option<&str>) -> color_eyre::Result<()>
     })?;
 
     Ok(())
+}
+
+// --- push --sources-only ---
+
+fn cmd_push_sources(paths: &[String], cache_url: Option<&str>) -> color_eyre::Result<()> {
+    let config = ClientConfig::load()?;
+
+    let server_url = match cache_url {
+        Some(url) => url.to_owned(),
+        None => {
+            let cache = config.primary_cache().ok_or_else(|| {
+                color_eyre::eyre::eyre!(
+                    "no cache configured — use --cache or configure in config.toml"
+                )
+            })?;
+            cache.url.clone()
+        },
+    };
+
+    let token = config.push_token(&server_url);
+    let base_url = server_url.trim_end_matches('/');
+
+    for input in paths {
+        let inst = Installable::new(input);
+
+        // 1. Get the derivation graph JSON (compressed for transfer).
+        tracing::info!("Evaluating derivation graph for {input}...");
+        let drv_graph_json = eval::derivation_graph_json(&inst)?;
+        let drv_graph_compressed = zstd::bulk::compress(&drv_graph_json, 3)
+            .map_err(|e| color_eyre::eyre::eyre!("zstd compress failed: {e}"))?;
+
+        tracing::info!(
+            "Derivation graph: {} ({} compressed)",
+            format_size(drv_graph_json.len()),
+            format_size(drv_graph_compressed.len()),
+        );
+
+        // 2. Identify FOD (fixed-output derivation) paths.
+        let fod_paths = eval::extract_fod_paths(&inst)?;
+        tracing::info!(
+            "Found {} fixed-output derivations (sources)",
+            fod_paths.len()
+        );
+
+        if fod_paths.is_empty() && drv_graph_json.is_empty() {
+            tracing::info!("Nothing to push for {input}");
+            continue;
+        }
+
+        // 3. Check which FODs the server already has.
+        let fod_hashes: Vec<String> = fod_paths
+            .iter()
+            .filter_map(|p| store::store_path_hash(p).map(String::from))
+            .collect();
+
+        let rt = tokio::runtime::Runtime::new()?;
+        rt.block_on(async {
+            let client = reqwest::Client::new();
+
+            // Check which FODs are already on the server.
+            let mut to_push = Vec::new();
+            let mut already_present = 0u64;
+
+            for (path, hash) in fod_paths.iter().zip(fod_hashes.iter()) {
+                let check_url = format!("{base_url}/{hash}.narinfo");
+                let resp = client.head(&check_url).send().await?;
+                if resp.status().is_success() {
+                    already_present += 1;
+                } else {
+                    to_push.push(path.clone());
+                }
+            }
+
+            if already_present > 0 {
+                tracing::info!("{already_present} FODs already on server");
+            }
+
+            if to_push.is_empty() {
+                tracing::info!("All FODs already present, pushing derivation graph only");
+            } else {
+                tracing::info!("{} FODs to push", to_push.len());
+
+                // Push FOD NARs.
+                let bar = ekapkgs_ui::progress::item_bar(to_push.len() as u64, "sources");
+                let results =
+                    futures::stream::iter(to_push.iter())
+                        .map(|path| {
+                            let client = client.clone();
+                            let base = base_url.to_owned();
+                            let token = token.clone();
+                            let path = path.clone();
+                            async move {
+                                push_single_path(&client, &base, token.as_deref(), &path).await
+                            }
+                        })
+                        .buffer_unordered(8)
+                        .collect::<Vec<_>>()
+                        .await;
+
+                for result in &results {
+                    match result {
+                        Ok(_) => bar.inc(1),
+                        Err(e) => {
+                            tracing::warn!("FOD push failed: {e}");
+                            bar.inc(1);
+                        },
+                    }
+                }
+                bar.finish_and_clear();
+            }
+
+            // 4. Push the compressed derivation graph as a special object.
+            let drv_url = format!("{base_url}/source-manifest");
+            let mut req = client
+                .put(&drv_url)
+                .header("Content-Type", "application/zstd")
+                .body(drv_graph_compressed);
+            if let Some(t) = &token {
+                req = req.header("Authorization", format!("Bearer {t}"));
+            }
+            match req.send().await {
+                Ok(resp) if resp.status().is_success() => {
+                    tracing::info!("Derivation graph uploaded");
+                },
+                Ok(resp) => {
+                    tracing::warn!(
+                        "Derivation graph upload returned {}: server may not support source-only \
+                         transfers yet",
+                        resp.status()
+                    );
+                },
+                Err(e) => {
+                    tracing::warn!("Derivation graph upload failed: {e}");
+                },
+            }
+
+            tracing::info!(
+                "Source-only push complete for {input}: {} FODs transferred",
+                to_push.len()
+            );
+
+            Ok::<(), color_eyre::Report>(())
+        })?;
+    }
+
+    Ok(())
+}
+
+fn format_size(bytes: usize) -> String {
+    if bytes >= 1_048_576 {
+        format!("{:.1} MiB", bytes as f64 / 1_048_576.0)
+    } else if bytes >= 1024 {
+        format!("{:.1} KiB", bytes as f64 / 1024.0)
+    } else {
+        format!("{bytes} B")
+    }
 }
 
 enum PushResult {
