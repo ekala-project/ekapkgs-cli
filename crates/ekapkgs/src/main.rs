@@ -3,6 +3,7 @@ mod commands;
 mod config;
 mod download;
 mod negotiate;
+mod prefetch;
 
 use clap::Parser;
 

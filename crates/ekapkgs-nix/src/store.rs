@@ -1,4 +1,31 @@
+use serde::Deserialize;
+
 use crate::command::{NixCommand, NixError};
+use crate::installable::Installable;
+
+/// A single entry from `nix path-info --json`.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PathInfoEntry {
+    pub path: String,
+    pub nar_size: u64,
+    #[serde(default)]
+    pub closure_size: u64,
+    #[serde(default)]
+    pub references: Vec<String>,
+}
+
+/// Get path info with sizes for all paths in a closure.
+///
+/// Calls `nix path-info -rS --json <installable>`.
+pub fn closure_path_info(installable: &Installable) -> Result<Vec<PathInfoEntry>, NixError> {
+    NixCommand::new(&["path-info"])
+        .arg("-r")
+        .arg("-S")
+        .arg("--json")
+        .arg(&installable.raw)
+        .json()
+}
 
 /// Query the local nix store for which paths exist.
 ///
