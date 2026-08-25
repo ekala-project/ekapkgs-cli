@@ -68,8 +68,8 @@ pub fn execute(installable: &str, extra: &[String]) -> color_eyre::Result<()> {
                 if avail > 0 {
                     tracing::info!(
                         "{avail} paths to download ({} download, {} unpacked)",
-                        format_bytes(dl_size),
-                        format_bytes(nar_size),
+                        ekapkgs_ui::format::format_bytes(dl_size),
+                        ekapkgs_ui::format::format_bytes(nar_size),
                     );
 
                     crate::download::download_and_import(
@@ -112,18 +112,3 @@ pub fn execute(installable: &str, extra: &[String]) -> color_eyre::Result<()> {
     }
 }
 
-fn format_bytes(bytes: u64) -> String {
-    const KIB: u64 = 1024;
-    const MIB: u64 = 1024 * 1024;
-    const GIB: u64 = 1024 * 1024 * 1024;
-
-    if bytes >= GIB {
-        format!("{:.1} GiB", bytes as f64 / GIB as f64)
-    } else if bytes >= MIB {
-        format!("{:.1} MiB", bytes as f64 / MIB as f64)
-    } else if bytes >= KIB {
-        format!("{:.1} KiB", bytes as f64 / KIB as f64)
-    } else {
-        format!("{bytes} B")
-    }
-}

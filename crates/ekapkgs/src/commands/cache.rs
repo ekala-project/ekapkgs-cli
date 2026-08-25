@@ -155,8 +155,8 @@ fn cmd_push_sources(paths: &[String], cache_url: Option<&str>) -> color_eyre::Re
 
         tracing::info!(
             "Derivation graph: {} ({} compressed)",
-            format_size(drv_graph_json.len()),
-            format_size(drv_graph_compressed.len()),
+            ekapkgs_ui::format::format_bytes(drv_graph_json.len() as u64),
+            ekapkgs_ui::format::format_bytes(drv_graph_compressed.len() as u64),
         );
 
         // 2. Identify FOD (fixed-output derivation) paths.
@@ -268,16 +268,6 @@ fn cmd_push_sources(paths: &[String], cache_url: Option<&str>) -> color_eyre::Re
     }
 
     Ok(())
-}
-
-fn format_size(bytes: usize) -> String {
-    if bytes >= 1_048_576 {
-        format!("{:.1} MiB", bytes as f64 / 1_048_576.0)
-    } else if bytes >= 1024 {
-        format!("{:.1} KiB", bytes as f64 / 1024.0)
-    } else {
-        format!("{bytes} B")
-    }
 }
 
 enum PushResult {
