@@ -68,6 +68,28 @@ pub enum Command {
         command: ClosureCommand,
     },
 
+    /// Deploy a NixOS configuration to a remote host.
+    Deploy {
+        /// The NixOS configuration installable (e.g., `.#nixosConfigurations.prod`).
+        installable: String,
+
+        /// Target host to deploy to (SSH destination).
+        #[arg(long)]
+        target_host: String,
+
+        /// Host to build on (default: local machine).
+        #[arg(long)]
+        build_host: Option<String>,
+
+        /// Activation mode.
+        #[arg(long, value_enum, default_value = "switch")]
+        mode: ActivationMode,
+
+        /// Only show what would be done.
+        #[arg(long)]
+        dry_run: bool,
+    },
+
     /// Flake introspection and management.
     Flake {
         #[command(subcommand)]
@@ -277,4 +299,11 @@ pub enum FlakeCommand {
         #[arg(long, default_value = ".")]
         installable: String,
     },
+}
+
+#[derive(Clone, clap::ValueEnum)]
+pub enum ActivationMode {
+    Switch,
+    Boot,
+    Test,
 }
