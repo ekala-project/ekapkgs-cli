@@ -153,8 +153,14 @@ impl CacheService for NegotiateService {
             }
         }
 
-        // Build download plan: topological sort by references.
-        let download_plan = build_download_plan(&available, &have_set);
+        // Build download plan: topological sort by references, with
+        // critical path prioritization if a target is specified.
+        let target = if req.target_hash.is_empty() {
+            None
+        } else {
+            Some(req.target_hash.as_str())
+        };
+        let download_plan = build_download_plan(&available, &have_set, target);
 
         // If client supports CAS and backend has CAS data, include path mappings.
         let ca_path_mappings = if req.supports_cas && self.state.storage.supports_cas() {
@@ -393,7 +399,33 @@ impl CacheService for NegotiateService {
 /// Paths are grouped into batches. Within each batch, paths can be downloaded
 /// in parallel. Batches must be processed in order (dependencies before
 /// dependents).
-fn build_download_plan(entries: &[PathManifestEntry], have: &HashSet<&str>) -> DownloadPlan {
+///
+/// When `target` is set, the target's transitive runtime dependencies are
+/// identified and placed in earlier batches (critical path prioritization).
+fn build_download_plan(
+    entries: &[PathManifestEntry],
+    have: &HashSet<&str>,
+    target: Option<&str>,
+) -> DownloadPlan {
+    // Build hash → entry index lookup and compute the critical path set.
+    let entry_hashes: Vec<String> = entries
+        .iter()
+        .map(|e| {
+            e.store_path
+                .rsplit('/')
+                .next()
+                .and_then(|b| b.split('-').next())
+                .unwrap_or("")
+                .to_owned()
+        })
+        .collect();
+
+    let critical_set = if let Some(target_hash) = target {
+        compute_critical_path(entries, &entry_hashes, target_hash)
+    } else {
+        HashSet::new()
+    };
+
     // Track which paths have been assigned to a batch.
     let mut assigned: HashSet<usize> = HashSet::new();
     // Track which hashes are "resolved" (available for dependents).
@@ -402,6 +434,7 @@ fn build_download_plan(entries: &[PathManifestEntry], have: &HashSet<&str>) -> D
     let mut batches = Vec::new();
 
     // Iteratively find paths whose references are all resolved.
+    // Within each batch, sort critical path entries first.
     loop {
         let mut batch_paths = Vec::new();
 
@@ -410,7 +443,6 @@ fn build_download_plan(entries: &[PathManifestEntry], have: &HashSet<&str>) -> D
                 continue;
             }
 
-            // Check if all references are resolved.
             let all_resolved = entry.references.iter().all(|r| {
                 let ref_hash = r.rsplit('/').next().and_then(|b| b.split('-').next());
                 match ref_hash {
@@ -420,48 +452,42 @@ fn build_download_plan(entries: &[PathManifestEntry], have: &HashSet<&str>) -> D
             });
 
             if all_resolved {
-                let hash = entry
-                    .store_path
-                    .rsplit('/')
-                    .next()
-                    .and_then(|b| b.split('-').next())
-                    .unwrap_or("")
-                    .to_owned();
-                batch_paths.push(hash);
+                batch_paths.push((
+                    entry_hashes[i].clone(),
+                    critical_set.contains(&entry_hashes[i]),
+                ));
                 assigned.insert(i);
             }
         }
 
         if batch_paths.is_empty() {
-            // Remaining paths have circular deps or missing refs — dump them all.
-            for (i, entry) in entries.iter().enumerate() {
+            for (i, _entry) in entries.iter().enumerate() {
                 if !assigned.contains(&i) {
-                    let hash = entry
-                        .store_path
-                        .rsplit('/')
-                        .next()
-                        .and_then(|b| b.split('-').next())
-                        .unwrap_or("")
-                        .to_owned();
-                    batch_paths.push(hash);
+                    batch_paths.push((
+                        entry_hashes[i].clone(),
+                        critical_set.contains(&entry_hashes[i]),
+                    ));
                 }
             }
             if !batch_paths.is_empty() {
+                // Sort: critical paths first.
+                batch_paths.sort_by_key(|a| std::cmp::Reverse(a.1));
                 batches.push(DownloadBatch {
-                    paths: batch_paths,
+                    paths: batch_paths.into_iter().map(|(h, _)| h).collect(),
                     priority: batches.len() as u32,
                 });
             }
             break;
         }
 
-        // Mark batch paths as resolved for the next iteration.
-        for h in &batch_paths {
+        for (h, _) in &batch_paths {
             resolved.insert(h.clone());
         }
 
+        // Sort: critical paths first within the batch.
+        batch_paths.sort_by_key(|a| std::cmp::Reverse(a.1));
         batches.push(DownloadBatch {
-            paths: batch_paths,
+            paths: batch_paths.into_iter().map(|(h, _)| h).collect(),
             priority: batches.len() as u32,
         });
 
@@ -471,6 +497,47 @@ fn build_download_plan(entries: &[PathManifestEntry], have: &HashSet<&str>) -> D
     }
 
     DownloadPlan { batches }
+}
+
+/// Compute the set of store path hashes that are on the critical path:
+/// the target and its transitive runtime dependencies.
+fn compute_critical_path(
+    entries: &[PathManifestEntry],
+    entry_hashes: &[String],
+    target_hash: &str,
+) -> HashSet<String> {
+    let mut critical = HashSet::new();
+
+    // Build a reference map: hash → references (as hashes).
+    let ref_map: HashMap<&str, Vec<&str>> = entries
+        .iter()
+        .zip(entry_hashes.iter())
+        .map(|(entry, hash)| {
+            let refs: Vec<&str> = entry
+                .references
+                .iter()
+                .filter_map(|r| r.rsplit('/').next().and_then(|b| b.split('-').next()))
+                .collect();
+            (hash.as_str(), refs)
+        })
+        .collect();
+
+    // BFS from the target to find all transitive deps.
+    let mut queue = vec![target_hash];
+    while let Some(hash) = queue.pop() {
+        if !critical.insert(hash.to_owned()) {
+            continue;
+        }
+        if let Some(refs) = ref_map.get(hash) {
+            for r in refs {
+                if !critical.contains(*r) {
+                    queue.push(r);
+                }
+            }
+        }
+    }
+
+    critical
 }
 
 /// Maximum delta-to-full ratio: only offer a delta if it's smaller than this

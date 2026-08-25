@@ -1109,6 +1109,7 @@ async fn test_delta_negotiate() {
         accept_compression: vec![Compression::Zstd as i32],
         trust_roots: Vec::new(),
         supports_cas: false,
+        target_hash: String::new(),
     });
     let response = grpc_client.negotiate(request).await.unwrap().into_inner();
 
@@ -1187,6 +1188,7 @@ async fn test_delta_http_download() {
         accept_compression: vec![Compression::Zstd as i32],
         trust_roots: Vec::new(),
         supports_cas: false,
+        target_hash: String::new(),
     });
     let response = grpc_client.negotiate(request).await.unwrap().into_inner();
     let entry = &response.available[0];
@@ -1274,6 +1276,7 @@ async fn test_delta_stream() {
         accept_compression: vec![Compression::Zstd as i32],
         trust_roots: Vec::new(),
         supports_cas: false,
+        target_hash: String::new(),
     });
     let response = grpc_client.negotiate(request).await.unwrap().into_inner();
     assert!(!response.available[0].delta_base_hash.is_empty());

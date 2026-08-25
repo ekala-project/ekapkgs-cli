@@ -15,6 +15,16 @@ pub fn execute(installable: &str, extra: &[String]) -> color_eyre::Result<()> {
         let spinner = ekapkgs_ui::progress::spinner("Evaluating closure...");
         let closure_paths = eval::derivation_closure_paths(&inst)?;
 
+        // Identify the primary target output path for critical path prioritization.
+        let target_hash = eval::eval_build_outputs(&inst)
+            .ok()
+            .and_then(|outputs| {
+                outputs
+                    .first()
+                    .and_then(|o| o.outputs.values().next().cloned())
+            })
+            .and_then(|path| store::store_path_hash(&path).map(String::from));
+
         spinner.set_message("Checking local store...");
         let (have, want) = store::partition_local(&closure_paths)?;
         spinner.finish_and_clear();
@@ -42,8 +52,13 @@ pub fn execute(installable: &str, extra: &[String]) -> color_eyre::Result<()> {
             rt.block_on(async {
                 let spinner = ekapkgs_ui::progress::spinner("Negotiating with cache...");
 
-                let response =
-                    crate::negotiate::negotiate(&server_url, want_hashes, have_hashes).await?;
+                let response = crate::negotiate::negotiate_with_target(
+                    &server_url,
+                    want_hashes,
+                    have_hashes,
+                    target_hash.as_deref(),
+                )
+                .await?;
 
                 spinner.finish_and_clear();
 

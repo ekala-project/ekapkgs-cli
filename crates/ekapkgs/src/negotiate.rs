@@ -5,10 +5,24 @@ use ekapkgs_protocol::ekapkgs::v1::{
 };
 
 /// Send a negotiate request to the ekapkgs cache server.
+///
+/// If `target` is provided, the server prioritizes the target and its
+/// transitive runtime dependencies in the download plan (critical path
+/// prioritization).
 pub async fn negotiate(
     server_url: &str,
     want: Vec<String>,
     have: Vec<String>,
+) -> color_eyre::Result<NegotiateResponse> {
+    negotiate_with_target(server_url, want, have, None).await
+}
+
+/// Send a negotiate request with a target hash for critical path prioritization.
+pub async fn negotiate_with_target(
+    server_url: &str,
+    want: Vec<String>,
+    have: Vec<String>,
+    target: Option<&str>,
 ) -> color_eyre::Result<NegotiateResponse> {
     let mut client = CacheServiceClient::connect(server_url.to_owned()).await?;
 
@@ -18,6 +32,7 @@ pub async fn negotiate(
         accept_compression: vec![Compression::Zstd as i32, Compression::Xz as i32],
         trust_roots: Vec::new(),
         supports_cas: true,
+        target_hash: target.unwrap_or_default().to_owned(),
     });
 
     let response = client.negotiate(request).await?;

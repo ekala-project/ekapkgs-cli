@@ -25,6 +25,10 @@ message NegotiateRequest {
   repeated TrustRoot trust_roots = 4;
   // Whether the client supports content-addressed chunk transfers.
   bool supports_cas = 5;
+  // Primary target store path hash (for critical path prioritization).
+  // When set, the server prioritizes the target and its transitive
+  // runtime dependencies in the download plan.
+  string target_hash = 6;
 }
 
 message NegotiateResponse {
