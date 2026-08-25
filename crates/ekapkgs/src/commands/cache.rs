@@ -335,53 +335,36 @@ fn cmd_pull(paths: &[String], cache_url: Option<&str>) -> color_eyre::Result<()>
         let unavail = response.unavailable.len();
 
         if avail > 0 {
-            // If the server provided CAS path mappings, use chunk negotiation
-            // for more efficient transfer, then fall back to NAR download
-            // for the actual store import.
-            if !response.ca_path_mappings.is_empty() {
-                tracing::info!(
-                    "{avail} paths available from cache (CAS: {} with chunk mappings)",
-                    response.ca_path_mappings.len()
-                );
+            tracing::info!("{avail} paths available from cache");
 
-                // Perform chunk-level negotiation.
-                let chunk_spinner = ekapkgs_ui::progress::spinner("Negotiating chunks...");
-                let chunk_response = crate::negotiate::negotiate_chunks(
-                    &server_url,
-                    want_hashes,
-                    have_hashes,
-                    Vec::new(), // No local chunk cache yet.
-                )
-                .await?;
-                chunk_spinner.finish_and_clear();
+            // Try gRPC streaming first for a single-connection transfer.
+            // Fall back to individual HTTP downloads if the server doesn't
+            // support the StreamNars RPC.
+            match crate::download::stream_and_import(&server_url, &response).await {
+                Ok(()) => {
+                    tracing::info!("Imported {avail} paths (streamed)");
+                },
+                Err(e) => {
+                    // Check if this is an UNIMPLEMENTED gRPC status, meaning
+                    // the server doesn't support streaming.
+                    let is_unimplemented = e
+                        .downcast_ref::<tonic::Status>()
+                        .is_some_and(|s| s.code() == tonic::Code::Unimplemented);
 
-                if !chunk_response.missing_chunks.is_empty() {
-                    tracing::info!(
-                        "{} chunks to download ({} bytes)",
-                        chunk_response.missing_chunks.len(),
-                        chunk_response.total_chunk_size,
-                    );
-                    crate::download::download_chunks(
-                        &server_url,
-                        &chunk_response,
-                        config.defaults.max_parallel_downloads,
-                    )
-                    .await?;
-                }
-            } else {
-                tracing::info!("{avail} paths available from cache");
+                    if is_unimplemented {
+                        tracing::info!("Server does not support streaming, using HTTP downloads");
+                        crate::download::download_and_import(
+                            &server_url,
+                            &response,
+                            config.defaults.max_parallel_downloads,
+                        )
+                        .await?;
+                        tracing::info!("Imported {avail} paths");
+                    } else {
+                        return Err(e);
+                    }
+                },
             }
-
-            // Always use the standard NAR download for import, since nix
-            // requires NARs for `nix copy`. The server reconstructs NARs from
-            // chunks on-the-fly when the CAS backend is in use.
-            crate::download::download_and_import(
-                &server_url,
-                &response,
-                config.defaults.max_parallel_downloads,
-            )
-            .await?;
-            tracing::info!("Imported {avail} paths");
         }
 
         if unavail > 0 {

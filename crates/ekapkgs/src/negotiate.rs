@@ -1,7 +1,7 @@
 use ekapkgs_protocol::ekapkgs::v1::cache_service_client::CacheServiceClient;
 use ekapkgs_protocol::ekapkgs::v1::{
-    B3Digest, ChunkNegotiateRequest, ChunkNegotiateResponse, Compression, NegotiateRequest,
-    NegotiateResponse,
+    B3Digest, ChunkNegotiateRequest, ChunkNegotiateResponse, Compression, NarChunk,
+    NegotiateRequest, NegotiateResponse, StreamNarsRequest,
 };
 
 /// Send a negotiate request to the ekapkgs cache server.
@@ -25,6 +25,7 @@ pub async fn negotiate(
 }
 
 /// Send a chunk-level negotiate request to the ekapkgs cache server.
+#[allow(dead_code)]
 pub async fn negotiate_chunks(
     server_url: &str,
     want: Vec<String>,
@@ -43,5 +44,20 @@ pub async fn negotiate_chunks(
     });
 
     let response = client.negotiate_chunks(request).await?;
+    Ok(response.into_inner())
+}
+
+/// Start a NAR streaming session with the ekapkgs cache server.
+///
+/// Returns a gRPC stream of `NarChunk` messages. The server sends NAR data
+/// for each requested path in order, split into 64 KiB chunks.
+pub async fn stream_nars(
+    server_url: &str,
+    path_hashes: Vec<String>,
+) -> color_eyre::Result<tonic::Streaming<NarChunk>> {
+    let mut client = CacheServiceClient::connect(server_url.to_owned()).await?;
+
+    let request = tonic::Request::new(StreamNarsRequest { path_hashes });
+    let response = client.stream_nars(request).await?;
     Ok(response.into_inner())
 }

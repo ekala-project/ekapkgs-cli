@@ -204,6 +204,7 @@ async fn download_single(
 /// told us which chunks are missing via `ChunkNegotiateResponse`. We download
 /// them, then rely on the standard NAR download path for actual store import
 /// since nix requires NARs for `nix copy`.
+#[allow(dead_code)]
 pub async fn download_chunks(
     server_url: &str,
     response: &ChunkNegotiateResponse,
@@ -283,4 +284,158 @@ pub async fn download_chunks(
     );
 
     Ok(())
+}
+
+/// Stream NARs over gRPC and import into the nix store.
+///
+/// Uses a single gRPC server-side stream instead of individual HTTP downloads.
+/// The server sends NAR data for each path in dependency order, split into
+/// 64 KiB chunks.
+pub async fn stream_and_import(
+    server_url: &str,
+    response: &NegotiateResponse,
+) -> color_eyre::Result<()> {
+    if response.available.is_empty() {
+        return Ok(());
+    }
+
+    let staging_dir = tempfile::tempdir()?;
+    let nar_dir = staging_dir.path().join("nar");
+    std::fs::create_dir_all(&nar_dir)?;
+
+    // Write nix-cache-info so nix recognizes this as a binary cache.
+    std::fs::write(
+        staging_dir.path().join("nix-cache-info"),
+        "StoreDir: /nix/store\n",
+    )?;
+
+    // Build a lookup from hash to manifest entry.
+    let entry_by_hash: std::collections::HashMap<&str, &PathManifestEntry> = response
+        .available
+        .iter()
+        .filter_map(|e| {
+            let hash = e.store_path.rsplit('/').next()?.split('-').next()?;
+            Some((hash, e))
+        })
+        .collect();
+
+    // Build the ordered list of path hashes from the download plan.
+    let path_hashes: Vec<String> = response
+        .download_plan
+        .as_ref()
+        .map(|p| {
+            p.batches
+                .iter()
+                .flat_map(|b| b.paths.iter().cloned())
+                .collect()
+        })
+        .unwrap_or_default();
+
+    // Also include any paths not covered by the plan.
+    let planned: std::collections::HashSet<String> = path_hashes.iter().cloned().collect();
+    let mut all_hashes = path_hashes;
+    for entry in &response.available {
+        if let Some(hash) = entry
+            .store_path
+            .rsplit('/')
+            .next()
+            .and_then(|b| b.split('-').next())
+        {
+            if !planned.contains(hash) {
+                all_hashes.push(hash.to_owned());
+            }
+        }
+    }
+
+    let bar = ekapkgs_ui::progress::download_bar(response.total_download_size);
+
+    // Start the gRPC stream.
+    let mut stream = crate::negotiate::stream_nars(server_url, all_hashes).await?;
+
+    let mut current_hash = String::new();
+    let mut current_buf: Vec<u8> = Vec::new();
+    let mut paths_received = 0u64;
+
+    while let Some(chunk) = stream.message().await? {
+        if chunk.path_hash != current_hash {
+            current_hash.clone_from(&chunk.path_hash);
+            current_buf.clear();
+            if chunk.file_size > 0 {
+                current_buf.reserve(chunk.file_size as usize);
+            }
+        }
+
+        bar.inc(chunk.data.len() as u64);
+        current_buf.extend_from_slice(&chunk.data);
+
+        if chunk.last {
+            // Write the completed NAR and narinfo to the staging directory.
+            if let Some(entry) = entry_by_hash.get(current_hash.as_str()) {
+                let nar_path = staging_dir.path().join(&entry.url);
+                if let Some(parent) = nar_path.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::fs::write(&nar_path, &current_buf)?;
+
+                let narinfo_text = build_narinfo_text(entry);
+                let narinfo_path = staging_dir.path().join(format!("{current_hash}.narinfo"));
+                std::fs::write(&narinfo_path, narinfo_text)?;
+
+                paths_received += 1;
+            } else {
+                tracing::warn!("Received NAR for unknown hash {current_hash}, skipping");
+            }
+
+            current_buf.clear();
+        }
+    }
+
+    bar.finish_and_clear();
+
+    if paths_received == 0 {
+        return Ok(());
+    }
+
+    tracing::info!("Importing {paths_received} paths into store...");
+    ekapkgs_nix::store::import_from_local_cache(staging_dir.path())?;
+
+    Ok(())
+}
+
+/// Build a narinfo text string from a PathManifestEntry.
+fn build_narinfo_text(entry: &PathManifestEntry) -> String {
+    let refs: Vec<String> = entry
+        .references
+        .iter()
+        .map(|r| r.rsplit('/').next().unwrap_or(r.as_str()).to_owned())
+        .collect();
+
+    let compression = match entry.compression {
+        c if c == ekapkgs_protocol::ekapkgs::v1::Compression::Zstd as i32 => "zstd",
+        c if c == ekapkgs_protocol::ekapkgs::v1::Compression::Xz as i32 => "xz",
+        _ => "none",
+    };
+
+    let mut narinfo = String::new();
+    narinfo.push_str(&format!("StorePath: {}\n", entry.store_path));
+    narinfo.push_str(&format!("URL: {}\n", entry.url));
+    narinfo.push_str(&format!("Compression: {compression}\n"));
+    if !entry.file_hash.is_empty() {
+        narinfo.push_str(&format!("FileHash: {}\n", entry.file_hash));
+    }
+    if entry.file_size > 0 {
+        narinfo.push_str(&format!("FileSize: {}\n", entry.file_size));
+    }
+    narinfo.push_str(&format!("NarHash: {}\n", entry.nar_hash));
+    narinfo.push_str(&format!("NarSize: {}\n", entry.nar_size));
+    if !refs.is_empty() {
+        narinfo.push_str(&format!("References: {}\n", refs.join(" ")));
+    }
+    for sig in &entry.signatures {
+        narinfo.push_str(&format!("Sig: {sig}\n"));
+    }
+    if !entry.ca.is_empty() {
+        narinfo.push_str(&format!("CA: {}\n", entry.ca));
+    }
+    narinfo
 }

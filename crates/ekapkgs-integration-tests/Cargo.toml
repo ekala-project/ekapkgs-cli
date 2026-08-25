@@ -13,6 +13,8 @@ serde.workspace = true
 data-encoding.workspace = true
 ed25519-dalek.workspace = true
 blake3.workspace = true
+ekapkgs-protocol.workspace = true
+tonic.workspace = true
 rand = "0.8"
 
 [[test]]

@@ -712,3 +712,185 @@ async fn test_castore_push_requires_auth() {
         .unwrap();
     assert_eq!(resp.status(), 200);
 }
+
+// ===== gRPC StreamNars tests =====
+
+#[tokio::test]
+async fn test_stream_nars_basic() {
+    let server = TestServer::start();
+    let base = server.base_url();
+
+    // Populate two NARs in the cache: dep first, then pkg that references it.
+    let nar_a = b"nar-data-for-dep-aaa";
+    let nar_b = b"nar-data-for-pkg-bbb";
+
+    server.write_narinfo(
+        "dep111",
+        "StorePath: /nix/store/dep111-dep-1.0\nURL: nar/dep111.nar\nCompression: none\nNarHash: \
+         sha256:aa11\nNarSize: 20\n",
+    );
+    server.write_nar("dep111.nar", nar_a);
+
+    server.write_narinfo(
+        "pkg222",
+        "StorePath: /nix/store/pkg222-pkg-1.0\nURL: nar/pkg222.nar\nCompression: none\nNarHash: \
+         sha256:bb22\nNarSize: 20\nReferences: dep111-dep-1.0\n",
+    );
+    server.write_nar("pkg222.nar", nar_b);
+
+    // Connect gRPC and stream both NARs.
+    use ekapkgs_protocol::ekapkgs::v1::StreamNarsRequest;
+    use ekapkgs_protocol::ekapkgs::v1::cache_service_client::CacheServiceClient;
+
+    let mut client = CacheServiceClient::connect(base.clone()).await.unwrap();
+    let request = tonic::Request::new(StreamNarsRequest {
+        path_hashes: vec!["dep111".to_owned(), "pkg222".to_owned()],
+    });
+    let mut stream = client.stream_nars(request).await.unwrap().into_inner();
+
+    // Collect all chunks.
+    let mut received: std::collections::HashMap<String, Vec<u8>> = std::collections::HashMap::new();
+    let mut last_seen: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
+
+    while let Some(chunk) = stream.message().await.unwrap() {
+        received
+            .entry(chunk.path_hash.clone())
+            .or_default()
+            .extend_from_slice(&chunk.data);
+        if chunk.last {
+            last_seen.insert(chunk.path_hash.clone(), true);
+        }
+    }
+
+    // Verify we got both paths with correct data.
+    assert_eq!(received.get("dep111").unwrap().as_slice(), nar_a);
+    assert_eq!(received.get("pkg222").unwrap().as_slice(), nar_b);
+    assert!(last_seen.get("dep111").copied().unwrap_or(false));
+    assert!(last_seen.get("pkg222").copied().unwrap_or(false));
+}
+
+#[tokio::test]
+async fn test_stream_nars_missing_path() {
+    let server = TestServer::start();
+    let base = server.base_url();
+
+    // Populate one NAR.
+    server.write_narinfo(
+        "exists1",
+        "StorePath: /nix/store/exists1-pkg-1.0\nURL: nar/exists1.nar\nCompression: none\nNarHash: \
+         sha256:ee11\nNarSize: 10\n",
+    );
+    server.write_nar("exists1.nar", b"nar-exists");
+
+    use ekapkgs_protocol::ekapkgs::v1::StreamNarsRequest;
+    use ekapkgs_protocol::ekapkgs::v1::cache_service_client::CacheServiceClient;
+
+    let mut client = CacheServiceClient::connect(base.clone()).await.unwrap();
+    let request = tonic::Request::new(StreamNarsRequest {
+        path_hashes: vec!["nonexistent".to_owned(), "exists1".to_owned()],
+    });
+    let mut stream = client.stream_nars(request).await.unwrap().into_inner();
+
+    // Should skip the missing path and deliver the existing one.
+    let mut received: std::collections::HashMap<String, Vec<u8>> = std::collections::HashMap::new();
+
+    while let Some(chunk) = stream.message().await.unwrap() {
+        received
+            .entry(chunk.path_hash.clone())
+            .or_default()
+            .extend_from_slice(&chunk.data);
+    }
+
+    assert!(!received.contains_key("nonexistent"));
+    assert_eq!(received.get("exists1").unwrap().as_slice(), b"nar-exists");
+}
+
+#[tokio::test]
+async fn test_stream_nars_castore() {
+    let server = TestServer::start_castore_with_tokens(&["writer"]);
+    let base = server.base_url();
+    let client = reqwest::Client::new();
+
+    // Push a NAR via HTTP (castore backend decomposes it into chunks).
+    let nar_data = build_test_nar(b"streamed from castore");
+    let resp = client
+        .put(format!("{base}/nar/cas222.nar"))
+        .header("Authorization", "Bearer test_token_writer")
+        .body(nar_data.clone())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let narinfo = "StorePath: /nix/store/cas222-test-1.0\nURL: nar/cas222.nar\nCompression: \
+                   none\nNarHash: sha256:ccdd\nNarSize: 100\n";
+    let resp = client
+        .put(format!("{base}/cas222.narinfo"))
+        .header("Authorization", "Bearer test_token_writer")
+        .body(narinfo)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    // Now stream it back via gRPC.
+    use ekapkgs_protocol::ekapkgs::v1::StreamNarsRequest;
+    use ekapkgs_protocol::ekapkgs::v1::cache_service_client::CacheServiceClient;
+
+    let mut grpc_client = CacheServiceClient::connect(base.clone()).await.unwrap();
+    let request = tonic::Request::new(StreamNarsRequest {
+        path_hashes: vec!["cas222".to_owned()],
+    });
+    let mut stream = grpc_client.stream_nars(request).await.unwrap().into_inner();
+
+    let mut received = Vec::new();
+    while let Some(chunk) = stream.message().await.unwrap() {
+        assert_eq!(chunk.path_hash, "cas222");
+        received.extend_from_slice(&chunk.data);
+    }
+
+    // The NAR reconstructed from CAS should match the original.
+    assert_eq!(received, nar_data);
+}
+
+#[tokio::test]
+async fn test_stream_nars_file_size_on_first_chunk() {
+    let server = TestServer::start();
+    let base = server.base_url();
+
+    let nar_data = vec![0xABu8; 200_000]; // > 64 KiB so multiple chunks
+    server.write_narinfo(
+        "big111",
+        "StorePath: /nix/store/big111-big-1.0\nURL: nar/big111.nar\nCompression: none\nNarHash: \
+         sha256:bbig\nNarSize: 200000\n",
+    );
+    server.write_nar("big111.nar", &nar_data);
+
+    use ekapkgs_protocol::ekapkgs::v1::StreamNarsRequest;
+    use ekapkgs_protocol::ekapkgs::v1::cache_service_client::CacheServiceClient;
+
+    let mut client = CacheServiceClient::connect(base.clone()).await.unwrap();
+    let request = tonic::Request::new(StreamNarsRequest {
+        path_hashes: vec!["big111".to_owned()],
+    });
+    let mut stream = client.stream_nars(request).await.unwrap().into_inner();
+
+    let mut chunks_received = 0u32;
+    let mut total_bytes = 0usize;
+    let mut first_file_size = 0u64;
+
+    while let Some(chunk) = stream.message().await.unwrap() {
+        if chunks_received == 0 {
+            first_file_size = chunk.file_size;
+        } else {
+            // file_size should be 0 on subsequent chunks.
+            assert_eq!(chunk.file_size, 0);
+        }
+        total_bytes += chunk.data.len();
+        chunks_received += 1;
+    }
+
+    assert!(chunks_received > 1, "should have multiple chunks");
+    assert_eq!(first_file_size, 200_000);
+    assert_eq!(total_bytes, 200_000);
+}

@@ -4,9 +4,14 @@ use std::sync::Arc;
 use ekapkgs_protocol::ekapkgs::v1::cache_service_server::CacheService;
 use ekapkgs_protocol::ekapkgs::v1::{
     CaPathMapping, ChunkDownload, ChunkNegotiateRequest, ChunkNegotiateResponse, Compression,
-    DownloadBatch, DownloadPlan, NegotiateRequest, NegotiateResponse, PathManifestEntry,
+    DownloadBatch, DownloadPlan, NarChunk, NegotiateRequest, NegotiateResponse, PathManifestEntry,
+    StreamNarsRequest,
 };
+use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
+
+/// Maximum size of each NarChunk payload (64 KiB).
+const NAR_CHUNK_SIZE: usize = 65_536;
 
 use crate::AppState;
 
@@ -16,6 +21,8 @@ pub struct NegotiateService {
 
 #[tonic::async_trait]
 impl CacheService for NegotiateService {
+    type StreamNarsStream = ReceiverStream<Result<NarChunk, Status>>;
+
     async fn negotiate(
         &self,
         request: Request<NegotiateRequest>,
@@ -232,6 +239,89 @@ impl CacheService for NegotiateService {
             unavailable,
             total_chunk_size,
         }))
+    }
+
+    async fn stream_nars(
+        &self,
+        request: Request<StreamNarsRequest>,
+    ) -> Result<Response<Self::StreamNarsStream>, Status> {
+        let req = request.into_inner();
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+
+        let state = Arc::clone(&self.state);
+        tokio::spawn(async move {
+            for hash in req.path_hashes {
+                // Look up narinfo to get the NAR URL and file size.
+                let narinfo = match state.storage.get_narinfo(&hash) {
+                    Ok(Some(ni)) => ni,
+                    Ok(None) => {
+                        tracing::warn!("StreamNars: path {hash} not found, skipping");
+                        continue;
+                    },
+                    Err(e) => {
+                        tracing::warn!("StreamNars: failed to query {hash}: {e}");
+                        continue;
+                    },
+                };
+
+                // Load the full NAR.
+                let nar_data = match state.storage.get_nar(&narinfo.url) {
+                    Ok(Some(data)) => data,
+                    Ok(None) => {
+                        tracing::warn!("StreamNars: NAR not found for {hash}, skipping");
+                        continue;
+                    },
+                    Err(e) => {
+                        tracing::warn!("StreamNars: failed to load NAR for {hash}: {e}");
+                        continue;
+                    },
+                };
+
+                // Record GC access.
+                if let Some(ref tracker) = state.gc_tracker {
+                    tracker.record_access(&hash);
+                }
+
+                // Split into chunks and stream.
+                let total = nar_data.len();
+                let mut offset = 0;
+                let mut first = true;
+
+                while offset < total {
+                    let end = (offset + NAR_CHUNK_SIZE).min(total);
+                    let last = end == total;
+
+                    let chunk = NarChunk {
+                        path_hash: hash.clone(),
+                        data: nar_data[offset..end].to_vec(),
+                        last,
+                        file_size: if first { total as u64 } else { 0 },
+                    };
+                    first = false;
+                    offset = end;
+
+                    if tx.send(Ok(chunk)).await.is_err() {
+                        // Client disconnected.
+                        return;
+                    }
+                }
+
+                // Handle empty NARs (shouldn't happen but be safe).
+                if total == 0 {
+                    let chunk = NarChunk {
+                        path_hash: hash.clone(),
+                        data: Vec::new(),
+                        last: true,
+                        file_size: 0,
+                    };
+                    if tx.send(Ok(chunk)).await.is_err() {
+                        return;
+                    }
+                }
+            }
+        });
+
+        Ok(Response::new(ReceiverStream::new(rx)))
     }
 }
 

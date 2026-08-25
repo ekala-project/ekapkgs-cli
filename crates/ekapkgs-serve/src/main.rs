@@ -444,7 +444,11 @@ async fn cmd_serve(cli: Cli) -> color_eyre::Result<()> {
 
     let app = build_http_router(state)
         .route_service("/ekapkgs.v1.CacheService/Negotiate", grpc_service.clone())
-        .route_service("/ekapkgs.v1.CacheService/NegotiateChunks", grpc_service);
+        .route_service(
+            "/ekapkgs.v1.CacheService/NegotiateChunks",
+            grpc_service.clone(),
+        )
+        .route_service("/ekapkgs.v1.CacheService/StreamNars", grpc_service);
 
     tracing::info!("Listening on {addr} (gRPC + HTTP)");
 

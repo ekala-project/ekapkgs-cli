@@ -10,6 +10,8 @@ service CacheService {
   rpc Negotiate(NegotiateRequest) returns (NegotiateResponse);
   // Chunk-level negotiation for CAS-aware clients.
   rpc NegotiateChunks(ChunkNegotiateRequest) returns (ChunkNegotiateResponse);
+  // Stream NAR data for multiple paths over a single server-side stream.
+  rpc StreamNars(StreamNarsRequest) returns (stream NarChunk);
 }
 
 message NegotiateRequest {
@@ -40,4 +42,20 @@ message NegotiateResponse {
   // CAS root nodes per path (populated when client sets supports_cas=true
   // and server has CAS data available).
   repeated CaPathMapping ca_path_mappings = 7;
+}
+
+message StreamNarsRequest {
+  // Store path hashes to stream, in dependency order (dependencies first).
+  repeated string path_hashes = 1;
+}
+
+message NarChunk {
+  // The store path hash this chunk belongs to.
+  string path_hash = 1;
+  // Chunk payload (up to 64 KiB).
+  bytes data = 2;
+  // True for the final chunk of this path's NAR data.
+  bool last = 3;
+  // Total NAR file size (set on the first chunk only, for progress tracking).
+  uint64 file_size = 4;
 }
