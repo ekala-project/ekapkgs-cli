@@ -21,6 +21,19 @@ pub fn execute(command: CacheCommand) -> color_eyre::Result<()> {
             }
         },
         CacheCommand::Pull { paths, cache } => cmd_pull(&paths, cache.as_deref()),
+        CacheCommand::Warm {
+            installable,
+            from_flake_lock_diff,
+            old,
+            new,
+            cache,
+        } => cmd_warm(
+            &installable,
+            from_flake_lock_diff.as_deref(),
+            old.as_deref(),
+            new.as_deref(),
+            cache.as_deref(),
+        ),
         CacheCommand::Auth { command } => cmd_auth(command),
     }
 }
@@ -540,6 +553,220 @@ fn cmd_pull(paths: &[String], cache_url: Option<&str>) -> color_eyre::Result<()>
         Ok::<(), color_eyre::Report>(())
     })?;
 
+    Ok(())
+}
+
+// --- warm ---
+
+fn cmd_warm(
+    installable: &str,
+    from_flake_lock_diff: Option<&str>,
+    old_lock: Option<&str>,
+    new_lock: Option<&str>,
+    cache_url: Option<&str>,
+) -> color_eyre::Result<()> {
+    let config = ClientConfig::load()?;
+
+    let server_url = match cache_url {
+        Some(url) => url.to_owned(),
+        None => {
+            let cache = config.primary_cache().ok_or_else(|| {
+                color_eyre::eyre::eyre!(
+                    "no cache configured — use --cache or configure in config.toml"
+                )
+            })?;
+            cache.url.clone()
+        },
+    };
+
+    // Resolve old and new flake.lock contents.
+    let (old_lock_content, new_lock_content) = if let Some(diff_range) = from_flake_lock_diff {
+        // Parse "OLD..NEW" git range (e.g., "HEAD~1..HEAD").
+        let (old_ref, new_ref) = diff_range.split_once("..").ok_or_else(|| {
+            color_eyre::eyre::eyre!("invalid diff range: expected OLD..NEW, got {diff_range}")
+        })?;
+        let old = git_show_file(old_ref, "flake.lock")?;
+        let new = git_show_file(new_ref, "flake.lock")?;
+        (old, new)
+    } else {
+        let old_path = old_lock.ok_or_else(|| {
+            color_eyre::eyre::eyre!("either --from-flake-lock-diff or --old is required")
+        })?;
+        let new_path = new_lock.unwrap_or("flake.lock");
+        let old = std::fs::read_to_string(old_path)?;
+        let new = std::fs::read_to_string(new_path)?;
+        (old, new)
+    };
+
+    // Write temporary flake.lock files for evaluation.
+    let temp_dir = tempfile::tempdir()?;
+    let old_lock_path = temp_dir.path().join("flake.lock.old");
+    let new_lock_path = temp_dir.path().join("flake.lock.new");
+    std::fs::write(&old_lock_path, &old_lock_content)?;
+    std::fs::write(&new_lock_path, &new_lock_content)?;
+
+    // Evaluate closures at both flake.lock versions.
+    tracing::info!("Evaluating old closure...");
+    let old_closure = eval_with_lock(installable, &old_lock_path)?;
+    tracing::info!("Evaluating new closure...");
+    let new_closure = eval_with_lock(installable, &new_lock_path)?;
+
+    // Compute the diff: paths in new closure not in old closure.
+    let old_set: std::collections::HashSet<&str> = old_closure.iter().map(String::as_str).collect();
+    let diff_paths: Vec<&str> = new_closure
+        .iter()
+        .filter(|p| !old_set.contains(p.as_str()))
+        .map(String::as_str)
+        .collect();
+
+    tracing::info!(
+        "Closure diff: {} new paths ({} total in new, {} in old)",
+        diff_paths.len(),
+        new_closure.len(),
+        old_closure.len(),
+    );
+
+    if diff_paths.is_empty() {
+        tracing::info!("No new paths to warm");
+        return Ok(());
+    }
+
+    // Partition diff paths into local and remote.
+    let (have, want) = store::partition_local(
+        &diff_paths
+            .iter()
+            .map(|s| (*s).to_owned())
+            .collect::<Vec<_>>(),
+    )?;
+
+    if want.is_empty() {
+        tracing::info!("All {} diff paths already in local store", have.len());
+        return Ok(());
+    }
+
+    tracing::info!(
+        "{} paths to warm ({} already local)",
+        want.len(),
+        have.len()
+    );
+
+    let want_hashes: Vec<String> = want
+        .iter()
+        .filter_map(|p| store::store_path_hash(p).map(String::from))
+        .collect();
+    let have_hashes: Vec<String> = have
+        .iter()
+        .filter_map(|p| store::store_path_hash(p).map(String::from))
+        .collect();
+
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(async {
+        let spinner = ekapkgs_ui::progress::spinner("Negotiating with cache...");
+
+        let response = crate::negotiate::negotiate(&server_url, want_hashes, have_hashes).await?;
+
+        spinner.finish_and_clear();
+
+        let avail = response.available.len();
+        let unavail = response.unavailable.len();
+
+        if avail > 0 {
+            tracing::info!("{avail} paths available from cache");
+            match crate::download::stream_and_import(&server_url, &response).await {
+                Ok(()) => {
+                    tracing::info!("Warmed {avail} paths (streamed)");
+                },
+                Err(e) => {
+                    let is_unimplemented = e
+                        .downcast_ref::<tonic::Status>()
+                        .is_some_and(|s| s.code() == tonic::Code::Unimplemented);
+                    if is_unimplemented {
+                        crate::download::download_and_import(
+                            &server_url,
+                            &response,
+                            config.defaults.max_parallel_downloads,
+                        )
+                        .await?;
+                        tracing::info!("Warmed {avail} paths");
+                    } else {
+                        return Err(e);
+                    }
+                },
+            }
+        }
+
+        if unavail > 0 {
+            tracing::warn!("{unavail} paths not available on cache");
+        }
+
+        Ok::<(), color_eyre::Report>(())
+    })?;
+
+    Ok(())
+}
+
+/// Get a file's content at a specific git revision.
+fn git_show_file(rev: &str, path: &str) -> color_eyre::Result<String> {
+    let output = std::process::Command::new("git")
+        .args(["show", &format!("{rev}:{path}")])
+        .output()?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(color_eyre::eyre::eyre!(
+            "git show {rev}:{path} failed: {stderr}"
+        ));
+    }
+
+    Ok(String::from_utf8(output.stdout)?)
+}
+
+/// Evaluate a closure with a specific flake.lock file.
+///
+/// Uses `--override-input` to pin the flake's lock to the specified file.
+/// Falls back to evaluating with the lock file copied into a temp flake.
+fn eval_with_lock(
+    installable: &str,
+    lock_path: &std::path::Path,
+) -> color_eyre::Result<Vec<String>> {
+    // Create a temporary directory with the current flake source and the
+    // overridden flake.lock.
+    let temp_dir = tempfile::tempdir()?;
+
+    // Copy the current directory's flake.nix (and other files) to temp.
+    // We only need flake.nix and the lock file.
+    if std::path::Path::new("flake.nix").exists() {
+        std::fs::copy("flake.nix", temp_dir.path().join("flake.nix"))?;
+    }
+    std::fs::copy(lock_path, temp_dir.path().join("flake.lock"))?;
+
+    // Copy nix/ directory if it exists (for overlays, modules).
+    if std::path::Path::new("nix").is_dir() {
+        copy_dir_recursive(std::path::Path::new("nix"), &temp_dir.path().join("nix"))?;
+    }
+
+    // Evaluate the installable in the temp directory.
+    let inst_path = format!(
+        "path:{}#{}",
+        temp_dir.path().display(),
+        installable.trim_start_matches(".#")
+    );
+    let inst = Installable::new(&inst_path);
+    eval::derivation_closure_paths(&inst).map_err(Into::into)
+}
+
+fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let ty = entry.file_type()?;
+        let dst_path = dst.join(entry.file_name());
+        if ty.is_dir() {
+            copy_dir_recursive(&entry.path(), &dst_path)?;
+        } else {
+            std::fs::copy(entry.path(), dst_path)?;
+        }
+    }
     Ok(())
 }
 

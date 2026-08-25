@@ -94,6 +94,28 @@ pub enum CacheCommand {
         cache: Option<String>,
     },
 
+    /// Pre-warm the cache by downloading the closure diff between two flake.lock versions.
+    Warm {
+        /// The installable to evaluate (e.g., `.#nixosConfigurations.prod`).
+        installable: String,
+
+        /// Git revision range for flake.lock diff (e.g., `HEAD~1..HEAD`).
+        #[arg(long)]
+        from_flake_lock_diff: Option<String>,
+
+        /// Path to the old flake.lock file (alternative to --from-flake-lock-diff).
+        #[arg(long)]
+        old: Option<String>,
+
+        /// Path to the new flake.lock file (default: ./flake.lock).
+        #[arg(long)]
+        new: Option<String>,
+
+        /// Cache URL (overrides config).
+        #[arg(long)]
+        cache: Option<String>,
+    },
+
     /// Configure cache authentication.
     Auth {
         #[command(subcommand)]
