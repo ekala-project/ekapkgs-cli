@@ -649,6 +649,7 @@ dependencies = [
  "toml",
  "tonic",
  "tracing",
+ "zstd",
 ]
 
 [[package]]
@@ -658,12 +659,15 @@ dependencies = [
  "blake3",
  "data-encoding",
  "ed25519-dalek",
+ "ekapkgs-protocol",
  "rand 0.8.7",
  "reqwest",
  "serde",
  "serde_json",
  "tempfile",
  "tokio",
+ "tonic",
+ "zstd",
 ]
 
 [[package]]
@@ -712,11 +716,13 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tokio",
+ "tokio-stream",
  "toml",
  "tonic",
  "tower 0.5.3",
  "tower-http",
  "tracing",
+ "zstd",
 ]
 
 [[package]]

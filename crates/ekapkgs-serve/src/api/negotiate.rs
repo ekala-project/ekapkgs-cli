@@ -1,12 +1,17 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use ekapkgs_protocol::ekapkgs::v1::cache_service_server::CacheService;
 use ekapkgs_protocol::ekapkgs::v1::{
     CaPathMapping, ChunkDownload, ChunkNegotiateRequest, ChunkNegotiateResponse, Compression,
-    DownloadBatch, DownloadPlan, NegotiateRequest, NegotiateResponse, PathManifestEntry,
+    DownloadBatch, DownloadPlan, NarChunk, NegotiateRequest, NegotiateResponse, PathManifestEntry,
+    StreamNarsRequest,
 };
+use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
+
+/// Maximum size of each NarChunk payload (64 KiB).
+const NAR_CHUNK_SIZE: usize = 65_536;
 
 use crate::AppState;
 
@@ -16,6 +21,8 @@ pub struct NegotiateService {
 
 #[tonic::async_trait]
 impl CacheService for NegotiateService {
+    type StreamNarsStream = ReceiverStream<Result<NarChunk, Status>>;
+
     async fn negotiate(
         &self,
         request: Request<NegotiateRequest>,
@@ -75,14 +82,47 @@ impl CacheService for NegotiateService {
                         compression,
                         file_hash: ni.file_hash,
                         file_size: ni.file_size,
+                        delta_base_hash: String::new(),
+                        delta_url: String::new(),
+                        delta_size: 0,
                     });
-                }
+                },
                 Ok(None) => {
                     unavailable.push(hash.clone());
-                }
+                },
                 Err(e) => {
                     tracing::warn!("Failed to query narinfo for {hash}: {e}");
                     unavailable.push(hash.clone());
+                },
+            }
+        }
+
+        // Apply certificate-based signatures if configured.
+        let certificate_chain = if let Some(ref cert_signer) = self.state.cert_signer {
+            for entry in &mut available {
+                let fingerprint = crate::signing::NarInfoSigner::fingerprint(
+                    &entry.store_path,
+                    &entry.nar_hash,
+                    entry.nar_size,
+                    &entry.references,
+                );
+                entry.cert_signature = Some(cert_signer.sign(&fingerprint));
+            }
+            Some(cert_signer.chain.clone())
+        } else {
+            None
+        };
+
+        // Record accesses for GC tracking.
+        if let Some(ref tracker) = self.state.gc_tracker {
+            for entry in &available {
+                if let Some(hash) = entry
+                    .store_path
+                    .rsplit('/')
+                    .next()
+                    .and_then(|b| b.split('-').next())
+                {
+                    tracker.record_access(hash);
                 }
             }
         }
@@ -112,10 +152,19 @@ impl CacheService for NegotiateService {
             Vec::new()
         };
 
+        // Compute delta transfers: for each available path, check if the client
+        // has an older version of the same package that can serve as a delta base.
+        compute_deltas(
+            &self.state,
+            &req.have,
+            &mut available,
+            &mut total_download_size,
+        );
+
         Ok(Response::new(NegotiateResponse {
             available,
             unavailable,
-            certificate_chain: None,
+            certificate_chain,
             download_plan: Some(download_plan),
             total_download_size,
             total_nar_size,
@@ -211,6 +260,98 @@ impl CacheService for NegotiateService {
             total_chunk_size,
         }))
     }
+
+    async fn stream_nars(
+        &self,
+        request: Request<StreamNarsRequest>,
+    ) -> Result<Response<Self::StreamNarsStream>, Status> {
+        let req = request.into_inner();
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+
+        let state = Arc::clone(&self.state);
+        tokio::spawn(async move {
+            for hash in req.path_hashes {
+                // Look up narinfo to get the NAR URL and file size.
+                let narinfo = match state.storage.get_narinfo(&hash) {
+                    Ok(Some(ni)) => ni,
+                    Ok(None) => {
+                        tracing::warn!("StreamNars: path {hash} not found, skipping");
+                        continue;
+                    },
+                    Err(e) => {
+                        tracing::warn!("StreamNars: failed to query {hash}: {e}");
+                        continue;
+                    },
+                };
+
+                // Check if a delta is cached for this path.
+                let (stream_data, is_delta) = {
+                    // Try all possible base hashes in the delta cache.
+                    let delta = state.delta_cache.get_for_target(&hash);
+                    if let Some(d) = delta {
+                        (d, true)
+                    } else {
+                        // Load the full NAR.
+                        match state.storage.get_nar(&narinfo.url) {
+                            Ok(Some(data)) => (data, false),
+                            Ok(None) => {
+                                tracing::warn!("StreamNars: NAR not found for {hash}, skipping");
+                                continue;
+                            },
+                            Err(e) => {
+                                tracing::warn!("StreamNars: failed to load NAR for {hash}: {e}");
+                                continue;
+                            },
+                        }
+                    }
+                };
+
+                // Record GC access.
+                if let Some(ref tracker) = state.gc_tracker {
+                    tracker.record_access(&hash);
+                }
+
+                // Split into chunks and stream.
+                let total = stream_data.len();
+                let mut offset = 0;
+                let mut first = true;
+
+                while offset < total {
+                    let end = (offset + NAR_CHUNK_SIZE).min(total);
+                    let last = end == total;
+
+                    let chunk = NarChunk {
+                        path_hash: hash.clone(),
+                        data: stream_data[offset..end].to_vec(),
+                        last,
+                        file_size: if first { total as u64 } else { 0 },
+                        is_delta,
+                    };
+                    first = false;
+                    offset = end;
+
+                    if tx.send(Ok(chunk)).await.is_err() {
+                        return;
+                    }
+                }
+
+                if total == 0 {
+                    let chunk = NarChunk {
+                        path_hash: hash.clone(),
+                        data: Vec::new(),
+                        last: true,
+                        file_size: 0,
+                        is_delta,
+                    };
+                    if tx.send(Ok(chunk)).await.is_err() {
+                        return;
+                    }
+                }
+            }
+        });
+
+        Ok(Response::new(ReceiverStream::new(rx)))
+    }
 }
 
 /// Build a topologically-sorted download plan.
@@ -296,4 +437,210 @@ fn build_download_plan(entries: &[PathManifestEntry], have: &HashSet<&str>) -> D
     }
 
     DownloadPlan { batches }
+}
+
+/// Maximum delta-to-full ratio: only offer a delta if it's smaller than this
+/// fraction of the full NAR size.
+const DELTA_MAX_RATIO: f64 = 0.80;
+
+/// Maximum number of delta computations per negotiate request to bound
+/// CPU and memory usage from untrusted clients.
+const MAX_DELTAS_PER_REQUEST: usize = 32;
+
+/// Scan available paths for delta transfer opportunities against the client's
+/// `have` set. For each match, compress the new NAR using the old NAR as a zstd
+/// dictionary and store the result in the delta cache.
+fn compute_deltas(
+    state: &crate::AppState,
+    have_hashes: &[String],
+    available: &mut [PathManifestEntry],
+    total_download_size: &mut u64,
+) {
+    // Build a map of pname → (hash, store_path) from the client's `have` set.
+    let mut have_by_pname: HashMap<String, (String, String)> = HashMap::new();
+    for hash in have_hashes {
+        if let Ok(Some(ni)) = state.storage.get_narinfo(hash) {
+            if let Some(pname) = extract_pname(&ni.store_path) {
+                have_by_pname.insert(pname, (hash.clone(), ni.store_path.clone()));
+            }
+        }
+    }
+
+    if have_by_pname.is_empty() {
+        return;
+    }
+
+    let mut deltas_computed = 0usize;
+
+    for entry in available.iter_mut() {
+        if deltas_computed >= MAX_DELTAS_PER_REQUEST {
+            break;
+        }
+        let Some(target_pname) = extract_pname(&entry.store_path) else {
+            continue;
+        };
+
+        let Some((base_hash, _base_store_path)) = have_by_pname.get(&target_pname) else {
+            continue;
+        };
+
+        let target_hash = entry
+            .store_path
+            .rsplit('/')
+            .next()
+            .and_then(|b| b.split('-').next())
+            .unwrap_or("")
+            .to_owned();
+
+        // Don't delta against ourselves.
+        if *base_hash == target_hash {
+            continue;
+        }
+
+        // Load both NARs.
+        let Ok(Some(base_nar)) = state.storage.get_nar(&format!("nar/{base_hash}.nar")) else {
+            continue;
+        };
+        let Ok(Some(target_nar)) = state.storage.get_nar(&entry.url) else {
+            continue;
+        };
+
+        // Compress the target NAR using the base NAR as a zstd dictionary.
+        let Some(delta) = compress_with_dict(&target_nar, &base_nar) else {
+            continue;
+        };
+
+        // Only offer the delta if it's meaningfully smaller.
+        if !target_nar.is_empty()
+            && (delta.len() as f64 / target_nar.len() as f64) < DELTA_MAX_RATIO
+        {
+            // Update download size tracking.
+            *total_download_size = total_download_size.saturating_sub(entry.file_size);
+            *total_download_size += delta.len() as u64;
+
+            entry.delta_base_hash = base_hash.clone();
+            entry.delta_url = format!("delta/{base_hash}/{target_hash}");
+            entry.delta_size = delta.len() as u64;
+
+            state
+                .delta_cache
+                .insert(base_hash.clone(), target_hash, delta);
+
+            deltas_computed += 1;
+
+            tracing::debug!(
+                "Delta available for {}: {} -> {} bytes (base: {base_hash})",
+                entry.store_path,
+                entry.file_size,
+                entry.delta_size,
+            );
+        }
+    }
+}
+
+/// Extract the package name from a nix store path, stripping the hash prefix
+/// and version suffix.
+///
+/// `/nix/store/abc123-firefox-131.0` → `"firefox"`
+/// `/nix/store/xyz789-hello-2.12.1` → `"hello"`
+pub fn extract_pname(store_path: &str) -> Option<String> {
+    // Get the basename: "abc123-firefox-131.0"
+    let basename = store_path.rsplit('/').next()?;
+    // Strip the hash prefix: "firefox-131.0"
+    let after_hash = basename.split_once('-').map(|(_, rest)| rest)?;
+    // Strip version suffix: find the last segment that starts with a digit.
+    // Walk from the end, stripping "-{version}" components.
+    let parts: Vec<&str> = after_hash.split('-').collect();
+    // Find where the version starts: last contiguous run of segments starting
+    // with a digit.
+    let mut pname_end = parts.len();
+    for i in (0..parts.len()).rev() {
+        if parts[i].starts_with(|c: char| c.is_ascii_digit()) {
+            pname_end = i;
+        } else {
+            break;
+        }
+    }
+
+    if pname_end == 0 {
+        // Everything looks like a version — use the full name.
+        return Some(after_hash.to_owned());
+    }
+
+    Some(parts[..pname_end].join("-"))
+}
+
+/// Compress `data` using `dict` as a zstd dictionary.
+fn compress_with_dict(data: &[u8], dict: &[u8]) -> Option<Vec<u8>> {
+    use std::io::Write;
+    let mut encoder = zstd::Encoder::with_dictionary(Vec::new(), 3, dict).ok()?;
+    encoder.write_all(data).ok()?;
+    encoder.finish().ok()
+}
+
+/// Decompress `data` that was compressed with `dict` as a zstd dictionary.
+#[cfg(test)]
+fn decompress_with_dict(data: &[u8], dict: &[u8]) -> Option<Vec<u8>> {
+    use std::io::Read;
+    let mut decoder = zstd::Decoder::with_dictionary(data, dict).ok()?;
+    let mut result = Vec::new();
+    decoder.read_to_end(&mut result).ok()?;
+    Some(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_extract_pname_simple() {
+        assert_eq!(
+            extract_pname("/nix/store/abc123-hello-2.12.1"),
+            Some("hello".to_owned())
+        );
+    }
+
+    #[test]
+    fn test_extract_pname_multi_part() {
+        assert_eq!(
+            extract_pname("/nix/store/abc123-firefox-esr-131.0"),
+            Some("firefox-esr".to_owned())
+        );
+    }
+
+    #[test]
+    fn test_extract_pname_no_version() {
+        assert_eq!(
+            extract_pname("/nix/store/abc123-glibc-2.39"),
+            Some("glibc".to_owned())
+        );
+    }
+
+    #[test]
+    fn test_extract_pname_complex_version() {
+        assert_eq!(
+            extract_pname("/nix/store/abc123-python3-3.12.4"),
+            Some("python3".to_owned())
+        );
+    }
+
+    #[test]
+    fn test_extract_pname_date_version() {
+        assert_eq!(
+            extract_pname("/nix/store/abc123-nix-2.24.0pre20240801"),
+            Some("nix".to_owned())
+        );
+    }
+
+    #[test]
+    fn test_delta_compress_decompress_roundtrip() {
+        let base = b"hello world, this is the base NAR content with lots of data that is shared";
+        let target =
+            b"hello world, this is the updated NAR content with lots of data that is shared";
+
+        let delta = super::compress_with_dict(target, base).unwrap();
+        let reconstructed = super::decompress_with_dict(&delta, base).unwrap();
+
+        assert_eq!(reconstructed, target.to_vec());
+    }
 }
