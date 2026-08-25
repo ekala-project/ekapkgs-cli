@@ -57,6 +57,12 @@ pub enum Command {
         command: ClosureCommand,
     },
 
+    /// Manage the local nix store.
+    Store {
+        #[command(subcommand)]
+        command: StoreCommand,
+    },
+
     /// Show build log for a derivation.
     Log {
         /// The installable to show logs for.
@@ -194,5 +200,37 @@ pub enum ClosureCommand {
 
         /// Second installable or store path.
         b: String,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum StoreCommand {
+    /// Garbage collect the nix store.
+    Gc {
+        /// Delete paths older than this duration (e.g., `30d`, `7d`).
+        #[arg(long)]
+        older_than: Option<String>,
+
+        /// Only show what would be deleted.
+        #[arg(long)]
+        dry_run: bool,
+    },
+
+    /// Optimize the store by deduplicating via hardlinks.
+    Optimize,
+
+    /// Verify store integrity.
+    Verify {
+        /// Check all paths in the store.
+        #[arg(long)]
+        all: bool,
+
+        /// Attempt to repair invalid paths.
+        #[arg(long)]
+        repair: bool,
+
+        /// Minimum number of valid signatures required.
+        #[arg(long)]
+        sigs_needed: Option<u32>,
     },
 }
