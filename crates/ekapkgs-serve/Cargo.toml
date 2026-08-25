@@ -34,6 +34,17 @@ blake3.workspace = true
 fastcdc.workspace = true
 zstd.workspace = true
 
+[features]
+s3 = ["dep:aws-sdk-s3", "dep:aws-config"]
+
+[dependencies.aws-sdk-s3]
+workspace = true
+optional = true
+
+[dependencies.aws-config]
+workspace = true
+optional = true
+
 [dev-dependencies]
 tempfile.workspace = true
 

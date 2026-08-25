@@ -58,6 +58,9 @@ toml = "0.8"
 directories = "6"
 tempfile = "3"
 
+aws-sdk-s3 = "1"
+aws-config = { version = "1", features = ["behavior-version-latest"] }
+
 [workspace.lints.rust]
 unsafe_code = "forbid"
 rust_2018_idioms = { level = "warn", priority = -1 }

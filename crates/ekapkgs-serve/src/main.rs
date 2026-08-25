@@ -415,6 +415,32 @@ async fn cmd_serve(cli: Cli) -> color_eyre::Result<()> {
                 gc_tracker = None;
                 Box::new(storage::nix_store::NixStoreBackend::new())
             },
+            #[cfg(feature = "s3")]
+            config::StorageConfig::S3 {
+                bucket,
+                region,
+                endpoint,
+                prefix,
+            } => {
+                gc_tracker = None;
+                let s3_config = storage::s3::S3Config {
+                    bucket,
+                    region,
+                    endpoint,
+                    prefix,
+                };
+                Box::new(
+                    tokio::runtime::Handle::current()
+                        .block_on(storage::s3::S3Backend::new(s3_config))?,
+                )
+            },
+            #[cfg(not(feature = "s3"))]
+            config::StorageConfig::S3 { .. } => {
+                return Err(color_eyre::eyre::eyre!(
+                    "S3 storage backend requires the 's3' feature. Rebuild with: cargo build \
+                     --features s3"
+                ));
+            },
             config::StorageConfig::Castore { path, gc } => {
                 let gc_t = if let Some(gc_raw) = gc {
                     let max_size = gc::parse_byte_size(&gc_raw.max_size)?;

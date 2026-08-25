@@ -37,6 +37,24 @@ pub enum StorageConfig {
         /// Optional GC configuration.
         gc: Option<GcRawConfig>,
     },
+    #[serde(rename = "s3")]
+    #[allow(dead_code)]
+    S3 {
+        /// S3 bucket name.
+        bucket: String,
+        /// AWS region (e.g., "us-east-1").
+        #[serde(default = "default_region")]
+        region: String,
+        /// Custom S3 endpoint for R2, MinIO, etc.
+        endpoint: Option<String>,
+        /// Key prefix for all objects (e.g., "cache/" for namespacing).
+        #[serde(default)]
+        prefix: String,
+    },
+}
+
+fn default_region() -> String {
+    "us-east-1".to_owned()
 }
 
 #[derive(Debug, Deserialize)]
