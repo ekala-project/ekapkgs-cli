@@ -51,6 +51,12 @@ pub enum Command {
         command: CacheCommand,
     },
 
+    /// Analyze nix closures.
+    Closure {
+        #[command(subcommand)]
+        command: ClosureCommand,
+    },
+
     /// Check system health and configuration.
     Doctor,
 
@@ -146,4 +152,31 @@ pub enum AuthCommand {
 
     /// Show configured caches and auth status.
     Status,
+}
+
+#[derive(Subcommand)]
+pub enum ClosureCommand {
+    /// Show closure size breakdown.
+    Size {
+        /// The installable to analyze (e.g., `nixpkgs#hello`).
+        installable: String,
+    },
+
+    /// Trace why a package depends on another.
+    WhyDepends {
+        /// The package to analyze.
+        installable: String,
+
+        /// The dependency to trace.
+        dependency: String,
+    },
+
+    /// Diff two closures.
+    Diff {
+        /// First installable or store path.
+        a: String,
+
+        /// Second installable or store path.
+        b: String,
+    },
 }
