@@ -27,6 +27,7 @@ toml.workspace = true
 directories.workspace = true
 blake3.workspace = true
 zstd.workspace = true
+axum.workspace = true
 
 [lints]
 workspace = true

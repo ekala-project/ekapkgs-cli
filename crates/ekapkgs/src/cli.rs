@@ -50,6 +50,21 @@ pub enum Command {
         #[command(subcommand)]
         command: CacheCommand,
     },
+
+    /// Run a local substituter proxy for transparent nix integration.
+    ///
+    /// Starts an HTTP server implementing the nix binary cache protocol that
+    /// batches narinfo queries and negotiates with the upstream ekapkgs server.
+    /// Configure nix to use it: `substituters = http://localhost:PORT`
+    Substituter {
+        /// Port to bind the local proxy on.
+        #[arg(short, long, default_value = "7422")]
+        port: u16,
+
+        /// Upstream ekapkgs server URL.
+        #[arg(long)]
+        upstream: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
