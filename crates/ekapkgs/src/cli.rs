@@ -45,6 +45,17 @@ pub enum Command {
         extra: Vec<String>,
     },
 
+    /// Enter a development environment with cache pre-fetching.
+    Develop {
+        /// The flake reference for the dev shell (default: `.`).
+        #[arg(default_value = ".")]
+        installable: String,
+
+        /// Extra arguments passed through to nix develop.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        extra: Vec<String>,
+    },
+
     /// Manage binary caches.
     Cache {
         #[command(subcommand)]

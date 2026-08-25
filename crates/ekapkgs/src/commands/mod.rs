@@ -1,6 +1,7 @@
 mod build;
 mod cache;
 mod closure;
+mod develop;
 mod doctor;
 mod dry_run;
 mod flake;
@@ -17,6 +18,7 @@ pub fn run(command: Command) -> color_eyre::Result<()> {
         Command::Build { installable, extra } => build::execute(&installable, &extra),
         Command::Run { installable, extra } => run::execute(&installable, &extra),
         Command::Shell { installable, extra } => shell::execute(&installable, &extra),
+        Command::Develop { installable, extra } => develop::execute(&installable, &extra),
         Command::Cache { command } => cache::execute(command),
         Command::Closure { command } => closure::execute(command),
         Command::Flake { command } => flake::execute(command),
