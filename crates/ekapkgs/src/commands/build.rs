@@ -98,7 +98,7 @@ pub fn execute(installable: &str, extra: &[String]) -> color_eyre::Result<()> {
     for arg in extra {
         cmd = cmd.arg(arg);
     }
-    cmd.stream()?;
+    cmd.stream_with_monitor()?;
 
     tracing::info!("Build complete");
     Ok(())

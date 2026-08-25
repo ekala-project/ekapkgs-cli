@@ -111,6 +111,47 @@ impl NixCommand {
         Ok(status)
     }
 
+    /// Run with a build monitor that parses nix's internal-json output.
+    ///
+    /// Adds `--log-format internal-json` to the command and pipes stderr
+    /// through `BuildMonitor` for a nom-style live build display.
+    pub fn stream_with_monitor(&self) -> Result<ExitStatus, NixError> {
+        use std::io::BufRead;
+
+        tracing::debug!(cmd = %self, "streaming nix command with build monitor");
+
+        let mut cmd = self.build_command();
+        cmd.arg("--log-format").arg("internal-json");
+        cmd.stdout(Stdio::inherit());
+        cmd.stderr(Stdio::piped());
+
+        let mut child = cmd.spawn().map_err(NixError::Spawn)?;
+
+        let stderr = child.stderr.take().expect("stderr is piped");
+        let reader = std::io::BufReader::new(stderr);
+
+        let mut monitor = ekapkgs_ui::build_monitor::BuildMonitor::new();
+
+        for line in reader.lines() {
+            let Ok(line) = line else { break };
+            monitor.process_line(&line);
+            monitor.render();
+        }
+
+        let status = child.wait().map_err(NixError::Spawn)?;
+
+        monitor.finish();
+
+        if !status.success() {
+            return Err(NixError::Failed {
+                status,
+                stderr: String::new(),
+            });
+        }
+
+        Ok(status)
+    }
+
     /// Replace the current process with this nix command (exec).
     pub fn exec(self) -> Result<std::convert::Infallible, NixError> {
         tracing::debug!(cmd = %self, "exec nix command");
