@@ -1,5 +1,6 @@
-use serde::Deserialize;
 use std::path::PathBuf;
+
+use serde::Deserialize;
 
 #[derive(Debug, Deserialize)]
 pub struct Config {
@@ -16,7 +17,7 @@ pub struct ServerConfig {
 }
 
 fn default_bind() -> String {
-    "127.0.0.1:8080".to_string()
+    "127.0.0.1:8080".to_owned()
 }
 
 #[derive(Debug, Deserialize)]
@@ -26,6 +27,13 @@ pub enum StorageConfig {
     Filesystem { path: PathBuf },
     #[serde(rename = "nix-store")]
     NixStore,
+    #[serde(rename = "castore")]
+    Castore {
+        /// Root directory for content-addressed chunk and directory storage.
+        path: PathBuf,
+        /// Optional GC configuration.
+        gc: Option<GcRawConfig>,
+    },
 }
 
 #[derive(Debug, Deserialize)]

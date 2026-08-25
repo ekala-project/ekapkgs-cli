@@ -1,12 +1,15 @@
 syntax = "proto3";
 package ekapkgs.v1;
 
+import "ekapkgs/v1/castore.proto";
 import "ekapkgs/v1/manifest.proto";
 import "ekapkgs/v1/signing.proto";
 
 service CacheService {
   // Single round-trip closure negotiation.
   rpc Negotiate(NegotiateRequest) returns (NegotiateResponse);
+  // Chunk-level negotiation for CAS-aware clients.
+  rpc NegotiateChunks(ChunkNegotiateRequest) returns (ChunkNegotiateResponse);
 }
 
 message NegotiateRequest {
@@ -18,6 +21,8 @@ message NegotiateRequest {
   repeated Compression accept_compression = 3;
   // Client's trust roots for certificate-based verification.
   repeated TrustRoot trust_roots = 4;
+  // Whether the client supports content-addressed chunk transfers.
+  bool supports_cas = 5;
 }
 
 message NegotiateResponse {
@@ -32,4 +37,7 @@ message NegotiateResponse {
   // Aggregate sizes for progress display.
   uint64 total_download_size = 5;
   uint64 total_nar_size = 6;
+  // CAS root nodes per path (populated when client sets supports_cas=true
+  // and server has CAS data available).
+  repeated CaPathMapping ca_path_mappings = 7;
 }

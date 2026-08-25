@@ -9,6 +9,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 format!("{proto_root}/ekapkgs/v1/negotiate.proto"),
                 format!("{proto_root}/ekapkgs/v1/manifest.proto"),
                 format!("{proto_root}/ekapkgs/v1/signing.proto"),
+                format!("{proto_root}/ekapkgs/v1/castore.proto"),
             ],
             &[proto_root],
         )?;

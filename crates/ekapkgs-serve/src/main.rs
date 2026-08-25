@@ -12,10 +12,8 @@ use std::sync::Arc;
 use axum::Router;
 use axum::routing::get;
 use clap::{Parser, Subcommand};
-
-use ekapkgs_protocol::ekapkgs::v1::cache_service_server::CacheServiceServer;
-
 use config::Config;
+use ekapkgs_protocol::ekapkgs::v1::cache_service_server::CacheServiceServer;
 use signing::NarInfoSigner;
 use storage::StorageBackend;
 
@@ -124,6 +122,10 @@ fn build_http_router(state: Arc<AppState>) -> Router {
             "/nar/{file}",
             get(api::compat::get_nar).put(api::upload::put_nar),
         )
+        .route(
+            "/cas/chunk/{b3hex}",
+            get(api::chunks::get_chunk).put(api::chunks::put_chunk),
+        )
         .with_state(state)
 }
 
@@ -183,7 +185,7 @@ fn cmd_issue_cert(
     use ekapkgs_protocol::signing::{generate_keypair, issue_certificate};
 
     // Load CA secret key.
-    let ca_key_contents = std::fs::read_to_string(ca_key_path)?.trim().to_string();
+    let ca_key_contents = std::fs::read_to_string(ca_key_path)?.trim().to_owned();
     let (_ca_key_name, ca_key_b64) = ca_key_contents
         .split_once(':')
         .ok_or_else(|| color_eyre::eyre::eyre!("invalid CA key format"))?;
@@ -236,7 +238,10 @@ struct CertFile {
     issuer_signature: String,
 }
 
-fn cmd_token(command: TokenCommand, config_path: Option<&std::path::Path>) -> color_eyre::Result<()> {
+fn cmd_token(
+    command: TokenCommand,
+    config_path: Option<&std::path::Path>,
+) -> color_eyre::Result<()> {
     let store_path = tokens::default_store_path(config_path);
 
     match command {
@@ -253,10 +258,13 @@ fn cmd_token(command: TokenCommand, config_path: Option<&std::path::Path>) -> co
 
             // Print the token — this is the only time it's shown in full.
             println!("{token_value}");
-            tracing::info!("Token '{name}' created ({})", if read_only { "read-only" } else { "read+write" });
+            tracing::info!(
+                "Token '{name}' created ({})",
+                if read_only { "read-only" } else { "read+write" }
+            );
 
             Ok(())
-        }
+        },
 
         TokenCommand::List => {
             let store = tokens::TokenStore::load(&store_path)?;
@@ -281,7 +289,7 @@ fn cmd_token(command: TokenCommand, config_path: Option<&std::path::Path>) -> co
             }
 
             Ok(())
-        }
+        },
 
         TokenCommand::Revoke { name } => {
             let mut store = tokens::TokenStore::load(&store_path)?;
@@ -294,7 +302,7 @@ fn cmd_token(command: TokenCommand, config_path: Option<&std::path::Path>) -> co
             }
 
             Ok(())
-        }
+        },
     }
 }
 
@@ -351,11 +359,32 @@ async fn cmd_serve(cli: Cli) -> color_eyre::Result<()> {
                 };
                 gc_tracker = gc_t;
                 Box::new(storage::filesystem::FilesystemBackend::new(path))
-            }
+            },
             config::StorageConfig::NixStore => {
                 gc_tracker = None;
                 Box::new(storage::nix_store::NixStoreBackend::new())
-            }
+            },
+            config::StorageConfig::Castore { path, gc } => {
+                let gc_t = if let Some(gc_raw) = gc {
+                    let max_size = gc::parse_byte_size(&gc_raw.max_size)?;
+                    let target_size = gc_raw
+                        .target_size
+                        .as_deref()
+                        .map(gc::parse_byte_size)
+                        .transpose()?
+                        .unwrap_or(max_size * 4 / 5);
+                    let gc_config = gc::GcConfig {
+                        max_size,
+                        target_size,
+                        gc_interval: std::time::Duration::from_secs(gc_raw.gc_interval_secs),
+                    };
+                    Some(gc::init(&path, gc_config)?)
+                } else {
+                    None
+                };
+                gc_tracker = gc_t;
+                Box::new(storage::castore::CastoreBackend::new(path)?)
+            },
         };
         // Load tokens: from token store + any legacy config tokens.
         let store_path = tokens::default_store_path(Some(config_path));
@@ -370,7 +399,7 @@ async fn cmd_serve(cli: Cli) -> color_eyre::Result<()> {
             Some(all_tokens)
         };
     } else {
-        bind_addr = cli.bind.unwrap_or_else(|| "127.0.0.1:8080".to_string());
+        bind_addr = cli.bind.unwrap_or_else(|| "127.0.0.1:8080".to_owned());
 
         let signing_key = cli.signing_key.ok_or_else(|| {
             color_eyre::eyre::eyre!("either --config or --signing-key is required")
@@ -389,13 +418,13 @@ async fn cmd_serve(cli: Cli) -> color_eyre::Result<()> {
             Some(all_tokens)
         };
 
-        let storage_str = cli.storage.unwrap_or_else(|| "nix-store".to_string());
+        let storage_str = cli.storage.unwrap_or_else(|| "nix-store".to_owned());
         storage_backend = if storage_str == "nix-store" {
             Box::new(storage::nix_store::NixStoreBackend::new())
         } else {
-            Box::new(storage::filesystem::FilesystemBackend::new(
-                PathBuf::from(storage_str),
-            ))
+            Box::new(storage::filesystem::FilesystemBackend::new(PathBuf::from(
+                storage_str,
+            )))
         };
     }
 
@@ -413,10 +442,9 @@ async fn cmd_serve(cli: Cli) -> color_eyre::Result<()> {
         state: Arc::clone(&state),
     });
 
-    let app = build_http_router(state).route_service(
-        "/ekapkgs.v1.CacheService/Negotiate",
-        grpc_service,
-    );
+    let app = build_http_router(state)
+        .route_service("/ekapkgs.v1.CacheService/Negotiate", grpc_service.clone())
+        .route_service("/ekapkgs.v1.CacheService/NegotiateChunks", grpc_service);
 
     tracing::info!("Listening on {addr} (gRPC + HTTP)");
 

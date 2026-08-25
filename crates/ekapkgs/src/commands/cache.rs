@@ -1,9 +1,7 @@
 use std::path::PathBuf;
 
-use ekapkgs_nix::NixCommand;
-use ekapkgs_nix::eval;
 use ekapkgs_nix::installable::Installable;
-use ekapkgs_nix::store;
+use ekapkgs_nix::{NixCommand, eval, store};
 use futures::StreamExt;
 
 use crate::cli::{AuthCommand, CacheCommand};
@@ -23,7 +21,7 @@ fn cmd_push(paths: &[String], cache_url: Option<&str>) -> color_eyre::Result<()>
     let config = ClientConfig::load()?;
 
     let server_url = match cache_url {
-        Some(url) => url.to_string(),
+        Some(url) => url.to_owned(),
         None => {
             let cache = config.primary_cache().ok_or_else(|| {
                 color_eyre::eyre::eyre!(
@@ -31,7 +29,7 @@ fn cmd_push(paths: &[String], cache_url: Option<&str>) -> color_eyre::Result<()>
                 )
             })?;
             cache.url.clone()
-        }
+        },
     };
 
     let token = config.push_token(&server_url);
@@ -54,12 +52,10 @@ fn cmd_push(paths: &[String], cache_url: Option<&str>) -> color_eyre::Result<()>
         let results = futures::stream::iter(store_paths.iter())
             .map(|path| {
                 let client = client.clone();
-                let base = base_url.to_string();
+                let base = base_url.to_owned();
                 let token = token.clone();
                 let path = path.clone();
-                async move {
-                    push_single_path(&client, &base, token.as_deref(), &path).await
-                }
+                async move { push_single_path(&client, &base, token.as_deref(), &path).await }
             })
             .buffer_unordered(8)
             .collect::<Vec<_>>()
@@ -74,16 +70,16 @@ fn cmd_push(paths: &[String], cache_url: Option<&str>) -> color_eyre::Result<()>
                 Ok(PushResult::Uploaded) => {
                     success += 1;
                     bar.inc(1);
-                }
+                },
                 Ok(PushResult::AlreadyExists) => {
                     skipped += 1;
                     bar.inc(1);
-                }
+                },
                 Err(e) => {
                     tracing::warn!("Push failed: {e}");
                     failed += 1;
                     bar.inc(1);
-                }
+                },
             }
         }
 
@@ -170,7 +166,7 @@ async fn push_single_path(
     let refs: Vec<String> = info
         .references
         .iter()
-        .map(|r| r.rsplit('/').next().unwrap_or(r).to_string())
+        .map(|r| r.rsplit('/').next().unwrap_or(r).to_owned())
         .collect();
 
     let mut narinfo = String::new();
@@ -200,7 +196,9 @@ async fn push_single_path(
     if !resp.status().is_success() {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
-        return Err(color_eyre::eyre::eyre!("NAR upload failed: {status} {body}"));
+        return Err(color_eyre::eyre::eyre!(
+            "NAR upload failed: {status} {body}"
+        ));
     }
 
     let narinfo_url = format!("{base_url}/{hash}.narinfo");
@@ -253,10 +251,9 @@ fn resolve_store_paths(inputs: &[String]) -> color_eyre::Result<Vec<String>> {
 
             for build in outputs {
                 for out_path in build.outputs.values() {
-                    let closure_output =
-                        NixCommand::new(&["path-info", "--recursive", "--json"])
-                            .arg(out_path)
-                            .output()?;
+                    let closure_output = NixCommand::new(&["path-info", "--recursive", "--json"])
+                        .arg(out_path)
+                        .output()?;
                     let closure_str = String::from_utf8_lossy(&closure_output.stdout);
 
                     #[derive(serde::Deserialize)]
@@ -281,7 +278,7 @@ fn cmd_pull(paths: &[String], cache_url: Option<&str>) -> color_eyre::Result<()>
     let config = ClientConfig::load()?;
 
     let server_url = match cache_url {
-        Some(url) => url.to_string(),
+        Some(url) => url.to_owned(),
         None => {
             let cache = config.primary_cache().ok_or_else(|| {
                 color_eyre::eyre::eyre!(
@@ -289,7 +286,7 @@ fn cmd_pull(paths: &[String], cache_url: Option<&str>) -> color_eyre::Result<()>
                 )
             })?;
             cache.url.clone()
-        }
+        },
     };
 
     // Resolve all inputs to closure paths and partition.
@@ -329,7 +326,8 @@ fn cmd_pull(paths: &[String], cache_url: Option<&str>) -> color_eyre::Result<()>
         let spinner = ekapkgs_ui::progress::spinner("Negotiating with cache...");
 
         let response =
-            crate::negotiate::negotiate(&server_url, want_hashes, have_hashes).await?;
+            crate::negotiate::negotiate(&server_url, want_hashes.clone(), have_hashes.clone())
+                .await?;
 
         spinner.finish_and_clear();
 
@@ -337,7 +335,46 @@ fn cmd_pull(paths: &[String], cache_url: Option<&str>) -> color_eyre::Result<()>
         let unavail = response.unavailable.len();
 
         if avail > 0 {
-            tracing::info!("{avail} paths available from cache");
+            // If the server provided CAS path mappings, use chunk negotiation
+            // for more efficient transfer, then fall back to NAR download
+            // for the actual store import.
+            if !response.ca_path_mappings.is_empty() {
+                tracing::info!(
+                    "{avail} paths available from cache (CAS: {} with chunk mappings)",
+                    response.ca_path_mappings.len()
+                );
+
+                // Perform chunk-level negotiation.
+                let chunk_spinner = ekapkgs_ui::progress::spinner("Negotiating chunks...");
+                let chunk_response = crate::negotiate::negotiate_chunks(
+                    &server_url,
+                    want_hashes,
+                    have_hashes,
+                    Vec::new(), // No local chunk cache yet.
+                )
+                .await?;
+                chunk_spinner.finish_and_clear();
+
+                if !chunk_response.missing_chunks.is_empty() {
+                    tracing::info!(
+                        "{} chunks to download ({} bytes)",
+                        chunk_response.missing_chunks.len(),
+                        chunk_response.total_chunk_size,
+                    );
+                    crate::download::download_chunks(
+                        &server_url,
+                        &chunk_response,
+                        config.defaults.max_parallel_downloads,
+                    )
+                    .await?;
+                }
+            } else {
+                tracing::info!("{avail} paths available from cache");
+            }
+
+            // Always use the standard NAR download for import, since nix
+            // requires NARs for `nix copy`. The server reconstructs NARs from
+            // chunks on-the-fly when the CAS backend is in use.
             crate::download::download_and_import(
                 &server_url,
                 &response,
@@ -381,7 +418,7 @@ fn cmd_auth(command: AuthCommand) -> color_eyre::Result<()> {
             save_config(&config)?;
             tracing::info!("Token saved for {cache}");
             Ok(())
-        }
+        },
 
         AuthCommand::Logout { cache } => {
             let mut config = ClientConfig::load()?;
@@ -395,7 +432,7 @@ fn cmd_auth(command: AuthCommand) -> color_eyre::Result<()> {
             }
 
             Ok(())
-        }
+        },
 
         AuthCommand::Status => {
             let config = ClientConfig::load()?;
@@ -422,7 +459,7 @@ fn cmd_auth(command: AuthCommand) -> color_eyre::Result<()> {
             }
 
             Ok(())
-        }
+        },
     }
 }
 

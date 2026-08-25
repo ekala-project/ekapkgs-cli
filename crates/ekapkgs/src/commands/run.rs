@@ -1,7 +1,5 @@
-use ekapkgs_nix::NixCommand;
-use ekapkgs_nix::eval;
 use ekapkgs_nix::installable::Installable;
-use ekapkgs_nix::store;
+use ekapkgs_nix::{NixCommand, eval, store};
 
 use crate::config::ClientConfig;
 

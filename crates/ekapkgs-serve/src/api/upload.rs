@@ -8,7 +8,8 @@ use axum::response::{IntoResponse, Response};
 use crate::AppState;
 
 /// Validate the bearer token against the configured write tokens.
-fn check_auth(state: &AppState, headers: &HeaderMap) -> Result<(), Response> {
+#[allow(clippy::result_large_err)]
+pub fn check_auth(state: &AppState, headers: &HeaderMap) -> Result<(), Response> {
     let tokens = match &state.write_tokens {
         Some(t) if !t.is_empty() => t,
         _ => {
@@ -23,7 +24,7 @@ fn check_auth(state: &AppState, headers: &HeaderMap) -> Result<(), Response> {
         .and_then(|v| v.strip_prefix("Bearer "));
 
     match auth {
-        Some(token) if tokens.contains(&token.to_string()) => Ok(()),
+        Some(token) if tokens.contains(&token.to_owned()) => Ok(()),
         _ => Err((StatusCode::UNAUTHORIZED, "invalid or missing token").into_response()),
     }
 }
@@ -43,9 +44,8 @@ pub async fn put_narinfo(
         .strip_suffix(".narinfo")
         .unwrap_or(&hash_narinfo);
 
-    let content = match std::str::from_utf8(&body) {
-        Ok(s) => s,
-        Err(_) => return (StatusCode::BAD_REQUEST, "invalid utf-8").into_response(),
+    let Ok(content) = std::str::from_utf8(&body) else {
+        return (StatusCode::BAD_REQUEST, "invalid utf-8").into_response();
     };
 
     // Re-sign the narinfo with our key before storing.
