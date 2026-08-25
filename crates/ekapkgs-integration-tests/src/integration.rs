@@ -956,6 +956,87 @@ async fn test_metrics_endpoint() {
     assert!(body.contains("ekapkgs_nar_downloads_total 1"));
 }
 
+// ===== Resumable download tests =====
+
+#[tokio::test]
+async fn test_nar_range_request() {
+    let server = TestServer::start();
+    let nar_data = b"0123456789abcdef0123456789abcdef";
+    server.write_nar("range1.nar", nar_data);
+
+    let client = reqwest::Client::new();
+    let base = server.base_url();
+
+    // Full download should include Accept-Ranges and Content-Length.
+    let resp = client
+        .get(format!("{base}/nar/range1.nar"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        resp.headers()
+            .get("accept-ranges")
+            .and_then(|v| v.to_str().ok()),
+        Some("bytes")
+    );
+    assert_eq!(
+        resp.headers()
+            .get("content-length")
+            .and_then(|v| v.to_str().ok()),
+        Some("32")
+    );
+    let full_body = resp.bytes().await.unwrap();
+    assert_eq!(full_body.as_ref(), nar_data);
+
+    // Range request: bytes 10 to end.
+    let resp = client
+        .get(format!("{base}/nar/range1.nar"))
+        .header("Range", "bytes=10-")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 206);
+    assert_eq!(
+        resp.headers()
+            .get("content-range")
+            .and_then(|v| v.to_str().ok()),
+        Some("bytes 10-31/32")
+    );
+    let partial = resp.bytes().await.unwrap();
+    assert_eq!(partial.as_ref(), &nar_data[10..]);
+
+    // Range request: bytes 5 to 14.
+    let resp = client
+        .get(format!("{base}/nar/range1.nar"))
+        .header("Range", "bytes=5-14")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 206);
+    let partial = resp.bytes().await.unwrap();
+    assert_eq!(partial.as_ref(), &nar_data[5..=14]);
+}
+
+#[tokio::test]
+async fn test_nar_range_invalid() {
+    let server = TestServer::start();
+    server.write_nar("range2.nar", b"small");
+
+    let client = reqwest::Client::new();
+
+    // Range past end — should fall back to full response.
+    let resp = client
+        .get(format!("{}/nar/range2.nar", server.base_url()))
+        .header("Range", "bytes=100-")
+        .send()
+        .await
+        .unwrap();
+    // Invalid range → server returns 200 with full content.
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.bytes().await.unwrap().as_ref(), b"small");
+}
+
 // ===== Delta transfer tests =====
 
 #[tokio::test]

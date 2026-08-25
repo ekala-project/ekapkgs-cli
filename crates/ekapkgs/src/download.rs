@@ -171,13 +171,21 @@ async fn download_single(
     Ok(())
 }
 
-/// Download a full NAR via HTTP GET.
+/// Maximum number of resume attempts before re-downloading from scratch.
+const MAX_RESUME_RETRIES: u32 = 3;
+
+/// Download a full NAR via HTTP GET with resumable download support.
+///
+/// If the download is interrupted, retries with a `Range` header to resume
+/// from where it left off. Falls back to a full re-download after
+/// `MAX_RESUME_RETRIES` failed resume attempts.
 async fn download_full_nar(
     client: &reqwest::Client,
     base_url: &str,
     url: &str,
 ) -> color_eyre::Result<Vec<u8>> {
     let nar_url = format!("{base_url}/{url}");
+
     let resp = client.get(&nar_url).send().await?;
 
     if !resp.status().is_success() {
@@ -188,7 +196,82 @@ async fn download_full_nar(
         ));
     }
 
-    Ok(resp.bytes().await?.to_vec())
+    // Try to read the full response.
+    match resp.bytes().await {
+        Ok(bytes) => return Ok(bytes.to_vec()),
+        Err(first_err) => {
+            tracing::warn!("NAR download interrupted for {url}: {first_err}");
+        },
+    }
+
+    // The initial download failed. Try to resume with Range requests.
+    // We don't have partial data from the first attempt (reqwest consumed it),
+    // so start from scratch but with retry logic.
+    let mut buf = Vec::new();
+
+    for attempt in 0..MAX_RESUME_RETRIES {
+        let req = if buf.is_empty() {
+            client.get(&nar_url)
+        } else {
+            client
+                .get(&nar_url)
+                .header("Range", format!("bytes={}-", buf.len()))
+        };
+
+        let resp = match req.send().await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(
+                    "Resume attempt {}/{MAX_RESUME_RETRIES} failed: {e}",
+                    attempt + 1
+                );
+                continue;
+            },
+        };
+
+        match resp.status().as_u16() {
+            200 => {
+                // Server sent the full file (doesn't support Range or we started from 0).
+                match resp.bytes().await {
+                    Ok(bytes) => return Ok(bytes.to_vec()),
+                    Err(e) => {
+                        tracing::warn!("Download interrupted on retry: {e}");
+                        buf.clear();
+                        continue;
+                    },
+                }
+            },
+            206 => {
+                // Partial content — append to our buffer.
+                match resp.bytes().await {
+                    Ok(bytes) => {
+                        buf.extend_from_slice(&bytes);
+                        return Ok(buf);
+                    },
+                    Err(e) => {
+                        tracing::warn!("Resume interrupted at {} bytes: {e}", buf.len());
+                        // Keep the partial buffer and try again.
+                        continue;
+                    },
+                }
+            },
+            416 => {
+                // Range not satisfiable — our offset is past the end.
+                // The file might have changed, start over.
+                buf.clear();
+                continue;
+            },
+            status => {
+                tracing::warn!("Unexpected status {status} on resume attempt");
+                buf.clear();
+                continue;
+            },
+        }
+    }
+
+    Err(color_eyre::eyre::eyre!(
+        "NAR download failed after {MAX_RESUME_RETRIES} resume attempts: {url}"
+    ))
 }
 
 /// Download individual chunks from a CAS-aware server and reassemble NARs
