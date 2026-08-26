@@ -18,16 +18,75 @@ backward compatibility.
 
 ## Client
 
+### Build, run, shell
+
 ```
 ekapkgs build nixpkgs#hello
 ekapkgs run nixpkgs#hello
 ekapkgs shell nixpkgs#hello nixpkgs#jq
+ekapkgs develop                         # cache-aware nix develop
+ekapkgs develop .#devShells.x86_64-linux.default
+```
 
+### Cache management
+
+```
 ekapkgs cache push nixpkgs#hello           # upload closure to cache
 ekapkgs cache pull nixpkgs#firefox          # pre-fetch closure
 ekapkgs cache auth login URL --token TOKEN  # save push credentials
 ekapkgs cache auth status                   # show configured caches
 ```
+
+### Closure analysis
+
+```
+ekapkgs closure size nixpkgs#hello          # size breakdown by path
+ekapkgs closure why-depends nixpkgs#hello nixpkgs#glibc
+ekapkgs closure diff nixpkgs#hello nixpkgs#curl
+```
+
+### Build log and dry run
+
+```
+ekapkgs log nixpkgs#hello                  # show build log
+ekapkgs dry-run nixpkgs#hello              # build plan with cache breakdown
+```
+
+### Store management
+
+```
+ekapkgs store gc                           # garbage collect
+ekapkgs store gc --older-than 30d          # delete paths older than 30 days
+ekapkgs store gc --dry-run                 # preview what would be deleted
+ekapkgs store optimize                     # deduplicate via hardlinks
+ekapkgs store verify --all                 # check store integrity
+ekapkgs store verify --all --repair        # repair invalid paths
+```
+
+### Flake introspection
+
+```
+ekapkgs flake show                         # colored output tree
+ekapkgs flake metadata                     # input dependency tree with revisions
+ekapkgs flake update-diff nixpkgs          # show closure diff before committing update
+```
+
+### Remote deployment
+
+```
+ekapkgs deploy .#nixosConfigurations.prod --target-host prod-server
+ekapkgs deploy .#nixosConfigurations.prod --target-host prod-server --mode boot
+ekapkgs deploy .#nixosConfigurations.prod --target-host prod-server --build-host builder
+ekapkgs deploy .#nixosConfigurations.prod --target-host prod-server --dry-run
+```
+
+### System diagnostics
+
+```
+ekapkgs doctor                             # check nix, store, caches, disk space
+```
+
+### Configuration
 
 Config at `~/.config/ekapkgs/config.toml`:
 
