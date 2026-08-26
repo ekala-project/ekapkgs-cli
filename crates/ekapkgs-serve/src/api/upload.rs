@@ -7,6 +7,34 @@ use axum::response::{IntoResponse, Response};
 
 use crate::AppState;
 
+/// Validate that a string looks like a nix store hash: only lowercase alphanumeric.
+fn is_valid_nix_hash(s: &str) -> bool {
+    !s.is_empty()
+        && s.bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+}
+
+/// Validate that a NAR filename is safe: `{hash}.nar` or `{hash}.nar.{compression}`.
+fn is_valid_nar_filename(s: &str) -> bool {
+    // Must not contain path separators or traversal.
+    if s.contains('/') || s.contains('\\') || s.contains("..") {
+        return false;
+    }
+
+    // Expected formats: {hash}.nar, {hash}.nar.xz, {hash}.nar.zst
+    let hash = if let Some(h) = s.strip_suffix(".nar.xz") {
+        h
+    } else if let Some(h) = s.strip_suffix(".nar.zst") {
+        h
+    } else if let Some(h) = s.strip_suffix(".nar") {
+        h
+    } else {
+        return false;
+    };
+
+    is_valid_nix_hash(hash)
+}
+
 /// Validate the bearer token against the configured write tokens.
 #[allow(clippy::result_large_err)]
 pub fn check_auth(state: &AppState, headers: &HeaderMap) -> Result<(), Response> {
@@ -43,6 +71,10 @@ pub async fn put_narinfo(
     let hash = hash_narinfo
         .strip_suffix(".narinfo")
         .unwrap_or(&hash_narinfo);
+
+    if !is_valid_nix_hash(hash) {
+        return (StatusCode::BAD_REQUEST, "invalid hash").into_response();
+    }
 
     let Ok(content) = std::str::from_utf8(&body) else {
         return (StatusCode::BAD_REQUEST, "invalid utf-8").into_response();
@@ -95,6 +127,10 @@ pub async fn put_nar(
 ) -> Response {
     if let Err(e) = check_auth(&state, &headers) {
         return e;
+    }
+
+    if !is_valid_nar_filename(&file) {
+        return (StatusCode::BAD_REQUEST, "invalid nar filename").into_response();
     }
 
     let nar_path = format!("nar/{file}");

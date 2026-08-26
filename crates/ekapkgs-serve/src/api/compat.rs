@@ -16,6 +16,32 @@ pub async fn nix_cache_info(State(_state): State<Arc<AppState>>) -> impl IntoRes
     )
 }
 
+/// Validate that a string looks like a nix store hash: only lowercase alphanumeric.
+fn is_valid_nix_hash(s: &str) -> bool {
+    !s.is_empty()
+        && s.bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+}
+
+/// Validate that a NAR filename is safe: `{hash}.nar` or `{hash}.nar.{compression}`.
+fn is_valid_nar_filename(s: &str) -> bool {
+    if s.contains('/') || s.contains('\\') || s.contains("..") {
+        return false;
+    }
+
+    let hash = if let Some(h) = s.strip_suffix(".nar.xz") {
+        h
+    } else if let Some(h) = s.strip_suffix(".nar.zst") {
+        h
+    } else if let Some(h) = s.strip_suffix(".nar") {
+        h
+    } else {
+        return false;
+    };
+
+    is_valid_nix_hash(hash)
+}
+
 /// GET /{hash}.narinfo
 pub async fn get_narinfo(
     State(state): State<Arc<AppState>>,
@@ -25,6 +51,10 @@ pub async fn get_narinfo(
     let hash = hash_narinfo
         .strip_suffix(".narinfo")
         .unwrap_or(&hash_narinfo);
+
+    if !is_valid_nix_hash(hash) {
+        return (StatusCode::NOT_FOUND, "not found").into_response();
+    }
 
     state
         .metrics
@@ -90,6 +120,10 @@ pub async fn get_nar(
     headers: HeaderMap,
     Path(file): Path<String>,
 ) -> Response {
+    if !is_valid_nar_filename(&file) {
+        return (StatusCode::NOT_FOUND, "not found").into_response();
+    }
+
     let nar_path = format!("nar/{file}");
 
     match state.storage.get_nar(&nar_path) {
