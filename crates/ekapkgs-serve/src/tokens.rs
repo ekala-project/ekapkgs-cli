@@ -101,24 +101,13 @@ impl TokenStore {
 /// Generate a cryptographically random token.
 ///
 /// Format: `ekap_` prefix + 43 chars of base64url (256 bits of entropy).
+///
+/// # Panics
+///
+/// Panics if the OS CSPRNG is unavailable.
 fn generate_token() -> String {
-    use std::io::Read;
-
     let mut bytes = [0u8; 32];
-    // Use /dev/urandom for portability without pulling in a full CSPRNG crate.
-    if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
-        let _ = f.read_exact(&mut bytes);
-    } else {
-        // Fallback: use a less ideal but functional source.
-        for (i, b) in bytes.iter_mut().enumerate() {
-            *b = (i as u8).wrapping_mul(0x9E).wrapping_add(
-                SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .subsec_nanos() as u8,
-            );
-        }
-    }
+    getrandom::fill(&mut bytes).expect("OS CSPRNG must be available for token generation");
 
     let encoded = data_encoding::BASE64URL_NOPAD.encode(&bytes);
     format!("ekap_{encoded}")

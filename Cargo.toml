@@ -37,6 +37,7 @@ yansi = "1"
 crossterm = "0.28"
 
 ed25519-dalek = { version = "2", features = ["rand_core"] }
+getrandom = "0.3"
 subtle = "2"
 data-encoding = "2"
 sha2 = "0.10"
