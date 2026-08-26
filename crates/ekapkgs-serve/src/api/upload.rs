@@ -4,6 +4,7 @@ use axum::body::Bytes;
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
+use subtle::ConstantTimeEq;
 
 use crate::AppState;
 
@@ -52,7 +53,15 @@ pub fn check_auth(state: &AppState, headers: &HeaderMap) -> Result<(), Response>
         .and_then(|v| v.strip_prefix("Bearer "));
 
     match auth {
-        Some(token) if tokens.contains(&token.to_owned()) => Ok(()),
+        Some(token)
+            if tokens.iter().any(|t| {
+                let a = t.as_bytes();
+                let b = token.as_bytes();
+                a.len() == b.len() && a.ct_eq(b).into()
+            }) =>
+        {
+            Ok(())
+        },
         _ => Err((StatusCode::UNAUTHORIZED, "invalid or missing token").into_response()),
     }
 }
