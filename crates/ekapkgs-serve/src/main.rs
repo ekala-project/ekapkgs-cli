@@ -178,19 +178,34 @@ async fn metrics_handler(
 }
 
 fn build_http_router(state: Arc<AppState>) -> Router {
+    use axum::extract::DefaultBodyLimit;
+
+    // 1 MiB limit for narinfo metadata uploads.
+    const NARINFO_BODY_LIMIT: usize = 1024 * 1024;
+    // 8 GiB limit for NAR file uploads.
+    const NAR_BODY_LIMIT: usize = 8 * 1024 * 1024 * 1024;
+    // 16 MiB limit for CAS chunk uploads.
+    const CHUNK_BODY_LIMIT: usize = 16 * 1024 * 1024;
+
     Router::new()
         .route("/nix-cache-info", get(api::compat::nix_cache_info))
         .route(
             "/{hash_narinfo}",
-            get(api::compat::get_narinfo).put(api::upload::put_narinfo),
+            get(api::compat::get_narinfo)
+                .put(api::upload::put_narinfo)
+                .layer(DefaultBodyLimit::max(NARINFO_BODY_LIMIT)),
         )
         .route(
             "/nar/{file}",
-            get(api::compat::get_nar).put(api::upload::put_nar),
+            get(api::compat::get_nar)
+                .put(api::upload::put_nar)
+                .layer(DefaultBodyLimit::max(NAR_BODY_LIMIT)),
         )
         .route(
             "/cas/chunk/{b3hex}",
-            get(api::chunks::get_chunk).put(api::chunks::put_chunk),
+            get(api::chunks::get_chunk)
+                .put(api::chunks::put_chunk)
+                .layer(DefaultBodyLimit::max(CHUNK_BODY_LIMIT)),
         )
         .route(
             "/delta/{base_hash}/{target_hash}",
