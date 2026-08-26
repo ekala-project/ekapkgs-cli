@@ -93,6 +93,18 @@ pub async fn put_narinfo(
     // Re-sign the narinfo with our key before storing.
     let narinfo = match crate::storage::NarInfo::parse(content) {
         Some(mut ni) => {
+            // Verify the narinfo's StorePath hash matches the URL hash.
+            match ni.store_path_hash() {
+                Some(sp_hash) if sp_hash == hash => {},
+                _ => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        "narinfo StorePath hash does not match URL",
+                    )
+                        .into_response();
+                },
+            }
+
             // Validate the URL field to prevent path traversal via stored narinfo.
             if !is_valid_nar_url(&ni.url) {
                 return (StatusCode::BAD_REQUEST, "invalid narinfo URL field").into_response();

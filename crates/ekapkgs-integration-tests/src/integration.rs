@@ -490,10 +490,12 @@ async fn test_multiple_tokens() {
     assert_eq!(resp.status(), 200);
 
     // Bob's token also works.
+    let narinfo_bob =
+        "StorePath: /nix/store/multi2-1.0\nURL: nar/multi2.nar\nNarHash: sha256:ff\nNarSize: 1\n";
     let resp = client
         .put(format!("{}/multi2.narinfo", server.base_url()))
         .header("Authorization", "Bearer test_token_bob")
-        .body(narinfo)
+        .body(narinfo_bob)
         .send()
         .await
         .unwrap();
