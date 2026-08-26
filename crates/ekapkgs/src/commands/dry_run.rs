@@ -62,7 +62,9 @@ pub fn execute(installable: &str, extra: &[String]) -> color_eyre::Result<()> {
 
     // Also run nix build --dry-run for nix's native output.
     println!();
-    let mut cmd = NixCommand::new(&["build"]).arg(installable).arg("--dry-run");
+    let mut cmd = NixCommand::new(&["build"])
+        .arg(installable)
+        .arg("--dry-run");
     for arg in extra {
         cmd = cmd.arg(arg);
     }

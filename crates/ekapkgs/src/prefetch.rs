@@ -8,7 +8,10 @@ use crate::config::ClientConfig;
 /// and downloads any available paths. Returns the count of fetched paths.
 ///
 /// If no cache is configured, returns 0 without error.
-pub fn prefetch_closure(config: &ClientConfig, closure_paths: &[String]) -> color_eyre::Result<usize> {
+pub fn prefetch_closure(
+    config: &ClientConfig,
+    closure_paths: &[String],
+) -> color_eyre::Result<usize> {
     let Some(cache) = config.primary_cache() else {
         return Ok(0);
     };
@@ -43,8 +46,7 @@ pub fn prefetch_closure(config: &ClientConfig, closure_paths: &[String]) -> colo
     let fetched = rt.block_on(async {
         let spinner = ekapkgs_ui::progress::spinner("Negotiating with cache...");
 
-        let response =
-            crate::negotiate::negotiate(&server_url, want_hashes, have_hashes).await?;
+        let response = crate::negotiate::negotiate(&server_url, want_hashes, have_hashes).await?;
 
         spinner.finish_and_clear();
 

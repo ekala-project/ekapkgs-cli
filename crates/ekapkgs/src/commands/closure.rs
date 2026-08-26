@@ -33,11 +33,7 @@ fn cmd_size(installable: &str) -> color_eyre::Result<()> {
     for entry in &entries {
         let size = ekapkgs_ui::format::format_bytes(entry.nar_size);
         // Show just the basename of the store path.
-        let name = entry
-            .path
-            .rsplit('/')
-            .next()
-            .unwrap_or(&entry.path);
+        let name = entry.path.rsplit('/').next().unwrap_or(&entry.path);
         println!("{size:>10}  {name}");
     }
 

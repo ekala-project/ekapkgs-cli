@@ -6,7 +6,10 @@ use crate::cli::StoreCommand;
 
 pub fn execute(command: StoreCommand) -> color_eyre::Result<()> {
     match command {
-        StoreCommand::Gc { older_than, dry_run } => cmd_gc(older_than.as_deref(), dry_run),
+        StoreCommand::Gc {
+            older_than,
+            dry_run,
+        } => cmd_gc(older_than.as_deref(), dry_run),
         StoreCommand::Optimize => cmd_optimize(),
         StoreCommand::Verify {
             all,

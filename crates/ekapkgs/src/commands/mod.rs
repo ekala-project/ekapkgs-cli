@@ -8,8 +8,8 @@ mod dry_run;
 mod flake;
 mod log;
 mod run;
-mod store;
 mod shell;
+mod store;
 mod substituter;
 
 use crate::cli::Command;
@@ -26,7 +26,13 @@ pub fn run(command: Command) -> color_eyre::Result<()> {
             build_host,
             mode,
             dry_run,
-        } => deploy::execute(&installable, &target_host, build_host.as_deref(), &mode, dry_run),
+        } => deploy::execute(
+            &installable,
+            &target_host,
+            build_host.as_deref(),
+            &mode,
+            dry_run,
+        ),
         Command::Cache { command } => cache::execute(command),
         Command::Closure { command } => closure::execute(command),
         Command::Flake { command } => flake::execute(command),

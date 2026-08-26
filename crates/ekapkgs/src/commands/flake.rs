@@ -8,9 +8,7 @@ pub fn execute(command: FlakeCommand) -> color_eyre::Result<()> {
     match command {
         FlakeCommand::Show { flake_ref } => cmd_show(&flake_ref),
         FlakeCommand::Metadata { flake_ref } => cmd_metadata(&flake_ref),
-        FlakeCommand::UpdateDiff { input, installable } => {
-            cmd_update_diff(&input, &installable)
-        },
+        FlakeCommand::UpdateDiff { input, installable } => cmd_update_diff(&input, &installable),
     }
 }
 
@@ -48,11 +46,7 @@ fn render_tree(value: &serde_json::Value, prefix: &str, _is_last: bool) {
         // Check if leaf (has "type" field).
         if let Some(leaf_obj) = val.as_object() {
             if let Some(typ) = leaf_obj.get("type").and_then(|t| t.as_str()) {
-                println!(
-                    "{prefix}{connector} {}: {}",
-                    key.bold(),
-                    typ.dim()
-                );
+                println!("{prefix}{connector} {}: {}", key.bold(), typ.dim());
                 continue;
             }
         }
@@ -110,17 +104,24 @@ fn cmd_metadata(flake_ref: &str) -> color_eyre::Result<()> {
                                 .map(chrono_format_timestamp)
                                 .unwrap_or_default();
 
-                            println!("{connector} {} {} {}", name.bold(), rev.dim(), modified.dim());
+                            println!(
+                                "{connector} {} {} {}",
+                                name.bold(),
+                                rev.dim(),
+                                modified.dim()
+                            );
 
                             // Recurse into sub-inputs.
-                            if let Some(sub_inputs) =
-                                node.get("inputs").and_then(|i| i.as_object())
+                            if let Some(sub_inputs) = node.get("inputs").and_then(|i| i.as_object())
                             {
                                 let sub_entries: Vec<_> = sub_inputs.iter().collect();
                                 for (j, (sub_name, sub_target)) in sub_entries.iter().enumerate() {
                                     let sub_last = j == sub_entries.len() - 1;
-                                    let sub_connector =
-                                        if sub_last { "└───" } else { "├───" };
+                                    let sub_connector = if sub_last {
+                                        "└───"
+                                    } else {
+                                        "├───"
+                                    };
                                     let sub_target_name = sub_target.as_str().unwrap_or("");
                                     let sub_rev = nodes
                                         .get(sub_target_name)
@@ -179,7 +180,9 @@ fn cmd_update_diff(input: &str, installable: &str) -> color_eyre::Result<()> {
     // Backup the current flake.lock.
     let lock_path = std::path::Path::new("flake.lock");
     if !lock_path.exists() {
-        return Err(color_eyre::eyre::eyre!("flake.lock not found in current directory"));
+        return Err(color_eyre::eyre::eyre!(
+            "flake.lock not found in current directory"
+        ));
     }
     let backup = std::fs::read(lock_path)?;
 

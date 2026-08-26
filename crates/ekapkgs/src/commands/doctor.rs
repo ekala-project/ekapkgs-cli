@@ -97,11 +97,20 @@ fn check_disk_space() {
                 if let Ok(avail) = avail_str.trim().parse::<u64>() {
                     let formatted = ekapkgs_ui::format::format_bytes(avail);
                     if avail < 1_073_741_824 {
-                        print_fail("Disk space", &format!("{formatted} available on {store_path}"));
+                        print_fail(
+                            "Disk space",
+                            &format!("{formatted} available on {store_path}"),
+                        );
                     } else if avail < 10_737_418_240 {
-                        print_warn("Disk space", &format!("{formatted} available on {store_path}"));
+                        print_warn(
+                            "Disk space",
+                            &format!("{formatted} available on {store_path}"),
+                        );
                     } else {
-                        print_pass("Disk space", &format!("{formatted} available on {store_path}"));
+                        print_pass(
+                            "Disk space",
+                            &format!("{formatted} available on {store_path}"),
+                        );
                     }
                 } else {
                     print_warn("Disk space", "could not parse available space");
@@ -133,7 +142,10 @@ fn check_caches_reachable(config: &ClientConfig) {
                 .timeout(std::time::Duration::from_secs(5))
                 .build()?;
 
-            let check_url = if url.starts_with("grpc://") || url.starts_with("https://") || url.starts_with("http://") {
+            let check_url = if url.starts_with("grpc://")
+                || url.starts_with("https://")
+                || url.starts_with("http://")
+            {
                 let base = url
                     .replace("grpc://", "https://")
                     .trim_end_matches('/')

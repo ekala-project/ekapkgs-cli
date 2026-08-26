@@ -111,4 +111,3 @@ pub fn execute(installable: &str, extra: &[String]) -> color_eyre::Result<()> {
         Err(e) => Err(e.into()),
     }
 }
-
