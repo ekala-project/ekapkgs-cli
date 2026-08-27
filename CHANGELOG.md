@@ -4,6 +4,7 @@
 
 ### Client
 
+- `registry list/add/remove/pin/unpin/resolve` commands for managing flake registries
 - `closure sbom-diff` command comparing closures by package with CVE, license, and provenance change tracking
 - `closure sbom` command generating CycloneDX 1.5 SBOMs with embedded package manifest support for CPE/PURL/license metadata
 - `search packages/options/files` commands with cached ZSTD-compressed indexes

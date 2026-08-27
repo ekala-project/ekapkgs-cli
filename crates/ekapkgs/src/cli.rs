@@ -96,6 +96,12 @@ pub enum Command {
         command: FlakeCommand,
     },
 
+    /// Manage flake registries.
+    Registry {
+        #[command(subcommand)]
+        command: RegistryCommand,
+    },
+
     /// Manage the local nix store.
     Store {
         #[command(subcommand)]
@@ -380,6 +386,65 @@ pub enum FlakeCommand {
         /// Installable to evaluate for closure comparison (default: `.`).
         #[arg(long, default_value = ".")]
         installable: String,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum RegistryCommand {
+    /// List all flake registry entries.
+    List,
+
+    /// Add or replace a flake in the user registry.
+    Add {
+        /// Flake reference to map from (e.g., `nixpkgs`).
+        from: String,
+
+        /// Flake reference to map to (e.g., `github:NixOS/nixpkgs`).
+        to: String,
+
+        /// Registry file to operate on (default: user registry).
+        #[arg(long)]
+        registry: Option<String>,
+    },
+
+    /// Remove a flake from the user registry.
+    Remove {
+        /// Flake reference to remove (e.g., `nixpkgs`).
+        entry: String,
+
+        /// Registry file to operate on (default: user registry).
+        #[arg(long)]
+        registry: Option<String>,
+    },
+
+    /// Pin a flake to its current version.
+    Pin {
+        /// Flake reference to pin (e.g., `nixpkgs`).
+        entry: String,
+
+        /// Registry file to operate on (default: user registry).
+        #[arg(long)]
+        registry: Option<String>,
+    },
+
+    /// Unpin a flake by removing its user registry entry.
+    ///
+    /// After unpinning, the flake reference falls through to the
+    /// system or global registry, restoring the default (floating)
+    /// resolution.
+    Unpin {
+        /// Flake reference to unpin (e.g., `nixpkgs`).
+        entry: String,
+
+        /// Registry file to operate on (default: user registry).
+        #[arg(long)]
+        registry: Option<String>,
+    },
+
+    /// Resolve flake references using the registry.
+    Resolve {
+        /// Flake references to resolve.
+        refs: Vec<String>,
     },
 }
 

@@ -1,6 +1,6 @@
 # Agent Guide for ekapkgs-cli
 
-Nix CLI wrapper with a negotiated binary cache protocol. Two binaries: `ekapkgs` (client) and `ekapkgs-serve` (server). Resolves entire closures in a single gRPC round trip instead of ~3N HTTP requests. Also provides `system` (nixos-rebuild replacement), `home` (home-manager replacement), `search` (package/option/file search), and `closure sbom` (SBOM generation) commands.
+Nix CLI wrapper with a negotiated binary cache protocol. Two binaries: `ekapkgs` (client) and `ekapkgs-serve` (server). Resolves entire closures in a single gRPC round trip instead of ~3N HTTP requests. Also provides `system` (nixos-rebuild replacement), `home` (home-manager replacement), `search` (package/option/file search), `closure sbom` (SBOM generation), and `registry` (flake registry management) commands.
 
 ## Project Structure
 
@@ -189,6 +189,14 @@ Generates CycloneDX 1.5 JSON or CSV Software Bill of Materials from a nix closur
 - Dependency graph derived from `nix path-info` references
 
 Related ekaos module: `modules/system/package-manifest.nix` in the `core-pkgs` repo generates the embedded manifest with role classification (`default`, `user`, `service`, `home`, `boot`).
+
+### Flake Registry (`ekapkgs registry`)
+
+Wraps `nix registry` subcommands for managing flake registries. Registries map symbolic flake identifiers (e.g., `nixpkgs`) to full URLs (e.g., `github:NixOS/nixpkgs`). Subcommands: `list`, `add`, `remove`, `pin`, `resolve`.
+
+- `add` and `remove` support `--registry` to operate on a specific registry file
+- `pin` locks a registry entry to a specific revision
+- `resolve` translates indirect flake references to direct URLs
 
 ### Client Configuration
 

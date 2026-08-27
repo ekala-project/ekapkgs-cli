@@ -8,6 +8,7 @@ mod dry_run;
 mod flake;
 mod home;
 mod log;
+mod registry;
 mod run;
 mod sbom;
 mod search;
@@ -43,6 +44,7 @@ pub fn run(command: Command) -> color_eyre::Result<()> {
         Command::Cache { command } => cache::execute(command),
         Command::Closure { command } => closure::execute(command),
         Command::Flake { command } => flake::execute(command),
+        Command::Registry { command } => registry::execute(command),
         Command::Store { command } => store::execute(command),
         Command::Log { installable } => log::execute(&installable),
         Command::DryRun { installable, extra } => dry_run::execute(&installable, &extra),
