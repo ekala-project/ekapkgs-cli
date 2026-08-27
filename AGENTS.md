@@ -1,6 +1,6 @@
 # Agent Guide for ekapkgs-cli
 
-Nix CLI wrapper with a negotiated binary cache protocol. Two binaries: `ekapkgs` (client) and `ekapkgs-serve` (server). Resolves entire closures in a single gRPC round trip instead of ~3N HTTP requests.
+Nix CLI wrapper with a negotiated binary cache protocol. Two binaries: `ekapkgs` (client) and `ekapkgs-serve` (server). Resolves entire closures in a single gRPC round trip instead of ~3N HTTP requests. Also provides `system` (nixos-rebuild replacement), `home` (home-manager replacement), and `search` (package/option/file search) commands.
 
 ## Project Structure
 
@@ -31,7 +31,7 @@ Cargo workspace with 6 crates. All shared settings (edition, version, lints, dep
 
 | Crate | Purpose | Has IO? |
 |---|---|---|
-| `ekapkgs` | Client CLI — wraps nix commands, cache push/pull/auth | Yes |
+| `ekapkgs` | Client CLI — wraps nix commands, cache push/pull/auth, system/home management, search | Yes |
 | `ekapkgs-serve` | Server — gRPC negotiation, HTTP compat, storage, tokens, GC | Yes |
 | `ekapkgs-protocol` | Protobuf types, certificate verification | No |
 | `ekapkgs-nix` | Nix command execution, eval, store path ops | Yes |
@@ -157,6 +157,25 @@ The core innovation is the negotiate RPC (`proto/ekapkgs/v1/negotiate.proto`):
 Two models supported:
 - **Standard nix signing** — Ed25519 secret key signs narinfo fingerprints
 - **Certificate-based signing** — CA keypair issues short-lived certificates for key rotation without client config changes
+
+### System Management (`ekapkgs system`)
+
+Replaces `nixos-rebuild` for local system configuration. Builds `system.build.toplevel` from the flake, manages `/nix/var/nix/profiles/system`, and activates via `switch-to-configuration`. Subcommands: `switch`, `boot`, `test`, `build`, `list-generations`, `rollback`, `prune-boot-entries`.
+
+- `prune-boot-entries` removes orphaned BLS entries, kernel/initrd files, and UKI files from the ESP after generations are garbage collected
+- `--gc` flag on `prune-boot-entries` runs `nix-collect-garbage -d` first
+
+### Home Configuration (`ekapkgs home`)
+
+Replaces `home-manager`. Per-user dotfiles, packages, environment variables, shell aliases, and activation scripts are defined in the ekaos module system under `users.users.<name>` and built as `system.build.home`. The activation script runs as the user (no root) and manages symlinks into `$HOME` with a JSON manifest for cleanup. State stored at `~/.config/ekaos/`.
+
+Related ekaos module: `modules/config/home.nix` in the `core-pkgs` repo.
+
+### Search (`ekapkgs search`)
+
+Searches packages, configuration options, or files using ZSTD-compressed JSON indexes cached at `~/.cache/ekapkgs/indexes/`. Indexes auto-generate on first use via nix evaluation, or can be downloaded from a remote URL. File search integrates with `nix-locate` when available.
+
+Related ekaos file: `lib/generate-options-index.nix` for option index generation.
 
 ### Client Configuration
 

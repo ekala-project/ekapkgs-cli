@@ -71,6 +71,51 @@ ekapkgs flake metadata                     # input dependency tree with revision
 ekapkgs flake update-diff nixpkgs          # show closure diff before committing update
 ```
 
+### System management
+
+Replaces `nixos-rebuild` for local system configuration:
+
+```
+ekapkgs system switch                      # build and activate
+ekapkgs system boot                        # add boot entry, activate on reboot
+ekapkgs system test                        # activate without updating boot entry
+ekapkgs system build                       # build only, print store path
+ekapkgs system list-generations            # list system generations
+ekapkgs system rollback                    # roll back to previous generation
+ekapkgs system rollback --dry-run          # preview rollback
+ekapkgs system prune-boot-entries          # remove orphaned boot entries from ESP
+ekapkgs system prune-boot-entries --gc     # garbage collect first, then prune
+ekapkgs system prune-boot-entries --dry-run
+```
+
+### Home configuration
+
+Replaces `home-manager` for per-user dotfiles, packages, and environment:
+
+```
+ekapkgs home switch                        # build and activate home config
+ekapkgs home build                         # build only, print store path
+ekapkgs home generations                   # list home generations
+ekapkgs home packages                      # list packages in active profile
+```
+
+Home configuration is defined in the ekaos module system under
+`users.users.<name>` and built via `system.build.home`.
+
+### Search
+
+Search packages, configuration options, or files. Indexes are cached
+locally as ZSTD-compressed JSON and auto-generated on first use.
+
+```
+ekapkgs search packages hello              # search by name/description
+ekapkgs search packages hello --json       # machine-readable output
+ekapkgs search options boot.loader         # search configuration options
+ekapkgs search files bin/hello             # find which package provides a file
+ekapkgs search update                      # regenerate indexes
+ekapkgs search update --remote https://...  # download pre-built indexes
+```
+
 ### Remote deployment
 
 ```
