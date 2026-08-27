@@ -207,13 +207,23 @@ struct OptionSearchEntry {
     read_only: bool,
 }
 
+/// Escape a string for use inside nix double quotes.
+fn escape_nix_string(s: &str) -> String {
+    s.replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+        .replace('\t', "\\t")
+        .replace("${", "\\${")
+}
+
 fn generate_option_index(flake: &str) -> color_eyre::Result<Vec<u8>> {
     // Use nix eval with an inline expression that serializes options.
     // This works with any flake that has an ekaos-style options tree.
+    let escaped_flake = escape_nix_string(flake);
     let expr = format!(
         r#"
         let
-          flake = builtins.getFlake "{flake}";
+          flake = builtins.getFlake "{escaped_flake}";
           pkgs = flake.legacyPackages.${{builtins.currentSystem}} or flake.pkgs.${{builtins.currentSystem}} or (import <nixpkgs> {{}});
           lib = pkgs.lib;
           eval = flake.config or
