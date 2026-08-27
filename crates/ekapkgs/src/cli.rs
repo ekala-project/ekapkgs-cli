@@ -118,6 +118,12 @@ pub enum Command {
         extra: Vec<String>,
     },
 
+    /// Manage per-user home configurations.
+    Home {
+        #[command(subcommand)]
+        command: HomeCommand,
+    },
+
     /// Check system health and configuration.
     Doctor,
 
@@ -299,6 +305,39 @@ pub enum FlakeCommand {
         #[arg(long, default_value = ".")]
         installable: String,
     },
+}
+
+#[derive(Subcommand)]
+pub enum HomeCommand {
+    /// Build and activate the home configuration.
+    Switch {
+        /// The installable for the home configuration
+        /// (e.g., `.#config.system.build.home`).
+        #[arg(default_value = ".#config.system.build.home")]
+        installable: String,
+
+        /// Extra arguments passed through to nix build.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        extra: Vec<String>,
+    },
+
+    /// Build the home configuration without activating.
+    Build {
+        /// The installable for the home configuration
+        /// (e.g., `.#config.system.build.home`).
+        #[arg(default_value = ".#config.system.build.home")]
+        installable: String,
+
+        /// Extra arguments passed through to nix build.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        extra: Vec<String>,
+    },
+
+    /// List home configuration generations.
+    Generations,
+
+    /// List packages installed via home configuration.
+    Packages,
 }
 
 #[derive(Clone, clap::ValueEnum)]

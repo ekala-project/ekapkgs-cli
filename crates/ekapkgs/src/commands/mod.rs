@@ -6,6 +6,7 @@ mod develop;
 mod doctor;
 mod dry_run;
 mod flake;
+mod home;
 mod log;
 mod run;
 mod shell;
@@ -33,6 +34,7 @@ pub fn run(command: Command) -> color_eyre::Result<()> {
             &mode,
             dry_run,
         ),
+        Command::Home { command } => home::execute(command),
         Command::Cache { command } => cache::execute(command),
         Command::Closure { command } => closure::execute(command),
         Command::Flake { command } => flake::execute(command),
