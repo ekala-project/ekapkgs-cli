@@ -124,6 +124,12 @@ pub enum Command {
         command: HomeCommand,
     },
 
+    /// Manage the local system configuration (nixos-rebuild replacement).
+    System {
+        #[command(subcommand)]
+        command: SystemCommand,
+    },
+
     /// Check system health and configuration.
     Doctor,
 
@@ -338,6 +344,77 @@ pub enum HomeCommand {
 
     /// List packages installed via home configuration.
     Packages,
+}
+
+#[derive(Subcommand)]
+pub enum SystemCommand {
+    /// Build the system configuration and activate it.
+    ///
+    /// Builds the system toplevel, updates the system profile, installs
+    /// boot entries, and activates the new configuration.
+    Switch {
+        /// The system configuration installable
+        /// (e.g., `.#nixosConfigurations.myhost.config.system.build.toplevel`).
+        #[arg(default_value = ".#config.system.build.toplevel")]
+        installable: String,
+
+        /// Only show what would be done.
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Extra arguments passed through to nix build.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        extra: Vec<String>,
+    },
+
+    /// Build and activate, but only add the boot entry without switching.
+    ///
+    /// The new configuration becomes the default boot entry but the
+    /// running system is not changed until the next reboot.
+    Boot {
+        /// The system configuration installable.
+        #[arg(default_value = ".#config.system.build.toplevel")]
+        installable: String,
+
+        /// Extra arguments passed through to nix build.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        extra: Vec<String>,
+    },
+
+    /// Build and activate without updating the boot entry.
+    ///
+    /// Useful for testing a configuration without committing to it
+    /// across reboots.
+    Test {
+        /// The system configuration installable.
+        #[arg(default_value = ".#config.system.build.toplevel")]
+        installable: String,
+
+        /// Extra arguments passed through to nix build.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        extra: Vec<String>,
+    },
+
+    /// Build the system configuration without activating.
+    Build {
+        /// The system configuration installable.
+        #[arg(default_value = ".#config.system.build.toplevel")]
+        installable: String,
+
+        /// Extra arguments passed through to nix build.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        extra: Vec<String>,
+    },
+
+    /// List system generations.
+    ListGenerations,
+
+    /// Roll back to the previous system generation.
+    Rollback {
+        /// Only show what would be done.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[derive(Clone, clap::ValueEnum)]

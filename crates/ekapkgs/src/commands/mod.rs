@@ -12,6 +12,7 @@ mod run;
 mod shell;
 mod store;
 mod substituter;
+mod system;
 
 use crate::cli::Command;
 
@@ -35,6 +36,7 @@ pub fn run(command: Command) -> color_eyre::Result<()> {
             dry_run,
         ),
         Command::Home { command } => home::execute(command),
+        Command::System { command } => system::execute(command),
         Command::Cache { command } => cache::execute(command),
         Command::Closure { command } => closure::execute(command),
         Command::Flake { command } => flake::execute(command),
