@@ -415,6 +415,22 @@ pub enum SystemCommand {
         #[arg(long)]
         dry_run: bool,
     },
+
+    /// Remove boot entries for generations that no longer exist.
+    ///
+    /// After garbage-collecting old system generations with
+    /// `ekapkgs store gc`, their boot entries remain on the ESP.
+    /// This command removes those orphaned entries and their
+    /// associated kernel/initrd/UKI files.
+    PruneBootEntries {
+        /// Boot mount point (ESP or XBOOTLDR).
+        #[arg(long, default_value = "/boot")]
+        boot_mount: String,
+
+        /// Only show what would be removed.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[derive(Clone, clap::ValueEnum)]
