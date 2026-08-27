@@ -9,6 +9,7 @@ mod flake;
 mod home;
 mod log;
 mod run;
+mod search;
 mod shell;
 mod store;
 mod substituter;
@@ -37,6 +38,7 @@ pub fn run(command: Command) -> color_eyre::Result<()> {
         ),
         Command::Home { command } => home::execute(command),
         Command::System { command } => system::execute(command),
+        Command::Search { command } => search::execute(command),
         Command::Cache { command } => cache::execute(command),
         Command::Closure { command } => closure::execute(command),
         Command::Flake { command } => flake::execute(command),

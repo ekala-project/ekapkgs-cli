@@ -130,6 +130,12 @@ pub enum Command {
         command: SystemCommand,
     },
 
+    /// Search packages, options, or files.
+    Search {
+        #[command(subcommand)]
+        command: SearchCommand,
+    },
+
     /// Check system health and configuration.
     Doctor,
 
@@ -438,6 +444,73 @@ pub enum SystemCommand {
         /// Only show what would be removed.
         #[arg(long)]
         dry_run: bool,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum SearchCommand {
+    /// Search packages by name or description.
+    Packages {
+        /// Search query (substring or regex).
+        query: String,
+
+        /// Flake reference to search (default: `nixpkgs`).
+        #[arg(long, default_value = "nixpkgs")]
+        flake: String,
+
+        /// Output results as JSON.
+        #[arg(long)]
+        json: bool,
+
+        /// Maximum number of results.
+        #[arg(long, default_value = "20")]
+        limit: usize,
+    },
+
+    /// Search configuration options by name or description.
+    Options {
+        /// Search query (substring or regex).
+        query: String,
+
+        /// Flake reference containing the ekaos configuration.
+        #[arg(long, default_value = ".")]
+        flake: String,
+
+        /// Output results as JSON.
+        #[arg(long)]
+        json: bool,
+
+        /// Maximum number of results.
+        #[arg(long, default_value = "20")]
+        limit: usize,
+    },
+
+    /// Search for files across packages.
+    Files {
+        /// File name or path pattern to search for.
+        query: String,
+
+        /// Output results as JSON.
+        #[arg(long)]
+        json: bool,
+
+        /// Maximum number of results.
+        #[arg(long, default_value = "20")]
+        limit: usize,
+    },
+
+    /// Update search indexes.
+    ///
+    /// Regenerates local search indexes by evaluating the flake.
+    /// Use `--remote` to download pre-built indexes instead.
+    Update {
+        /// Flake reference to index (default: `nixpkgs`).
+        #[arg(long, default_value = "nixpkgs")]
+        flake: String,
+
+        /// Download pre-built indexes from this URL instead of generating locally.
+        #[arg(long)]
+        remote: Option<String>,
     },
 }
 
