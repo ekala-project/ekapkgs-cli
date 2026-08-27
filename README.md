@@ -89,6 +89,20 @@ ekapkgs flake metadata                     # input dependency tree with revision
 ekapkgs flake update-diff nixpkgs          # show closure diff before committing update
 ```
 
+### Flake registry
+
+Manage flake registries (symbolic identifiers like `nixpkgs` that map to
+full flake URLs):
+
+```
+ekapkgs registry list                      # show all registry entries
+ekapkgs registry add nixpkgs github:NixOS/nixpkgs  # add/replace entry
+ekapkgs registry remove nixpkgs            # remove entry
+ekapkgs registry pin nixpkgs               # pin to current revision
+ekapkgs registry unpin nixpkgs             # remove pin (restore floating)
+ekapkgs registry resolve nixpkgs           # show resolved URL
+```
+
 ### System management
 
 Replaces `nixos-rebuild` for local system configuration:
