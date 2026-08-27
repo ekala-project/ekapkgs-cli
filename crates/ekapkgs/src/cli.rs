@@ -282,12 +282,44 @@ pub enum ClosureCommand {
         #[arg(short, long)]
         output: Option<String>,
     },
+
+    /// Diff two closures and show package changes.
+    ///
+    /// Builds both installables, compares their runtime closures by
+    /// package name, and reports added, removed, and changed packages.
+    /// Useful for reviewing what changed between system generations
+    /// or flake input updates.
+    SbomDiff {
+        /// The old installable or store path.
+        old: String,
+
+        /// The new installable or store path.
+        new: String,
+
+        /// Output format.
+        #[arg(long, value_enum, default_value = "text")]
+        format: SbomDiffFormat,
+
+        /// Output file (default: stdout).
+        #[arg(short, long)]
+        output: Option<String>,
+    },
 }
 
 #[derive(Clone, clap::ValueEnum)]
 pub enum SbomFormat {
     /// CycloneDX 1.5 JSON.
     Cyclonedx,
+    /// CSV for quick inspection.
+    Csv,
+}
+
+#[derive(Clone, clap::ValueEnum)]
+pub enum SbomDiffFormat {
+    /// Human-readable text summary (default).
+    Text,
+    /// JSON with structured change records.
+    Json,
     /// CSV for quick inspection.
     Csv,
 }

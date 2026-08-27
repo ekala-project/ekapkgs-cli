@@ -7,7 +7,7 @@ use ekapkgs_nix::store::{self, PathInfoEntry};
 use ekapkgs_nix::{NixCommand, eval};
 use serde::Serialize;
 
-use crate::cli::SbomFormat;
+use crate::cli::{SbomDiffFormat, SbomFormat};
 
 pub fn execute(
     installable: &str,
@@ -15,55 +15,8 @@ pub fn execute(
     buildtime: bool,
     output: Option<&str>,
 ) -> color_eyre::Result<()> {
-    let inst = Installable::new(installable);
+    let (root_path, components, closure_entries) = build_sbom_components(installable, buildtime)?;
 
-    // Step 1: Build the installable to realize it in the store.
-    // We need the output paths to exist for `nix path-info -r` to work.
-    let outputs: Vec<eval::BuildOutput> = NixCommand::new(&["build"])
-        .arg(installable)
-        .arg("--json")
-        .json()?;
-
-    let root_path = outputs
-        .first()
-        .and_then(|o| o.outputs.get("out").cloned())
-        .ok_or_else(|| color_eyre::eyre::eyre!("no output path for installable"))?;
-
-    // Step 2: Try to load embedded package manifest (ekaos systems only).
-    let manifest = manifest::load_manifest(&root_path);
-    if manifest.is_some() {
-        tracing::info!("Found embedded package manifest");
-    }
-
-    // Step 3: Query the closure (paths must be realized in the store).
-    let spinner = ekapkgs_ui::progress::spinner("Querying closure...");
-    let closure_entries = if buildtime {
-        // For buildtime, get all derivation output paths and query their info.
-        let paths = eval::derivation_closure_paths(&inst)?;
-        // We can't get references for unbuilt paths, so just create
-        // entries with the paths we have.
-        paths
-            .into_iter()
-            .map(|path| PathInfoEntry {
-                path,
-                nar_size: 0,
-                closure_size: 0,
-                references: Vec::new(),
-            })
-            .collect()
-    } else {
-        store::closure_path_info(&inst)?
-    };
-    spinner.finish_and_clear();
-
-    // Step 4: Build the component list.
-    let manifest_index = build_manifest_index(manifest.as_ref());
-    let components: Vec<SbomComponent> = closure_entries
-        .iter()
-        .map(|entry| build_component(entry, &manifest_index))
-        .collect();
-
-    // Step 5: Format and write output.
     let writer: Box<dyn Write> = match output {
         Some(path) => Box::new(std::fs::File::create(path)?),
         None => Box::new(std::io::stdout().lock()),
@@ -79,6 +32,78 @@ pub fn execute(
         ),
         SbomFormat::Csv => write_csv(writer, &components),
     }
+}
+
+pub fn execute_diff(
+    old: &str,
+    new: &str,
+    format: &SbomDiffFormat,
+    output: Option<&str>,
+) -> color_eyre::Result<()> {
+    let (_, old_components, _) = build_sbom_components(old, false)?;
+    let (_, new_components, _) = build_sbom_components(new, false)?;
+
+    let diff = compute_diff(&old_components, &new_components);
+
+    let writer: Box<dyn Write> = match output {
+        Some(path) => Box::new(std::fs::File::create(path)?),
+        None => Box::new(std::io::stdout().lock()),
+    };
+
+    match format {
+        SbomDiffFormat::Text => write_diff_text(writer, &diff),
+        SbomDiffFormat::Json => write_diff_json(writer, &diff),
+        SbomDiffFormat::Csv => write_diff_csv(writer, &diff),
+    }
+}
+
+/// Build and query a closure, returning the root path, component list,
+/// and raw closure entries.
+fn build_sbom_components(
+    installable: &str,
+    buildtime: bool,
+) -> color_eyre::Result<(String, Vec<SbomComponent>, Vec<PathInfoEntry>)> {
+    let inst = Installable::new(installable);
+
+    let outputs: Vec<eval::BuildOutput> = NixCommand::new(&["build"])
+        .arg(installable)
+        .arg("--json")
+        .json()?;
+
+    let root_path = outputs
+        .first()
+        .and_then(|o| o.outputs.get("out").cloned())
+        .ok_or_else(|| color_eyre::eyre::eyre!("no output path for installable"))?;
+
+    let manifest = manifest::load_manifest(&root_path);
+    if manifest.is_some() {
+        tracing::info!("Found embedded package manifest");
+    }
+
+    let spinner = ekapkgs_ui::progress::spinner("Querying closure...");
+    let closure_entries = if buildtime {
+        let paths = eval::derivation_closure_paths(&inst)?;
+        paths
+            .into_iter()
+            .map(|path| PathInfoEntry {
+                path,
+                nar_size: 0,
+                closure_size: 0,
+                references: Vec::new(),
+            })
+            .collect()
+    } else {
+        store::closure_path_info(&inst)?
+    };
+    spinner.finish_and_clear();
+
+    let manifest_index = build_manifest_index(manifest.as_ref());
+    let components: Vec<SbomComponent> = closure_entries
+        .iter()
+        .map(|entry| build_component(entry, &manifest_index))
+        .collect();
+
+    Ok((root_path, components, closure_entries))
 }
 
 // ---------------------------------------------------------------------------
@@ -527,6 +552,452 @@ fn days_to_date(mut days: u64) -> (u64, u64, u64) {
     (y, m, d)
 }
 
+// ---------------------------------------------------------------------------
+// SBOM diff
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DiffEntry {
+    status: &'static str,
+    pname: String,
+    old_version: String,
+    new_version: String,
+    old_nar_size: u64,
+    new_nar_size: u64,
+    role: String,
+    /// Package URL for downstream tooling identification.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    purl: Option<String>,
+    /// Metadata changes detected for this package.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    metadata_changes: Vec<MetadataChange>,
+}
+
+/// A single metadata field that changed between old and new.
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct MetadataChange {
+    field: &'static str,
+    old_value: String,
+    new_value: String,
+}
+
+struct SbomDiff {
+    added: Vec<DiffEntry>,
+    removed: Vec<DiffEntry>,
+    changed: Vec<DiffEntry>,
+    summary: DiffSummary,
+}
+
+struct DiffSummary {
+    old_count: usize,
+    new_count: usize,
+    added: usize,
+    removed: usize,
+    changed: usize,
+    size_delta: i64,
+}
+
+/// Compare metadata between two components and return a list of changes.
+fn diff_metadata(old: &SbomComponent, new: &SbomComponent) -> Vec<MetadataChange> {
+    let mut changes = Vec::new();
+
+    // License changes.
+    let old_lic = format_licenses(&old.licenses);
+    let new_lic = format_licenses(&new.licenses);
+    if old_lic != new_lic {
+        changes.push(MetadataChange {
+            field: "license",
+            old_value: old_lic,
+            new_value: new_lic,
+        });
+    }
+
+    // CVE changes.
+    let mut old_cves = old.known_vulnerabilities.clone();
+    let mut new_cves = new.known_vulnerabilities.clone();
+    old_cves.sort();
+    new_cves.sort();
+    if old_cves != new_cves {
+        let added_cves: Vec<&String> = new_cves.iter().filter(|c| !old_cves.contains(c)).collect();
+        let removed_cves: Vec<&String> =
+            old_cves.iter().filter(|c| !new_cves.contains(c)).collect();
+        if !added_cves.is_empty() {
+            changes.push(MetadataChange {
+                field: "cve:added",
+                old_value: String::new(),
+                new_value: added_cves
+                    .iter()
+                    .map(|s| s.as_str())
+                    .collect::<Vec<_>>()
+                    .join(","),
+            });
+        }
+        if !removed_cves.is_empty() {
+            changes.push(MetadataChange {
+                field: "cve:removed",
+                old_value: removed_cves
+                    .iter()
+                    .map(|s| s.as_str())
+                    .collect::<Vec<_>>()
+                    .join(","),
+                new_value: String::new(),
+            });
+        }
+    }
+
+    // Source provenance changes.
+    let mut old_prov = old.source_provenance.clone();
+    let mut new_prov = new.source_provenance.clone();
+    old_prov.sort();
+    new_prov.sort();
+    if old_prov != new_prov {
+        changes.push(MetadataChange {
+            field: "sourceProvenance",
+            old_value: old_prov.join(","),
+            new_value: new_prov.join(","),
+        });
+    }
+
+    // CPE changes.
+    if old.cpe != new.cpe {
+        changes.push(MetadataChange {
+            field: "cpe",
+            old_value: old.cpe.clone().unwrap_or_default(),
+            new_value: new.cpe.clone().unwrap_or_default(),
+        });
+    }
+
+    // PURL changes.
+    if old.purl != new.purl {
+        changes.push(MetadataChange {
+            field: "purl",
+            old_value: old.purl.clone().unwrap_or_default(),
+            new_value: new.purl.clone().unwrap_or_default(),
+        });
+    }
+
+    // Role changes.
+    if old.role != new.role && !old.role.is_empty() && !new.role.is_empty() {
+        changes.push(MetadataChange {
+            field: "role",
+            old_value: old.role.clone(),
+            new_value: new.role.clone(),
+        });
+    }
+
+    changes
+}
+
+fn format_licenses(licenses: &[SbomLicense]) -> String {
+    let mut ids: Vec<&str> = licenses
+        .iter()
+        .map(|l| l.spdx_id.as_deref().unwrap_or(&l.name))
+        .collect();
+    ids.sort();
+    ids.join(",")
+}
+
+fn compute_diff(old: &[SbomComponent], new: &[SbomComponent]) -> SbomDiff {
+    // Index by pname. When multiple store paths share a pname (e.g.,
+    // multi-output packages), keep the one with the largest nar_size
+    // as representative.
+    let old_by_name = index_by_pname(old);
+    let new_by_name = index_by_pname(new);
+
+    let mut added = Vec::new();
+    let mut removed = Vec::new();
+    let mut changed = Vec::new();
+    let mut size_delta: i64 = 0;
+
+    // Check for removed and changed packages.
+    for (pname, old_comp) in &old_by_name {
+        if let Some(new_comp) = new_by_name.get(pname) {
+            let metadata_changes = diff_metadata(old_comp, new_comp);
+            let path_changed = old_comp.store_path != new_comp.store_path;
+
+            if path_changed || !metadata_changes.is_empty() {
+                let delta = new_comp.nar_size as i64 - old_comp.nar_size as i64;
+                size_delta += delta;
+                changed.push(DiffEntry {
+                    status: if path_changed { "changed" } else { "metadata" },
+                    pname: pname.clone(),
+                    old_version: old_comp.version.clone(),
+                    new_version: new_comp.version.clone(),
+                    old_nar_size: old_comp.nar_size,
+                    new_nar_size: new_comp.nar_size,
+                    role: if new_comp.role.is_empty() {
+                        old_comp.role.clone()
+                    } else {
+                        new_comp.role.clone()
+                    },
+                    purl: new_comp.purl.clone().or_else(|| old_comp.purl.clone()),
+                    metadata_changes,
+                });
+            }
+        } else {
+            size_delta -= old_comp.nar_size as i64;
+            removed.push(DiffEntry {
+                status: "removed",
+                pname: pname.clone(),
+                old_version: old_comp.version.clone(),
+                new_version: String::new(),
+                old_nar_size: old_comp.nar_size,
+                new_nar_size: 0,
+                role: old_comp.role.clone(),
+                purl: old_comp.purl.clone(),
+                metadata_changes: Vec::new(),
+            });
+        }
+    }
+
+    // Check for added packages.
+    for (pname, new_comp) in &new_by_name {
+        if !old_by_name.contains_key(pname) {
+            size_delta += new_comp.nar_size as i64;
+
+            // Surface CVEs on newly added packages.
+            let metadata_changes = if new_comp.known_vulnerabilities.is_empty() {
+                Vec::new()
+            } else {
+                vec![MetadataChange {
+                    field: "cve:added",
+                    old_value: String::new(),
+                    new_value: new_comp.known_vulnerabilities.join(","),
+                }]
+            };
+
+            added.push(DiffEntry {
+                status: "added",
+                pname: pname.clone(),
+                old_version: String::new(),
+                new_version: new_comp.version.clone(),
+                old_nar_size: 0,
+                new_nar_size: new_comp.nar_size,
+                role: new_comp.role.clone(),
+                purl: new_comp.purl.clone(),
+                metadata_changes,
+            });
+        }
+    }
+
+    added.sort_by(|a, b| a.pname.cmp(&b.pname));
+    removed.sort_by(|a, b| a.pname.cmp(&b.pname));
+    changed.sort_by(|a, b| a.pname.cmp(&b.pname));
+
+    let summary = DiffSummary {
+        old_count: old_by_name.len(),
+        new_count: new_by_name.len(),
+        added: added.len(),
+        removed: removed.len(),
+        changed: changed.len(),
+        size_delta,
+    };
+
+    SbomDiff {
+        added,
+        removed,
+        changed,
+        summary,
+    }
+}
+
+fn index_by_pname(components: &[SbomComponent]) -> HashMap<String, &SbomComponent> {
+    let mut map: HashMap<String, &SbomComponent> = HashMap::new();
+    for comp in components {
+        map.entry(comp.pname.clone())
+            .and_modify(|existing| {
+                if comp.nar_size > existing.nar_size {
+                    *existing = comp;
+                }
+            })
+            .or_insert(comp);
+    }
+    map
+}
+
+fn write_diff_text(mut writer: impl Write, diff: &SbomDiff) -> color_eyre::Result<()> {
+    let s = &diff.summary;
+    writeln!(
+        writer,
+        "{} packages -> {} packages",
+        s.old_count, s.new_count
+    )?;
+
+    let size_str = if s.size_delta >= 0 {
+        format!("+{}", ekapkgs_ui::format::format_bytes(s.size_delta as u64))
+    } else {
+        format!(
+            "-{}",
+            ekapkgs_ui::format::format_bytes((-s.size_delta) as u64)
+        )
+    };
+    writeln!(
+        writer,
+        "  {} added, {} removed, {} changed ({})",
+        s.added, s.removed, s.changed, size_str
+    )?;
+
+    if !diff.changed.is_empty() {
+        writeln!(writer)?;
+        for entry in &diff.changed {
+            let delta = entry.new_nar_size as i64 - entry.old_nar_size as i64;
+            let delta_str = if delta >= 0 {
+                format!("+{}", ekapkgs_ui::format::format_bytes(delta as u64))
+            } else {
+                format!("-{}", ekapkgs_ui::format::format_bytes((-delta) as u64))
+            };
+            if entry.old_version == entry.new_version {
+                // Metadata-only change, same version.
+                write!(writer, "  {}: {}", entry.pname, entry.new_version)?;
+            } else {
+                write!(
+                    writer,
+                    "  {}: {} -> {}",
+                    entry.pname, entry.old_version, entry.new_version
+                )?;
+            }
+            if delta != 0 {
+                write!(writer, ", {delta_str}")?;
+            }
+            writeln!(writer)?;
+            write_metadata_changes(&mut writer, &entry.metadata_changes)?;
+        }
+    }
+
+    if !diff.added.is_empty() {
+        writeln!(writer)?;
+        for entry in &diff.added {
+            let size = ekapkgs_ui::format::format_bytes(entry.new_nar_size);
+            write!(writer, "  + {} {}", entry.pname, entry.new_version)?;
+            if !entry.role.is_empty() {
+                write!(writer, " ({})", entry.role)?;
+            }
+            writeln!(writer, ", {size}")?;
+            write_metadata_changes(&mut writer, &entry.metadata_changes)?;
+        }
+    }
+
+    if !diff.removed.is_empty() {
+        writeln!(writer)?;
+        for entry in &diff.removed {
+            let size = ekapkgs_ui::format::format_bytes(entry.old_nar_size);
+            write!(writer, "  - {} {}", entry.pname, entry.old_version)?;
+            if !entry.role.is_empty() {
+                write!(writer, " ({})", entry.role)?;
+            }
+            writeln!(writer, ", {size}")?;
+        }
+    }
+
+    Ok(())
+}
+
+fn write_metadata_changes(
+    writer: &mut impl Write,
+    changes: &[MetadataChange],
+) -> color_eyre::Result<()> {
+    for mc in changes {
+        match mc.field {
+            "cve:added" => {
+                for cve in mc.new_value.split(',') {
+                    writeln!(writer, "      CVE+ {cve}")?;
+                }
+            },
+            "cve:removed" => {
+                for cve in mc.old_value.split(',') {
+                    writeln!(writer, "      CVE- {cve}")?;
+                }
+            },
+            "license" => {
+                writeln!(
+                    writer,
+                    "      license: {} -> {}",
+                    mc.old_value, mc.new_value
+                )?;
+            },
+            "sourceProvenance" => {
+                writeln!(
+                    writer,
+                    "      provenance: {} -> {}",
+                    mc.old_value, mc.new_value
+                )?;
+            },
+            "role" => {
+                writeln!(writer, "      role: {} -> {}", mc.old_value, mc.new_value)?;
+            },
+            _ => {
+                writeln!(
+                    writer,
+                    "      {}: {} -> {}",
+                    mc.field, mc.old_value, mc.new_value
+                )?;
+            },
+        }
+    }
+    Ok(())
+}
+
+fn write_diff_json(writer: impl Write, diff: &SbomDiff) -> color_eyre::Result<()> {
+    #[derive(Serialize)]
+    struct DiffOutput<'a> {
+        summary: SummaryJson,
+        changes: &'a [DiffEntry],
+        added: &'a [DiffEntry],
+        removed: &'a [DiffEntry],
+    }
+
+    #[derive(Serialize)]
+    #[serde(rename_all = "camelCase")]
+    struct SummaryJson {
+        old_count: usize,
+        new_count: usize,
+        size_delta: i64,
+    }
+
+    let output = DiffOutput {
+        summary: SummaryJson {
+            old_count: diff.summary.old_count,
+            new_count: diff.summary.new_count,
+            size_delta: diff.summary.size_delta,
+        },
+        changes: &diff.changed,
+        added: &diff.added,
+        removed: &diff.removed,
+    };
+
+    serde_json::to_writer_pretty(writer, &output)?;
+    Ok(())
+}
+
+fn write_diff_csv(mut writer: impl Write, diff: &SbomDiff) -> color_eyre::Result<()> {
+    writeln!(
+        writer,
+        "status,pname,old_version,new_version,old_nar_size,new_nar_size,role"
+    )?;
+    let all: Vec<&DiffEntry> = diff
+        .changed
+        .iter()
+        .chain(diff.added.iter())
+        .chain(diff.removed.iter())
+        .collect();
+    for e in all {
+        writeln!(
+            writer,
+            "{},{},{},{},{},{},{}",
+            e.status,
+            csv_escape(&e.pname),
+            csv_escape(&e.old_version),
+            csv_escape(&e.new_version),
+            e.old_nar_size,
+            e.new_nar_size,
+            csv_escape(&e.role),
+        )?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -616,6 +1087,271 @@ mod tests {
         assert_eq!(component.version, "8.5.0");
         assert!(component.role.is_empty());
         assert!(component.licenses.is_empty());
+    }
+
+    fn make_component(pname: &str, version: &str, nar_size: u64, role: &str) -> SbomComponent {
+        SbomComponent {
+            bom_ref: format!("hash-{pname}-{version}"),
+            pname: pname.into(),
+            version: version.into(),
+            description: String::new(),
+            homepage: String::new(),
+            licenses: Vec::new(),
+            store_path: format!("/nix/store/hash-{pname}-{version}"),
+            nar_size,
+            role: role.into(),
+            source: String::new(),
+            cpe: None,
+            purl: None,
+            source_provenance: Vec::new(),
+            known_vulnerabilities: Vec::new(),
+            changelog: String::new(),
+            main_program: String::new(),
+        }
+    }
+
+    #[test]
+    fn diff_detects_added_packages() {
+        let old = vec![make_component("hello", "2.10", 1000, "")];
+        let new = vec![
+            make_component("hello", "2.10", 1000, ""),
+            make_component("curl", "8.5.0", 500, "user"),
+        ];
+        let diff = compute_diff(&old, &new);
+        assert_eq!(diff.summary.added, 1);
+        assert_eq!(diff.summary.removed, 0);
+        assert_eq!(diff.summary.changed, 0);
+        assert_eq!(diff.added[0].pname, "curl");
+    }
+
+    #[test]
+    fn diff_detects_removed_packages() {
+        let old = vec![
+            make_component("hello", "2.10", 1000, ""),
+            make_component("curl", "8.5.0", 500, ""),
+        ];
+        let new = vec![make_component("hello", "2.10", 1000, "")];
+        let diff = compute_diff(&old, &new);
+        assert_eq!(diff.summary.added, 0);
+        assert_eq!(diff.summary.removed, 1);
+        assert_eq!(diff.removed[0].pname, "curl");
+    }
+
+    #[test]
+    fn diff_detects_version_change() {
+        let old = vec![make_component("nginx", "1.26.2", 1000, "service")];
+        let new = vec![make_component("nginx", "1.26.3", 1200, "service")];
+        let diff = compute_diff(&old, &new);
+        assert_eq!(diff.summary.changed, 1);
+        assert_eq!(diff.summary.added, 0);
+        assert_eq!(diff.summary.removed, 0);
+        assert_eq!(diff.changed[0].old_version, "1.26.2");
+        assert_eq!(diff.changed[0].new_version, "1.26.3");
+        assert_eq!(diff.summary.size_delta, 200);
+    }
+
+    #[test]
+    fn diff_unchanged_not_reported() {
+        let old = vec![make_component("hello", "2.10", 1000, "")];
+        let new = vec![make_component("hello", "2.10", 1000, "")];
+        let diff = compute_diff(&old, &new);
+        assert_eq!(diff.summary.changed, 0);
+        assert_eq!(diff.summary.added, 0);
+        assert_eq!(diff.summary.removed, 0);
+    }
+
+    #[test]
+    fn diff_text_output() {
+        let old = vec![
+            make_component("nginx", "1.26.2", 1000, "service"),
+            make_component("redis", "7.0", 800, "service"),
+        ];
+        let new = vec![
+            make_component("nginx", "1.26.3", 1200, "service"),
+            make_component("postgres", "16.2", 5000, "service"),
+        ];
+        let diff = compute_diff(&old, &new);
+        let mut buf = Vec::new();
+        write_diff_text(&mut buf, &diff).unwrap();
+        let output = String::from_utf8(buf).unwrap();
+        assert!(output.contains("nginx: 1.26.2 -> 1.26.3"));
+        assert!(output.contains("+ postgres"));
+        assert!(output.contains("- redis"));
+    }
+
+    #[test]
+    fn diff_json_output() {
+        let old = vec![make_component("hello", "2.10", 1000, "")];
+        let new = vec![make_component("hello", "2.12", 1100, "")];
+        let diff = compute_diff(&old, &new);
+        let mut buf = Vec::new();
+        write_diff_json(&mut buf, &diff).unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&buf).unwrap();
+        assert_eq!(json["summary"]["oldCount"], 1);
+        assert_eq!(json["summary"]["sizeDelta"], 100);
+        assert_eq!(json["changes"].as_array().unwrap().len(), 1);
+        assert_eq!(json["changes"][0]["pname"], "hello");
+        assert_eq!(json["changes"][0]["oldVersion"], "2.10");
+        assert_eq!(json["changes"][0]["newVersion"], "2.12");
+    }
+
+    fn make_component_with_meta(
+        pname: &str,
+        version: &str,
+        nar_size: u64,
+        cves: &[&str],
+        license_id: &str,
+        provenance: &str,
+    ) -> SbomComponent {
+        let mut c = make_component(pname, version, nar_size, "");
+        c.known_vulnerabilities = cves.iter().map(|s| (*s).to_owned()).collect();
+        if !license_id.is_empty() {
+            c.licenses = vec![SbomLicense {
+                spdx_id: Some(license_id.into()),
+                name: license_id.into(),
+            }];
+        }
+        if !provenance.is_empty() {
+            c.source_provenance = vec![provenance.into()];
+        }
+        c
+    }
+
+    #[test]
+    fn diff_detects_new_cve() {
+        let old = vec![make_component_with_meta(
+            "openssl",
+            "3.3.1",
+            5000,
+            &[],
+            "Apache-2.0",
+            "fromSource",
+        )];
+        let new = vec![make_component_with_meta(
+            "openssl",
+            "3.3.1",
+            5000,
+            &["CVE-2024-1234"],
+            "Apache-2.0",
+            "fromSource",
+        )];
+        // Same store path means no "changed" — but metadata differs.
+        // Force different store paths to trigger diff.
+        let mut new = new;
+        new[0].store_path = "/nix/store/different-openssl-3.3.1".into();
+
+        let diff = compute_diff(&old, &new);
+        assert_eq!(diff.summary.changed, 1);
+        let entry = &diff.changed[0];
+        assert!(
+            entry
+                .metadata_changes
+                .iter()
+                .any(|mc| mc.field == "cve:added" && mc.new_value.contains("CVE-2024-1234"))
+        );
+    }
+
+    #[test]
+    fn diff_detects_cve_fixed() {
+        let mut old = make_component_with_meta(
+            "openssl",
+            "3.3.1",
+            5000,
+            &["CVE-2024-1234"],
+            "Apache-2.0",
+            "fromSource",
+        );
+        old.store_path = "/nix/store/old-openssl-3.3.1".into();
+
+        let mut new =
+            make_component_with_meta("openssl", "3.3.2", 5100, &[], "Apache-2.0", "fromSource");
+        new.store_path = "/nix/store/new-openssl-3.3.2".into();
+
+        let diff = compute_diff(&[old], &[new]);
+        assert_eq!(diff.summary.changed, 1);
+        assert!(
+            diff.changed[0]
+                .metadata_changes
+                .iter()
+                .any(|mc| mc.field == "cve:removed" && mc.old_value.contains("CVE-2024-1234"))
+        );
+    }
+
+    #[test]
+    fn diff_detects_license_change() {
+        let mut old = make_component_with_meta("foo", "1.0", 100, &[], "MIT", "fromSource");
+        old.store_path = "/nix/store/old-foo-1.0".into();
+
+        let mut new =
+            make_component_with_meta("foo", "2.0", 100, &[], "GPL-3.0-or-later", "fromSource");
+        new.store_path = "/nix/store/new-foo-2.0".into();
+
+        let diff = compute_diff(&[old], &[new]);
+        assert_eq!(diff.summary.changed, 1);
+        let lic = diff.changed[0]
+            .metadata_changes
+            .iter()
+            .find(|mc| mc.field == "license")
+            .unwrap();
+        assert_eq!(lic.old_value, "MIT");
+        assert_eq!(lic.new_value, "GPL-3.0-or-later");
+    }
+
+    #[test]
+    fn diff_detects_provenance_change() {
+        let mut old = make_component_with_meta("blob", "1.0", 100, &[], "", "binaryNativeCode");
+        old.store_path = "/nix/store/old-blob-1.0".into();
+
+        let mut new = make_component_with_meta("blob", "1.1", 100, &[], "", "fromSource");
+        new.store_path = "/nix/store/new-blob-1.1".into();
+
+        let diff = compute_diff(&[old], &[new]);
+        let prov = diff.changed[0]
+            .metadata_changes
+            .iter()
+            .find(|mc| mc.field == "sourceProvenance")
+            .unwrap();
+        assert_eq!(prov.old_value, "binaryNativeCode");
+        assert_eq!(prov.new_value, "fromSource");
+    }
+
+    #[test]
+    fn diff_metadata_only_no_store_path_change() {
+        // Same store path but different metadata (e.g., manifest updated).
+        let mut old = make_component_with_meta("lib", "1.0", 100, &[], "MIT", "");
+        let mut new = make_component_with_meta("lib", "1.0", 100, &["CVE-2025-9999"], "MIT", "");
+        // Same store path — only metadata differs.
+        old.store_path = "/nix/store/same-lib-1.0".into();
+        new.store_path = "/nix/store/same-lib-1.0".into();
+
+        let diff = compute_diff(&[old], &[new]);
+        // Metadata-only change should still be reported.
+        assert_eq!(diff.summary.changed, 1);
+        assert_eq!(diff.changed[0].status, "metadata");
+        assert!(
+            diff.changed[0]
+                .metadata_changes
+                .iter()
+                .any(|mc| mc.field == "cve:added")
+        );
+    }
+
+    #[test]
+    fn diff_text_shows_cve_changes() {
+        let mut old = make_component("openssl", "3.3.1", 5000, "");
+        old.store_path = "/nix/store/old-openssl-3.3.1".into();
+        old.known_vulnerabilities = vec!["CVE-2024-0001".into()];
+
+        let mut new = make_component("openssl", "3.3.2", 5100, "");
+        new.store_path = "/nix/store/new-openssl-3.3.2".into();
+        new.known_vulnerabilities = vec!["CVE-2024-0002".into()];
+
+        let diff = compute_diff(&[old], &[new]);
+        let mut buf = Vec::new();
+        write_diff_text(&mut buf, &diff).unwrap();
+        let output = String::from_utf8(buf).unwrap();
+        assert!(output.contains("CVE+ CVE-2024-0002"));
+        assert!(output.contains("CVE- CVE-2024-0001"));
     }
 
     #[test]

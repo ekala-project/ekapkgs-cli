@@ -18,6 +18,12 @@ pub fn execute(command: ClosureCommand) -> color_eyre::Result<()> {
             buildtime,
             output,
         } => sbom::execute(&installable, &format, buildtime, output.as_deref()),
+        ClosureCommand::SbomDiff {
+            old,
+            new,
+            format,
+            output,
+        } => sbom::execute_diff(&old, &new, &format, output.as_deref()),
     }
 }
 

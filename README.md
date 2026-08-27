@@ -47,6 +47,9 @@ ekapkgs closure sbom nixpkgs#hello          # CycloneDX 1.5 SBOM (runtime closur
 ekapkgs closure sbom nixpkgs#hello --buildtime        # include build-time deps
 ekapkgs closure sbom nixpkgs#hello --format csv       # CSV output
 ekapkgs closure sbom nixpkgs#hello -o sbom.cdx.json   # write to file
+ekapkgs closure sbom-diff OLD NEW                      # diff two closures by package
+ekapkgs closure sbom-diff OLD NEW --format json        # structured JSON diff
+ekapkgs closure sbom-diff OLD NEW --format csv         # CSV diff
 ```
 
 For ekaos system closures, the SBOM includes authoritative metadata from the
@@ -54,6 +57,11 @@ embedded package manifest: CPE and PURL identifiers for vulnerability matching,
 SPDX license IDs, source provenance, and role classification (`default`, `user`,
 `service`, `home`, `boot`). For other installables, metadata is parsed
 heuristically from store path names.
+
+`sbom-diff` compares closures by package name and reports version changes,
+added/removed packages, and metadata changes including new or resolved CVEs,
+license changes, and source provenance shifts. Each entry includes a PURL
+identifier (when available) for downstream tooling correlation.
 
 ### Build log and dry run
 
