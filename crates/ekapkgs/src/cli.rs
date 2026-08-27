@@ -38,10 +38,11 @@ pub enum Command {
     /// Enter a shell with the given packages available.
     Shell {
         /// The installable(s) to make available.
+        #[arg(required = true)]
         installable: Vec<String>,
 
-        /// Extra arguments passed through to nix.
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        /// Extra arguments passed through to nix (after `--`).
+        #[arg(last = true, allow_hyphen_values = true)]
         extra: Vec<String>,
     },
 
@@ -158,6 +159,13 @@ pub enum Command {
         /// Upstream ekapkgs server URL.
         #[arg(long)]
         upstream: Option<String>,
+    },
+
+    /// Generate shell completions.
+    Completions {
+        /// Shell to generate completions for.
+        #[arg(value_enum)]
+        shell: clap_complete::Shell,
     },
 }
 

@@ -50,5 +50,6 @@ pub fn run(command: Command) -> color_eyre::Result<()> {
         Command::DryRun { installable, extra } => dry_run::execute(&installable, &extra),
         Command::Doctor => doctor::execute(),
         Command::Substituter { port, upstream } => substituter::execute(port, upstream),
+        Command::Completions { .. } => unreachable!("handled in main"),
     }
 }

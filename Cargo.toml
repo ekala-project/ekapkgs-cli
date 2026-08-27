@@ -27,6 +27,7 @@ color-eyre = "0.6"
 thiserror = "2"
 
 clap = { version = "4", features = ["derive", "color", "env"] }
+clap_complete = "4"
 clap-verbosity-flag = "3"
 
 tracing = "0.1"
