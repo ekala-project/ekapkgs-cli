@@ -28,8 +28,9 @@ pub fn execute(command: SystemCommand) -> color_eyre::Result<()> {
         SystemCommand::Rollback { dry_run } => cmd_rollback(dry_run),
         SystemCommand::PruneBootEntries {
             boot_mount,
+            gc,
             dry_run,
-        } => cmd_prune_boot_entries(&boot_mount, dry_run),
+        } => cmd_prune_boot_entries(&boot_mount, gc, dry_run),
     }
 }
 
@@ -271,7 +272,28 @@ fn cmd_rollback(dry_run: bool) -> color_eyre::Result<()> {
     Ok(())
 }
 
-fn cmd_prune_boot_entries(boot_mount: &str, dry_run: bool) -> color_eyre::Result<()> {
+fn cmd_prune_boot_entries(boot_mount: &str, gc: bool, dry_run: bool) -> color_eyre::Result<()> {
+    if gc {
+        tracing::info!("Running garbage collection...");
+        let mut cmd = Command::new("sudo");
+        cmd.arg("nix-collect-garbage").arg("-d");
+        if dry_run {
+            cmd.arg("--dry-run");
+        }
+        let status = cmd
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .status()
+            .map_err(|e| color_eyre::eyre::eyre!("failed to run nix-collect-garbage: {e}"))?;
+
+        if !status.success() {
+            return Err(color_eyre::eyre::eyre!(
+                "Garbage collection failed (exit {})",
+                status.code().unwrap_or(1)
+            ));
+        }
+    }
+
     let boot_path = Path::new(boot_mount);
     let entries_dir = boot_path.join("loader/entries");
     let nixos_dir = boot_path.join("EFI/nixos");

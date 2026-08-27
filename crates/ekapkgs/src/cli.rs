@@ -422,10 +422,18 @@ pub enum SystemCommand {
     /// `ekapkgs store gc`, their boot entries remain on the ESP.
     /// This command removes those orphaned entries and their
     /// associated kernel/initrd/UKI files.
+    ///
+    /// Use `--gc` to run garbage collection first, removing old
+    /// profile generations before pruning their boot entries.
     PruneBootEntries {
         /// Boot mount point (ESP or XBOOTLDR).
         #[arg(long, default_value = "/boot")]
         boot_mount: String,
+
+        /// Run `nix-collect-garbage -d` before pruning to remove
+        /// old generation profile links first.
+        #[arg(long)]
+        gc: bool,
 
         /// Only show what would be removed.
         #[arg(long)]
