@@ -9,6 +9,7 @@ mod flake;
 mod home;
 mod log;
 mod run;
+mod sbom;
 mod search;
 mod shell;
 mod store;

@@ -59,6 +59,7 @@ tonic = "0.12"
 
 prometheus = "0.13"
 
+uuid = { version = "1", features = ["v4"] }
 toml = "0.8"
 directories = "6"
 tempfile = "3"

@@ -258,6 +258,38 @@ pub enum ClosureCommand {
         /// Second installable or store path.
         b: String,
     },
+
+    /// Generate a Software Bill of Materials (SBOM) for a closure.
+    ///
+    /// Produces a CycloneDX 1.5 JSON document listing all packages in
+    /// the runtime closure with dependency relationships. For ekaos
+    /// system closures, enriches components with authoritative metadata
+    /// (license, role, provenance) from the embedded package manifest.
+    Sbom {
+        /// The installable to generate an SBOM for (e.g., `nixpkgs#hello`
+        /// or `.#config.system.build.toplevel`).
+        installable: String,
+
+        /// Output format.
+        #[arg(long, value_enum, default_value = "cyclonedx")]
+        format: SbomFormat,
+
+        /// Include build-time dependencies (default: runtime only).
+        #[arg(long)]
+        buildtime: bool,
+
+        /// Output file (default: stdout).
+        #[arg(short, long)]
+        output: Option<String>,
+    },
+}
+
+#[derive(Clone, clap::ValueEnum)]
+pub enum SbomFormat {
+    /// CycloneDX 1.5 JSON.
+    Cyclonedx,
+    /// CSV for quick inspection.
+    Csv,
 }
 
 #[derive(Subcommand)]

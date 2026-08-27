@@ -1,6 +1,6 @@
 # Agent Guide for ekapkgs-cli
 
-Nix CLI wrapper with a negotiated binary cache protocol. Two binaries: `ekapkgs` (client) and `ekapkgs-serve` (server). Resolves entire closures in a single gRPC round trip instead of ~3N HTTP requests. Also provides `system` (nixos-rebuild replacement), `home` (home-manager replacement), and `search` (package/option/file search) commands.
+Nix CLI wrapper with a negotiated binary cache protocol. Two binaries: `ekapkgs` (client) and `ekapkgs-serve` (server). Resolves entire closures in a single gRPC round trip instead of ~3N HTTP requests. Also provides `system` (nixos-rebuild replacement), `home` (home-manager replacement), `search` (package/option/file search), and `closure sbom` (SBOM generation) commands.
 
 ## Project Structure
 
@@ -176,6 +176,18 @@ Related ekaos module: `modules/config/home.nix` in the `core-pkgs` repo.
 Searches packages, configuration options, or files using ZSTD-compressed JSON indexes cached at `~/.cache/ekapkgs/indexes/`. Indexes auto-generate on first use via nix evaluation, or can be downloaded from a remote URL. File search integrates with `nix-locate` when available.
 
 Related ekaos file: `lib/generate-options-index.nix` for option index generation.
+
+### SBOM Generation (`ekapkgs closure sbom`)
+
+Generates CycloneDX 1.5 JSON or CSV Software Bill of Materials from a nix closure. For ekaos system closures, reads the embedded `package-manifest.json` for authoritative metadata (license, role, provenance). For arbitrary installables, falls back to store-path-name heuristics.
+
+- Default: runtime-only closure (avoids bootstrap/build-tool noise)
+- `--buildtime` flag includes full build closure
+- `--format cyclonedx` (default) or `--format csv`
+- `-o FILE` to write to file instead of stdout
+- Dependency graph derived from `nix path-info` references
+
+Related ekaos module: `modules/system/package-manifest.nix` in the `core-pkgs` repo generates the embedded manifest with role classification (`default`, `user`, `service`, `home`, `boot`).
 
 ### Client Configuration
 

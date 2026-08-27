@@ -1326,6 +1326,7 @@ dependencies = [
  "toml",
  "tonic",
  "tracing",
+ "uuid",
  "yansi",
  "zstd",
 ]
@@ -3907,6 +3908,7 @@ version = "1.25.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f053576934f05a761a402421fbbe3d425d9366f75f978806a037b3ca481abecc"
 dependencies = [
+ "getrandom 0.4.3",
  "js-sys",
  "wasm-bindgen",
 ]

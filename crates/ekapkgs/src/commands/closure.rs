@@ -2,6 +2,7 @@ use ekapkgs_nix::installable::Installable;
 use ekapkgs_nix::{NixCommand, store};
 
 use crate::cli::ClosureCommand;
+use crate::commands::sbom;
 
 pub fn execute(command: ClosureCommand) -> color_eyre::Result<()> {
     match command {
@@ -11,6 +12,12 @@ pub fn execute(command: ClosureCommand) -> color_eyre::Result<()> {
             dependency,
         } => cmd_why_depends(&installable, &dependency),
         ClosureCommand::Diff { a, b } => cmd_diff(&a, &b),
+        ClosureCommand::Sbom {
+            installable,
+            format,
+            buildtime,
+            output,
+        } => sbom::execute(&installable, &format, buildtime, output.as_deref()),
     }
 }
 
