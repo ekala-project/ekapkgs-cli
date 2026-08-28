@@ -27,6 +27,8 @@ struct EvalMeta {
     cpe: Option<String>,
     purl: Option<String>,
     #[serde(default)]
+    position: String,
+    #[serde(default)]
     source_provenance: Vec<String>,
     #[serde(default)]
     src_urls: Vec<String>,
@@ -72,6 +74,7 @@ const EXTRACT_META_NIX: &str = r#"
     }) licenses;
     cpe = identifiers.cpe or null;
     purl = identifiers.purl or null;
+    position = meta.position or "";
     sourceProvenance = provenance;
     srcUrls = srcUrls;
     storePaths = builtins.listToAttrs (map (o: {
@@ -306,6 +309,7 @@ struct SbomComponent {
     changelog: String,
     main_program: String,
     src_urls: Vec<String>,
+    position: String,
 }
 
 struct SbomLicense {
@@ -369,6 +373,7 @@ fn build_component(
             changelog: manifest_entry.changelog.clone(),
             main_program: manifest_entry.main_program.clone(),
             src_urls: Vec::new(),
+            position: String::new(),
         }
     } else if let Some(eval_meta) = eval_index.get(&entry.path) {
         SbomComponent {
@@ -396,6 +401,7 @@ fn build_component(
             changelog: eval_meta.changelog.clone(),
             main_program: eval_meta.main_program.clone(),
             src_urls: eval_meta.src_urls.clone(),
+            position: eval_meta.position.clone(),
         }
     } else {
         // Heuristic fallback.
@@ -418,6 +424,7 @@ fn build_component(
             changelog: String::new(),
             main_program: String::new(),
             src_urls: Vec::new(),
+            position: String::new(),
         }
     }
 }
@@ -470,6 +477,9 @@ fn coalesce_components(components: Vec<SbomComponent>) -> Vec<SbomComponent> {
             }
             if existing.src_urls.is_empty() && !c.src_urls.is_empty() {
                 existing.src_urls = c.src_urls;
+            }
+            if existing.position.is_empty() && !c.position.is_empty() {
+                existing.position = c.position;
             }
             existing
                 .known_vulnerabilities
@@ -593,25 +603,38 @@ fn write_cyclonedx(
         .unwrap_or("root")
         .to_owned();
 
-    let root_component = CdxComponent {
-        component_type: "application",
-        bom_ref: root_bom_ref.clone(),
-        name: installable.to_owned(),
-        version: String::new(),
-        description: None,
-        cpe: None,
-        purl: None,
-        licenses: Vec::new(),
-        external_references: Vec::new(),
-        properties: vec![CdxProperty {
-            name: "nix:store_path".into(),
-            value: root_path.to_owned(),
-        }],
+    // Find the coalesced component matching the root to use its full metadata.
+    let root_coalesced = components
+        .iter()
+        .find(|c| c.store_paths.iter().any(|p| p == root_path));
+
+    let root_component = if let Some(rc) = root_coalesced {
+        let mut cdx = component_to_cdx(rc);
+        cdx.component_type = "application";
+        cdx.bom_ref = root_bom_ref.clone();
+        cdx.name = installable.to_owned();
+        cdx
+    } else {
+        CdxComponent {
+            component_type: "application",
+            bom_ref: root_bom_ref.clone(),
+            name: installable.to_owned(),
+            version: String::new(),
+            description: None,
+            cpe: None,
+            purl: None,
+            licenses: Vec::new(),
+            external_references: Vec::new(),
+            properties: vec![CdxProperty {
+                name: "nix:output_path".into(),
+                value: root_path.to_owned(),
+            }],
+        }
     };
 
     let cdx_components: Vec<CdxComponent> = components
         .iter()
-        .filter(|c| !c.store_paths.contains(&root_path.to_owned()))
+        .filter(|c| !c.store_paths.iter().any(|p| p == root_path))
         .map(component_to_cdx)
         .collect();
 
@@ -719,7 +742,7 @@ fn component_to_cdx(c: &SbomComponent) -> CdxComponent {
         .store_paths
         .iter()
         .map(|p| CdxProperty {
-            name: "nix:store_path".into(),
+            name: "nix:output_path".into(),
             value: p.clone(),
         })
         .collect();
@@ -751,6 +774,12 @@ fn component_to_cdx(c: &SbomComponent) -> CdxComponent {
         properties.push(CdxProperty {
             name: "nix:mainProgram".into(),
             value: c.main_program.clone(),
+        });
+    }
+    if !c.position.is_empty() {
+        properties.push(CdxProperty {
+            name: "nix:position".into(),
+            value: c.position.clone(),
         });
     }
     for cve in &c.known_vulnerabilities {
@@ -1421,6 +1450,7 @@ mod tests {
             changelog: String::new(),
             main_program: String::new(),
             src_urls: Vec::new(),
+            position: String::new(),
         }
     }
 
@@ -1691,6 +1721,7 @@ mod tests {
             changelog: String::new(),
             main_program: "hello".into(),
             src_urls: Vec::new(),
+            position: String::new(),
         }];
 
         let closure_entries = vec![PathInfoEntry {
