@@ -43,7 +43,7 @@ ekapkgs cache auth status                   # show configured caches
 ekapkgs closure size nixpkgs#hello          # size breakdown by path
 ekapkgs closure why-depends nixpkgs#hello nixpkgs#glibc
 ekapkgs closure diff nixpkgs#hello nixpkgs#curl
-ekapkgs closure sbom nixpkgs#hello          # CycloneDX 1.5 SBOM (runtime closure)
+ekapkgs closure sbom nixpkgs#hello          # CycloneDX 1.7 SBOM (runtime closure)
 ekapkgs closure sbom nixpkgs#hello --buildtime        # include build-time deps
 ekapkgs closure sbom nixpkgs#hello --format csv       # CSV output
 ekapkgs closure sbom nixpkgs#hello -o sbom.cdx.json   # write to file
@@ -52,11 +52,12 @@ ekapkgs closure sbom-diff OLD NEW --format json        # structured JSON diff
 ekapkgs closure sbom-diff OLD NEW --format csv         # CSV diff
 ```
 
-For ekaos system closures, the SBOM includes authoritative metadata from the
-embedded package manifest: CPE and PURL identifiers for vulnerability matching,
-SPDX license IDs, source provenance, and role classification (`default`, `user`,
-`service`, `home`, `boot`). For other installables, metadata is parsed
-heuristically from store path names.
+Package metadata (CPE, PURL, license, description, source URLs) is extracted
+via `nix eval --apply` with recursive dependency traversal, enriching the
+full closure. Multi-output packages are coalesced into single components.
+Source distribution URLs are included as external references. For ekaos
+system closures, additional metadata (role, provenance) comes from the
+embedded package manifest.
 
 `sbom-diff` compares closures by package name and reports version changes,
 added/removed packages, and metadata changes including new or resolved CVEs,
@@ -161,6 +162,14 @@ ekapkgs deploy .#nixosConfigurations.prod --target-host prod-server --dry-run
 
 ```
 ekapkgs doctor                             # check nix, store, caches, disk space
+```
+
+### Shell completions
+
+```
+ekapkgs completions bash > ~/.bash_completion.d/ekapkgs
+ekapkgs completions zsh > ~/.zsh/completions/_ekapkgs
+ekapkgs completions fish > ~/.config/fish/completions/ekapkgs.fish
 ```
 
 ### Configuration

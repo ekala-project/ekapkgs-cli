@@ -275,7 +275,7 @@ pub enum ClosureCommand {
 
     /// Generate a Software Bill of Materials (SBOM) for a closure.
     ///
-    /// Produces a CycloneDX 1.5 JSON document listing all packages in
+    /// Produces a CycloneDX 1.7 JSON document listing all packages in
     /// the runtime closure with dependency relationships. For ekaos
     /// system closures, enriches components with authoritative metadata
     /// (license, role, provenance) from the embedded package manifest.
@@ -322,7 +322,7 @@ pub enum ClosureCommand {
 
 #[derive(Clone, clap::ValueEnum)]
 pub enum SbomFormat {
-    /// CycloneDX 1.5 JSON.
+    /// CycloneDX 1.7 JSON.
     Cyclonedx,
     /// CSV for quick inspection.
     Csv,

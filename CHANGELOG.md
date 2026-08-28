@@ -4,9 +4,14 @@
 
 ### Client
 
+- `completions` command generating shell completions for bash, zsh, fish, elvish, powershell
 - `registry list/add/remove/pin/unpin/resolve` commands for managing flake registries
 - `closure sbom-diff` command comparing closures by package with CVE, license, and provenance change tracking
-- `closure sbom` command generating CycloneDX 1.5 SBOMs with embedded package manifest support for CPE/PURL/license metadata
+- `closure sbom` command generating CycloneDX 1.7 SBOMs with CPE/PURL/license/source-distribution metadata
+  - Enriches components via `nix eval --apply` with recursive dependency walk for full closure metadata
+  - Multi-output packages coalesced into single components with aggregated size
+  - Source distribution URLs from `src.urls`/`src.url` with binary distribution detection
+  - Embedded package manifest support for ekaos system closures
 - `search packages/options/files` commands with cached ZSTD-compressed indexes
 - `system switch/boot/test/build/rollback/list-generations` commands replacing nixos-rebuild
   - `system prune-boot-entries` command removing orphaned boot entries with optional `--gc` pass

@@ -5,9 +5,167 @@ use ekapkgs_nix::installable::Installable;
 use ekapkgs_nix::manifest::{self, ManifestEntry, PackageManifest};
 use ekapkgs_nix::store::{self, PathInfoEntry};
 use ekapkgs_nix::{NixCommand, eval};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::cli::{SbomDiffFormat, SbomFormat};
+
+// ---------------------------------------------------------------------------
+// Nix eval --apply metadata extraction
+// ---------------------------------------------------------------------------
+
+/// Metadata extracted from a nix package via `nix eval --apply`.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct EvalMeta {
+    pname: String,
+    version: String,
+    description: String,
+    homepage: String,
+    changelog: String,
+    main_program: String,
+    license: Vec<EvalLicense>,
+    cpe: Option<String>,
+    purl: Option<String>,
+    #[serde(default)]
+    source_provenance: Vec<String>,
+    #[serde(default)]
+    src_urls: Vec<String>,
+    #[serde(default)]
+    store_paths: HashMap<String, String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct EvalLicense {
+    spdx_id: Option<String>,
+    full_name: String,
+}
+
+/// Nix expression fragment that extracts SBOM-relevant metadata from a package.
+const EXTRACT_META_NIX: &str = r#"
+  p: let
+    meta = p.meta or {};
+    identifiers = meta.identifiers or {};
+    license = meta.license or null;
+    licenses = if builtins.isList license then license
+               else if license != null then [ license ]
+               else [];
+    rawProv = meta.sourceProvenance or [];
+    provenance = builtins.map (s:
+      if builtins.isAttrs s then s.shortName or "unknown"
+      else builtins.toString s
+    ) rawProv;
+    src = p.src or null;
+    srcUrls = if src != null
+      then (src.urls or (if src ? url then [ src.url ] else []))
+      else [];
+  in {
+    pname = p.pname or (builtins.parseDrvName (p.name or "unknown")).name;
+    version = p.version or (builtins.parseDrvName (p.name or "unknown")).version;
+    description = meta.description or "";
+    homepage = meta.homepage or "";
+    changelog = meta.changelog or "";
+    mainProgram = meta.mainProgram or "";
+    license = map (l: {
+      spdxId = l.spdxId or null;
+      fullName = l.fullName or "unknown";
+    }) licenses;
+    cpe = identifiers.cpe or null;
+    purl = identifiers.purl or null;
+    sourceProvenance = provenance;
+    srcUrls = srcUrls;
+    storePaths = builtins.listToAttrs (map (o: {
+      name = o;
+      value = builtins.unsafeDiscardStringContext (builtins.toString p.${o});
+    }) (p.outputs or [ "out" ]));
+  }
+"#;
+
+/// Nix expression that recursively walks build dependencies and collects
+/// metadata for each package in the build closure.
+const EXTRACT_CLOSURE_META_NIX: &str = r#"
+  pkg: let
+    extractMeta = EXTRACT_META_PLACEHOLDER;
+
+    getDrvKey = p:
+      builtins.unsafeDiscardStringContext (builtins.toString (p.drvPath or p.outPath or p));
+
+    depAttrs = [
+      "buildInputs" "nativeBuildInputs" "propagatedBuildInputs"
+      "propagatedNativeBuildInputs" "depsBuildBuild"
+    ];
+
+    getDeps = p:
+      builtins.concatLists (map (attr:
+        let val = p.${attr} or []; in
+        if builtins.isList val then builtins.filter builtins.isAttrs val
+        else []
+      ) depAttrs);
+
+    collect = seen: queue:
+      if queue == [] then seen
+      else let
+        p = builtins.head queue;
+        rest = builtins.tail queue;
+        key = getDrvKey p;
+      in if seen ? ${key} then collect seen rest
+         else let
+           deps = getDeps p;
+           newSeen = seen // { ${key} = extractMeta p; };
+         in collect newSeen (rest ++ deps);
+
+  in builtins.attrValues (collect {} [ pkg ])
+"#;
+
+/// Evaluate package metadata for a single installable via `nix eval --apply`.
+fn eval_package_meta(installable: &str) -> Option<EvalMeta> {
+    let result: Result<EvalMeta, _> = NixCommand::new(&["eval", "--json"])
+        .arg(installable)
+        .arg("--apply")
+        .arg(EXTRACT_META_NIX)
+        .json();
+
+    match result {
+        Ok(meta) => Some(meta),
+        Err(e) => {
+            tracing::debug!("Failed to eval package meta: {e}");
+            None
+        },
+    }
+}
+
+/// Evaluate metadata for all packages in the build closure via `nix eval --apply`.
+fn eval_closure_meta(installable: &str) -> Option<Vec<EvalMeta>> {
+    let apply_expr = EXTRACT_CLOSURE_META_NIX.replace("EXTRACT_META_PLACEHOLDER", EXTRACT_META_NIX);
+
+    let result: Result<Vec<EvalMeta>, _> = NixCommand::new(&["eval", "--json"])
+        .arg(installable)
+        .arg("--apply")
+        .arg(&apply_expr)
+        .json();
+
+    match result {
+        Ok(metas) => {
+            tracing::info!("Eval found metadata for {} packages", metas.len());
+            Some(metas)
+        },
+        Err(e) => {
+            tracing::debug!("Failed to eval closure meta: {e}");
+            None
+        },
+    }
+}
+
+/// Build a store-path-keyed index from eval metadata.
+fn build_eval_meta_index(metas: &[EvalMeta]) -> HashMap<String, &EvalMeta> {
+    let mut index = HashMap::new();
+    for meta in metas {
+        for store_path in meta.store_paths.values() {
+            index.insert(store_path.clone(), meta);
+        }
+    }
+    index
+}
 
 pub fn execute(
     installable: &str,
@@ -85,6 +243,20 @@ fn build_sbom_components(
         tracing::info!("Found embedded package manifest");
     }
 
+    // Eval package metadata via nix eval --apply.
+    // Use recursive closure walk for both runtime and buildtime — the nix
+    // expression traverses buildInputs/propagatedBuildInputs which covers
+    // runtime deps too, enriching the entire closure with metadata.
+    let eval_spinner = ekapkgs_ui::progress::spinner("Evaluating package metadata...");
+    let eval_metas: Vec<EvalMeta> = eval_closure_meta(installable)
+        .or_else(|| {
+            // Fall back to single-package eval if closure walk fails.
+            eval_package_meta(installable).map(|m| vec![m])
+        })
+        .unwrap_or_default();
+    eval_spinner.finish_and_clear();
+    let eval_index = build_eval_meta_index(&eval_metas);
+
     let spinner = ekapkgs_ui::progress::spinner("Querying closure...");
     let closure_entries = if buildtime {
         let paths = eval::derivation_closure_paths(&inst)?;
@@ -103,10 +275,11 @@ fn build_sbom_components(
     spinner.finish_and_clear();
 
     let manifest_index = build_manifest_index(manifest.as_ref());
-    let components: Vec<SbomComponent> = closure_entries
+    let raw_components: Vec<SbomComponent> = closure_entries
         .iter()
-        .map(|entry| build_component(entry, &manifest_index))
+        .map(|entry| build_component(entry, &manifest_index, &eval_index))
         .collect();
+    let components = coalesce_components(raw_components);
 
     Ok((root_path, components, closure_entries))
 }
@@ -122,7 +295,7 @@ struct SbomComponent {
     description: String,
     homepage: String,
     licenses: Vec<SbomLicense>,
-    store_path: String,
+    store_paths: Vec<String>,
     nar_size: u64,
     role: String,
     source: String,
@@ -132,6 +305,7 @@ struct SbomComponent {
     known_vulnerabilities: Vec<String>,
     changelog: String,
     main_program: String,
+    src_urls: Vec<String>,
 }
 
 struct SbomLicense {
@@ -163,6 +337,7 @@ fn build_manifest_index(manifest: Option<&PackageManifest>) -> HashMap<String, &
 fn build_component(
     entry: &PathInfoEntry,
     manifest_index: &HashMap<String, &ManifestEntry>,
+    eval_index: &HashMap<String, &EvalMeta>,
 ) -> SbomComponent {
     let bom_ref = store::store_path_hash(&entry.path)
         .unwrap_or("unknown")
@@ -183,7 +358,7 @@ fn build_component(
                     name: l.full_name.clone(),
                 })
                 .collect(),
-            store_path: entry.path.clone(),
+            store_paths: vec![entry.path.clone()],
             nar_size: entry.nar_size,
             role: manifest_entry.role.clone(),
             source: manifest_entry.source.clone(),
@@ -193,6 +368,34 @@ fn build_component(
             known_vulnerabilities: manifest_entry.known_vulnerabilities.clone(),
             changelog: manifest_entry.changelog.clone(),
             main_program: manifest_entry.main_program.clone(),
+            src_urls: Vec::new(),
+        }
+    } else if let Some(eval_meta) = eval_index.get(&entry.path) {
+        SbomComponent {
+            bom_ref,
+            pname: eval_meta.pname.clone(),
+            version: eval_meta.version.clone(),
+            description: eval_meta.description.clone(),
+            homepage: eval_meta.homepage.clone(),
+            licenses: eval_meta
+                .license
+                .iter()
+                .map(|l| SbomLicense {
+                    spdx_id: l.spdx_id.clone(),
+                    name: l.full_name.clone(),
+                })
+                .collect(),
+            store_paths: vec![entry.path.clone()],
+            nar_size: entry.nar_size,
+            role: String::new(),
+            source: String::new(),
+            cpe: eval_meta.cpe.clone(),
+            purl: eval_meta.purl.clone(),
+            source_provenance: eval_meta.source_provenance.clone(),
+            known_vulnerabilities: Vec::new(),
+            changelog: eval_meta.changelog.clone(),
+            main_program: eval_meta.main_program.clone(),
+            src_urls: eval_meta.src_urls.clone(),
         }
     } else {
         // Heuristic fallback.
@@ -204,7 +407,7 @@ fn build_component(
             description: String::new(),
             homepage: String::new(),
             licenses: Vec::new(),
-            store_path: entry.path.clone(),
+            store_paths: vec![entry.path.clone()],
             nar_size: entry.nar_size,
             role: String::new(),
             source: String::new(),
@@ -214,12 +417,74 @@ fn build_component(
             known_vulnerabilities: Vec::new(),
             changelog: String::new(),
             main_program: String::new(),
+            src_urls: Vec::new(),
         }
     }
 }
 
+/// Merge components that share the same `(pname, version)` into a single
+/// entry. Multi-output nix packages produce one store path per output;
+/// this collapses them into one SBOM component with aggregated size and
+/// all store paths listed.
+fn coalesce_components(components: Vec<SbomComponent>) -> Vec<SbomComponent> {
+    let mut result: Vec<SbomComponent> = Vec::new();
+    let mut key_to_idx: HashMap<(String, String), usize> = HashMap::new();
+
+    for c in components {
+        let key = (c.pname.clone(), c.version.clone());
+        if let Some(&idx) = key_to_idx.get(&key) {
+            let existing = &mut result[idx];
+            existing.nar_size += c.nar_size;
+            existing.store_paths.extend(c.store_paths);
+
+            // Keep the richest metadata.
+            if existing.description.is_empty() && !c.description.is_empty() {
+                existing.description = c.description;
+            }
+            if existing.homepage.is_empty() && !c.homepage.is_empty() {
+                existing.homepage = c.homepage;
+            }
+            if existing.changelog.is_empty() && !c.changelog.is_empty() {
+                existing.changelog = c.changelog;
+            }
+            if existing.main_program.is_empty() && !c.main_program.is_empty() {
+                existing.main_program = c.main_program;
+            }
+            if existing.licenses.is_empty() && !c.licenses.is_empty() {
+                existing.licenses = c.licenses;
+            }
+            if existing.cpe.is_none() && c.cpe.is_some() {
+                existing.cpe = c.cpe;
+            }
+            if existing.purl.is_none() && c.purl.is_some() {
+                existing.purl = c.purl;
+            }
+            if existing.role.is_empty() && !c.role.is_empty() {
+                existing.role = c.role;
+            }
+            if existing.source.is_empty() && !c.source.is_empty() {
+                existing.source = c.source;
+            }
+            if existing.source_provenance.is_empty() && !c.source_provenance.is_empty() {
+                existing.source_provenance = c.source_provenance;
+            }
+            if existing.src_urls.is_empty() && !c.src_urls.is_empty() {
+                existing.src_urls = c.src_urls;
+            }
+            existing
+                .known_vulnerabilities
+                .extend(c.known_vulnerabilities);
+        } else {
+            key_to_idx.insert(key, result.len());
+            result.push(c);
+        }
+    }
+
+    result
+}
+
 // ---------------------------------------------------------------------------
-// CycloneDX 1.5 JSON output
+// CycloneDX 1.7 JSON output
 // ---------------------------------------------------------------------------
 
 #[derive(Serialize)]
@@ -237,12 +502,20 @@ struct CycloneDxBom {
 #[derive(Serialize)]
 struct CdxMetadata {
     timestamp: String,
-    tools: Vec<CdxTool>,
+    tools: CdxTools,
     component: CdxComponent,
 }
 
+/// CycloneDX 1.6+ tools format using `components` array.
 #[derive(Serialize)]
-struct CdxTool {
+struct CdxTools {
+    components: Vec<CdxToolComponent>,
+}
+
+#[derive(Serialize)]
+struct CdxToolComponent {
+    #[serde(rename = "type")]
+    component_type: &'static str,
     name: String,
     version: String,
 }
@@ -338,7 +611,7 @@ fn write_cyclonedx(
 
     let cdx_components: Vec<CdxComponent> = components
         .iter()
-        .filter(|c| c.store_path != root_path)
+        .filter(|c| !c.store_paths.contains(&root_path.to_owned()))
         .map(component_to_cdx)
         .collect();
 
@@ -361,6 +634,9 @@ fn write_cyclonedx(
                 .filter(|r| r.as_str() != entry.path)
                 .filter_map(|r| hash_set.get(r.as_str()).map(|h| (*h).to_owned()))
                 .collect();
+            if depends_on.is_empty() {
+                return None;
+            }
             Some(CdxDependency {
                 dep_ref,
                 depends_on,
@@ -370,15 +646,18 @@ fn write_cyclonedx(
 
     let bom = CycloneDxBom {
         bom_format: "CycloneDX",
-        spec_version: "1.5",
+        spec_version: "1.7",
         version: 1,
         serial_number: serial,
         metadata: CdxMetadata {
             timestamp,
-            tools: vec![CdxTool {
-                name: "ekapkgs".into(),
-                version: env!("CARGO_PKG_VERSION").into(),
-            }],
+            tools: CdxTools {
+                components: vec![CdxToolComponent {
+                    component_type: "application",
+                    name: "ekapkgs".into(),
+                    version: env!("CARGO_PKG_VERSION").into(),
+                }],
+            },
             component: root_component,
         },
         components: cdx_components,
@@ -419,10 +698,31 @@ fn component_to_cdx(c: &SbomComponent) -> CdxComponent {
         });
     }
 
-    let mut properties = vec![CdxProperty {
-        name: "nix:store_path".into(),
-        value: c.store_path.clone(),
-    }];
+    // Add source or binary distribution references.
+    let is_binary = c
+        .source_provenance
+        .iter()
+        .any(|s| s.contains("binary") || s.contains("Binary"));
+    let dist_type = if is_binary {
+        "distribution"
+    } else {
+        "source-distribution"
+    };
+    for url in &c.src_urls {
+        external_refs.push(CdxExternalRef {
+            ref_type: dist_type,
+            url: url.clone(),
+        });
+    }
+
+    let mut properties: Vec<CdxProperty> = c
+        .store_paths
+        .iter()
+        .map(|p| CdxProperty {
+            name: "nix:store_path".into(),
+            value: p.clone(),
+        })
+        .collect();
     if c.nar_size > 0 {
         properties.push(CdxProperty {
             name: "nix:nar_size".into(),
@@ -460,8 +760,14 @@ fn component_to_cdx(c: &SbomComponent) -> CdxComponent {
         });
     }
 
+    let component_type = if c.main_program.is_empty() {
+        "library"
+    } else {
+        "application"
+    };
+
     CdxComponent {
-        component_type: "library",
+        component_type,
         bom_ref: c.bom_ref.clone(),
         name: c.pname.clone(),
         version: c.version.clone(),
@@ -502,7 +808,7 @@ fn write_csv(mut writer: impl Write, components: &[SbomComponent]) -> color_eyre
             csv_escape(&license_str),
             csv_escape(&c.role),
             csv_escape(&c.source),
-            csv_escape(&c.store_path),
+            csv_escape(&c.store_paths.join(" ")),
             c.nar_size,
         )?;
     }
@@ -720,7 +1026,7 @@ fn compute_diff(old: &[SbomComponent], new: &[SbomComponent]) -> SbomDiff {
     for (pname, old_comp) in &old_by_name {
         if let Some(new_comp) = new_by_name.get(pname) {
             let metadata_changes = diff_metadata(old_comp, new_comp);
-            let path_changed = old_comp.store_path != new_comp.store_path;
+            let path_changed = old_comp.store_paths != new_comp.store_paths;
 
             if path_changed || !metadata_changes.is_empty() {
                 let delta = new_comp.nar_size as i64 - old_comp.nar_size as i64;
@@ -1066,7 +1372,8 @@ mod tests {
         let mut index = HashMap::new();
         index.insert("/nix/store/abc123-nginx-1.26.2".to_owned(), &manifest_entry);
 
-        let component = build_component(&entry, &index);
+        let eval_index = HashMap::new();
+        let component = build_component(&entry, &index, &eval_index);
         assert_eq!(component.pname, "nginx");
         assert_eq!(component.version, "1.26.2");
         assert_eq!(component.role, "service");
@@ -1087,7 +1394,8 @@ mod tests {
         };
 
         let index = HashMap::new();
-        let component = build_component(&entry, &index);
+        let eval_index = HashMap::new();
+        let component = build_component(&entry, &index, &eval_index);
         assert_eq!(component.pname, "curl");
         assert_eq!(component.version, "8.5.0");
         assert!(component.role.is_empty());
@@ -1102,7 +1410,7 @@ mod tests {
             description: String::new(),
             homepage: String::new(),
             licenses: Vec::new(),
-            store_path: format!("/nix/store/hash-{pname}-{version}"),
+            store_paths: vec![format!("/nix/store/hash-{pname}-{version}")],
             nar_size,
             role: role.into(),
             source: String::new(),
@@ -1112,6 +1420,7 @@ mod tests {
             known_vulnerabilities: Vec::new(),
             changelog: String::new(),
             main_program: String::new(),
+            src_urls: Vec::new(),
         }
     }
 
@@ -1243,7 +1552,7 @@ mod tests {
         // Same store path means no "changed" — but metadata differs.
         // Force different store paths to trigger diff.
         let mut new = new;
-        new[0].store_path = "/nix/store/different-openssl-3.3.1".into();
+        new[0].store_paths = vec!["/nix/store/different-openssl-3.3.1".into()];
 
         let diff = compute_diff(&old, &new);
         assert_eq!(diff.summary.changed, 1);
@@ -1266,11 +1575,11 @@ mod tests {
             "Apache-2.0",
             "fromSource",
         );
-        old.store_path = "/nix/store/old-openssl-3.3.1".into();
+        old.store_paths = vec!["/nix/store/old-openssl-3.3.1".into()];
 
         let mut new =
             make_component_with_meta("openssl", "3.3.2", 5100, &[], "Apache-2.0", "fromSource");
-        new.store_path = "/nix/store/new-openssl-3.3.2".into();
+        new.store_paths = vec!["/nix/store/new-openssl-3.3.2".into()];
 
         let diff = compute_diff(&[old], &[new]);
         assert_eq!(diff.summary.changed, 1);
@@ -1285,11 +1594,11 @@ mod tests {
     #[test]
     fn diff_detects_license_change() {
         let mut old = make_component_with_meta("foo", "1.0", 100, &[], "MIT", "fromSource");
-        old.store_path = "/nix/store/old-foo-1.0".into();
+        old.store_paths = vec!["/nix/store/old-foo-1.0".into()];
 
         let mut new =
             make_component_with_meta("foo", "2.0", 100, &[], "GPL-3.0-or-later", "fromSource");
-        new.store_path = "/nix/store/new-foo-2.0".into();
+        new.store_paths = vec!["/nix/store/new-foo-2.0".into()];
 
         let diff = compute_diff(&[old], &[new]);
         assert_eq!(diff.summary.changed, 1);
@@ -1305,10 +1614,10 @@ mod tests {
     #[test]
     fn diff_detects_provenance_change() {
         let mut old = make_component_with_meta("blob", "1.0", 100, &[], "", "binaryNativeCode");
-        old.store_path = "/nix/store/old-blob-1.0".into();
+        old.store_paths = vec!["/nix/store/old-blob-1.0".into()];
 
         let mut new = make_component_with_meta("blob", "1.1", 100, &[], "", "fromSource");
-        new.store_path = "/nix/store/new-blob-1.1".into();
+        new.store_paths = vec!["/nix/store/new-blob-1.1".into()];
 
         let diff = compute_diff(&[old], &[new]);
         let prov = diff.changed[0]
@@ -1326,8 +1635,8 @@ mod tests {
         let mut old = make_component_with_meta("lib", "1.0", 100, &[], "MIT", "");
         let mut new = make_component_with_meta("lib", "1.0", 100, &["CVE-2025-9999"], "MIT", "");
         // Same store path — only metadata differs.
-        old.store_path = "/nix/store/same-lib-1.0".into();
-        new.store_path = "/nix/store/same-lib-1.0".into();
+        old.store_paths = vec!["/nix/store/same-lib-1.0".into()];
+        new.store_paths = vec!["/nix/store/same-lib-1.0".into()];
 
         let diff = compute_diff(&[old], &[new]);
         // Metadata-only change should still be reported.
@@ -1344,11 +1653,11 @@ mod tests {
     #[test]
     fn diff_text_shows_cve_changes() {
         let mut old = make_component("openssl", "3.3.1", 5000, "");
-        old.store_path = "/nix/store/old-openssl-3.3.1".into();
+        old.store_paths = vec!["/nix/store/old-openssl-3.3.1".into()];
         old.known_vulnerabilities = vec!["CVE-2024-0001".into()];
 
         let mut new = make_component("openssl", "3.3.2", 5100, "");
-        new.store_path = "/nix/store/new-openssl-3.3.2".into();
+        new.store_paths = vec!["/nix/store/new-openssl-3.3.2".into()];
         new.known_vulnerabilities = vec!["CVE-2024-0002".into()];
 
         let diff = compute_diff(&[old], &[new]);
@@ -1371,7 +1680,7 @@ mod tests {
                 spdx_id: Some("GPL-3.0-or-later".into()),
                 name: "GNU GPLv3+".into(),
             }],
-            store_path: "/nix/store/abc123-hello-2.10".into(),
+            store_paths: vec!["/nix/store/abc123-hello-2.10".into()],
             nar_size: 1024,
             role: "user".into(),
             source: "environment.systemPackages".into(),
@@ -1381,6 +1690,7 @@ mod tests {
             known_vulnerabilities: Vec::new(),
             changelog: String::new(),
             main_program: "hello".into(),
+            src_urls: Vec::new(),
         }];
 
         let closure_entries = vec![PathInfoEntry {
@@ -1402,14 +1712,17 @@ mod tests {
 
         let json: serde_json::Value = serde_json::from_slice(&buf).unwrap();
         assert_eq!(json["bomFormat"], "CycloneDX");
-        assert_eq!(json["specVersion"], "1.5");
+        assert_eq!(json["specVersion"], "1.7");
         assert!(
             json["serialNumber"]
                 .as_str()
                 .unwrap()
                 .starts_with("urn:uuid:")
         );
-        assert_eq!(json["metadata"]["tools"][0]["name"], "ekapkgs");
+        assert_eq!(
+            json["metadata"]["tools"]["components"][0]["name"],
+            "ekapkgs"
+        );
         // Root component is in metadata, not in components list (filtered out).
         assert_eq!(json["components"].as_array().unwrap().len(), 0);
     }

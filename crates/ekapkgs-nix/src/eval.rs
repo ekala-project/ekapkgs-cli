@@ -11,12 +11,27 @@ pub struct BuildOutput {
     pub outputs: std::collections::HashMap<String, String>,
 }
 
+/// Versioned wrapper for `nix derivation show` output (format version >= 4).
+#[derive(Debug, Deserialize)]
+pub struct DerivationShowOutput {
+    pub derivations: std::collections::HashMap<String, DerivationInfo>,
+    #[allow(dead_code)]
+    pub version: Option<u32>,
+}
+
 /// Result of evaluating a derivation closure via `nix derivation show -r`.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DerivationInfo {
-    pub input_drvs: Option<std::collections::HashMap<String, serde_json::Value>>,
+    pub inputs: Option<DerivationInputs>,
     pub outputs: std::collections::HashMap<String, DerivationOutput>,
+}
+
+/// Input derivations and sources for a derivation.
+#[derive(Debug, Deserialize)]
+pub struct DerivationInputs {
+    #[serde(default)]
+    pub drvs: std::collections::HashMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -44,17 +59,21 @@ pub fn eval_build_outputs(installable: &Installable) -> Result<Vec<BuildOutput>,
 /// Calls `nix derivation show -r <installable>` and extracts all output
 /// store paths from the derivation graph.
 pub fn derivation_closure_paths(installable: &Installable) -> Result<Vec<String>, NixError> {
-    let derivations: std::collections::HashMap<String, DerivationInfo> =
-        NixCommand::new(&["derivation", "show"])
-            .arg("-r")
-            .arg(&installable.raw)
-            .json()?;
+    let show: DerivationShowOutput = NixCommand::new(&["derivation", "show"])
+        .arg("-r")
+        .arg(&installable.raw)
+        .json()?;
 
     let mut paths = Vec::new();
-    for drv in derivations.values() {
+    for drv in show.derivations.values() {
         for output in drv.outputs.values() {
             if let Some(path) = &output.path {
-                paths.push(path.clone());
+                // New format uses bare hash-name; normalize to full store paths.
+                if path.starts_with("/nix/store/") {
+                    paths.push(path.clone());
+                } else {
+                    paths.push(format!("/nix/store/{path}"));
+                }
             }
         }
     }
@@ -80,18 +99,21 @@ pub fn derivation_graph_json(installable: &Installable) -> Result<Vec<u8>, NixEr
 /// FODs are derivations whose outputs have a `hash` field set. These represent
 /// fetched sources (tarballs, git checkouts, patches) rather than build results.
 pub fn extract_fod_paths(installable: &Installable) -> Result<Vec<String>, NixError> {
-    let derivations: std::collections::HashMap<String, DerivationInfo> =
-        NixCommand::new(&["derivation", "show"])
-            .arg("-r")
-            .arg(&installable.raw)
-            .json()?;
+    let show: DerivationShowOutput = NixCommand::new(&["derivation", "show"])
+        .arg("-r")
+        .arg(&installable.raw)
+        .json()?;
 
     let mut fod_paths = Vec::new();
-    for drv in derivations.values() {
+    for drv in show.derivations.values() {
         for output in drv.outputs.values() {
             if output.hash.is_some() {
                 if let Some(path) = &output.path {
-                    fod_paths.push(path.clone());
+                    if path.starts_with("/nix/store/") {
+                        fod_paths.push(path.clone());
+                    } else {
+                        fod_paths.push(format!("/nix/store/{path}"));
+                    }
                 }
             }
         }
