@@ -11,6 +11,7 @@
   - Enriches components via `nix eval --apply` with recursive dependency walk for full closure metadata
   - Multi-output packages coalesced into single components with aggregated size
   - Source distribution URLs from `src.urls`/`src.url` with binary distribution detection
+  - `nix:position` and `nix:output_path` properties on each component
   - Embedded package manifest support for ekaos system closures
 - `search packages/options/files` commands with cached ZSTD-compressed indexes
 - `system switch/boot/test/build/rollback/list-generations` commands replacing nixos-rebuild

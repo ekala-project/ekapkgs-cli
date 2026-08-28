@@ -52,12 +52,14 @@ ekapkgs closure sbom-diff OLD NEW --format json        # structured JSON diff
 ekapkgs closure sbom-diff OLD NEW --format csv         # CSV diff
 ```
 
-Package metadata (CPE, PURL, license, description, source URLs) is extracted
-via `nix eval --apply` with recursive dependency traversal, enriching the
-full closure. Multi-output packages are coalesced into single components.
-Source distribution URLs are included as external references. For ekaos
-system closures, additional metadata (role, provenance) comes from the
-embedded package manifest.
+Package metadata (CPE, PURL, license, description, source URLs, position)
+is extracted via `nix eval --apply` with recursive dependency traversal,
+enriching the full closure. Multi-output packages are coalesced into single
+components. Each component includes `nix:output_path` and `nix:position`
+properties, source distribution external references, and is typed as
+`application` when `meta.mainProgram` is defined. For ekaos system closures,
+additional metadata (role, provenance) comes from the embedded package
+manifest.
 
 `sbom-diff` compares closures by package name and reports version changes,
 added/removed packages, and metadata changes including new or resolved CVEs,
