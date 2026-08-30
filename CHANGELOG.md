@@ -17,6 +17,10 @@
 - `system switch/boot/test/build/rollback/list-generations` commands replacing nixos-rebuild
   - `system prune-boot-entries` command removing orphaned boot entries with optional `--gc` pass
 - `home switch/build/generations/packages` commands replacing home-manager
+  - `home packages add/remove/list/export/import` commands for imperative package management
+  - Packages managed via `~/.config/ekapkgs/home-packages.toml` manifest
+  - Immediate install/remove via dedicated nix profile at `~/.ekapkgs-packages`
+  - Export/import manifest for syncing packages across machines
 - `deploy` command with build, transfer, and activation lifecycle
 - `develop` command with cache-aware pre-fetching for dev environments
 - `flake show/metadata/update-diff` commands for flake introspection

@@ -485,8 +485,57 @@ pub enum HomeCommand {
     /// List home configuration generations.
     Generations,
 
-    /// List packages installed via home configuration.
-    Packages,
+    /// Manage imperatively-installed home packages.
+    Packages {
+        #[command(subcommand)]
+        command: HomePackagesCommand,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum HomePackagesCommand {
+    /// Add packages to the home configuration.
+    Add {
+        /// Package names or attribute paths (e.g., `alacritty`,
+        /// `python311Packages.requests`).
+        #[arg(required = true)]
+        packages: Vec<String>,
+
+        /// Flake to resolve packages from (overrides manifest default).
+        #[arg(long)]
+        flake: Option<String>,
+    },
+
+    /// Remove packages from the home configuration.
+    Remove {
+        /// Package names to remove.
+        #[arg(required = true)]
+        packages: Vec<String>,
+    },
+
+    /// List imperatively-installed packages.
+    List {
+        /// Output as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Export the package manifest for syncing to another machine.
+    Export {
+        /// Output file (default: stdout).
+        #[arg(short, long)]
+        output: Option<String>,
+    },
+
+    /// Import a package manifest from another machine.
+    Import {
+        /// Path to the manifest file.
+        file: String,
+
+        /// Merge with existing packages instead of replacing.
+        #[arg(long)]
+        merge: bool,
+    },
 }
 
 #[derive(Subcommand)]
