@@ -16,6 +16,10 @@
 - `search packages/options/files` commands with cached ZSTD-compressed indexes
 - `system switch/boot/test/build/rollback/list-generations` commands replacing nixos-rebuild
   - `system prune-boot-entries` command removing orphaned boot entries with optional `--gc` pass
+  - `system packages add/remove/list/export/import` commands for imperative system package management
+  - System packages managed via `~/.config/ekapkgs/system-packages.toml` manifest
+  - Immediate install/remove via dedicated nix profile at `/nix/var/nix/profiles/ekapkgs-system-packages`
+  - Export/import manifest for syncing system packages across machines
 - `home switch/build/generations/packages` commands replacing home-manager
   - `home packages add/remove/list/export/import` commands for imperative package management
   - Packages managed via `~/.config/ekapkgs/home-packages.toml` manifest

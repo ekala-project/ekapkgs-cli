@@ -4,11 +4,15 @@ use std::process::{Command, Stdio};
 
 use ekapkgs_nix::installable::Installable;
 use ekapkgs_nix::{NixCommand, eval};
+use yansi::Paint;
 
-use crate::cli::SystemCommand;
-use crate::config::ClientConfig;
+use crate::cli::{SystemCommand, SystemPackagesCommand};
+use crate::config::{ClientConfig, SystemPackageEntry, SystemPackages};
 
 const SYSTEM_PROFILE: &str = "/nix/var/nix/profiles/system";
+
+/// Nix profile for imperatively-installed system packages.
+const PACKAGES_PROFILE: &str = "/nix/var/nix/profiles/ekapkgs-system-packages";
 
 pub fn execute(command: SystemCommand) -> color_eyre::Result<()> {
     match command {
@@ -31,6 +35,7 @@ pub fn execute(command: SystemCommand) -> color_eyre::Result<()> {
             gc,
             dry_run,
         } => cmd_prune_boot_entries(&boot_mount, gc, dry_run),
+        SystemCommand::Packages { command } => cmd_packages(command),
     }
 }
 
@@ -493,6 +498,215 @@ fn prune_uki_files(
 
     Ok(removed)
 }
+
+// ---------------------------------------------------------------------------
+// Packages
+// ---------------------------------------------------------------------------
+
+fn cmd_packages(command: SystemPackagesCommand) -> color_eyre::Result<()> {
+    match command {
+        SystemPackagesCommand::Add { packages, flake } => {
+            cmd_packages_add(&packages, flake.as_deref())
+        },
+        SystemPackagesCommand::Remove { packages } => cmd_packages_remove(&packages),
+        SystemPackagesCommand::List { json } => cmd_packages_list(json),
+        SystemPackagesCommand::Export { output } => cmd_packages_export(output.as_deref()),
+        SystemPackagesCommand::Import { file, merge } => cmd_packages_import(&file, merge),
+    }
+}
+
+fn cmd_packages_add(packages: &[String], flake_override: Option<&str>) -> color_eyre::Result<()> {
+    let mut manifest = SystemPackages::load()?;
+    let mut added = 0u32;
+
+    for name in packages {
+        let entry = SystemPackageEntry {
+            name: name.clone(),
+            flake: flake_override.map(str::to_owned),
+        };
+
+        let installable = manifest.resolve_installable(&entry);
+
+        if !manifest.add(entry) {
+            tracing::warn!("{name} is already in the manifest, skipping");
+            continue;
+        }
+
+        tracing::info!("Installing {installable}...");
+        let status = Command::new("sudo")
+            .arg("nix")
+            .arg("profile")
+            .arg("install")
+            .arg("--profile")
+            .arg(PACKAGES_PROFILE)
+            .arg(&installable)
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .status()
+            .map_err(|e| color_eyre::eyre::eyre!("failed to run nix profile install: {e}"))?;
+
+        if !status.success() {
+            return Err(color_eyre::eyre::eyre!(
+                "Failed to install {installable} (exit {})",
+                status.code().unwrap_or(1)
+            ));
+        }
+
+        added += 1;
+    }
+
+    manifest.save()?;
+
+    if added > 0 {
+        println!(
+            "Added {added} package(s) to {}",
+            SystemPackages::manifest_path().display()
+        );
+    }
+
+    Ok(())
+}
+
+fn cmd_packages_remove(packages: &[String]) -> color_eyre::Result<()> {
+    let mut manifest = SystemPackages::load()?;
+    let mut removed = 0u32;
+
+    for name in packages {
+        if !manifest.remove(name) {
+            tracing::warn!("{name} is not in the manifest, skipping");
+            continue;
+        }
+
+        tracing::info!("Removing {name} from profile...");
+        let status = Command::new("sudo")
+            .arg("nix")
+            .arg("profile")
+            .arg("remove")
+            .arg("--profile")
+            .arg(PACKAGES_PROFILE)
+            .arg(name)
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .status();
+
+        match status {
+            Ok(s) if !s.success() => {
+                tracing::warn!("Failed to remove {name} from nix profile");
+            },
+            Err(e) => {
+                tracing::warn!("Failed to remove {name} from nix profile: {e}");
+            },
+            _ => {},
+        }
+
+        removed += 1;
+    }
+
+    manifest.save()?;
+
+    if removed > 0 {
+        println!("Removed {removed} package(s)");
+    }
+
+    Ok(())
+}
+
+fn cmd_packages_list(json_output: bool) -> color_eyre::Result<()> {
+    let manifest = SystemPackages::load()?;
+
+    if json_output {
+        println!("{}", serde_json::to_string_pretty(&manifest.packages)?);
+        return Ok(());
+    }
+
+    if manifest.packages.is_empty() {
+        println!("No system packages installed.");
+        println!(
+            "{}",
+            "Use `ekapkgs system packages add <package>` to add one.".dim()
+        );
+        return Ok(());
+    }
+
+    for entry in &manifest.packages {
+        let flake_display = entry.flake.as_deref().unwrap_or(&manifest.flake);
+        println!(
+            "  {} {}",
+            entry.name.bold(),
+            format!("({flake_display})").dim()
+        );
+    }
+    println!("\n{} package(s)", manifest.packages.len());
+
+    Ok(())
+}
+
+fn cmd_packages_export(output: Option<&str>) -> color_eyre::Result<()> {
+    let manifest = SystemPackages::load()?;
+    let contents = toml::to_string_pretty(&manifest)?;
+
+    if let Some(path) = output {
+        std::fs::write(path, &contents)?;
+        println!("Exported {} package(s) to {path}", manifest.packages.len());
+    } else {
+        print!("{contents}");
+    }
+
+    Ok(())
+}
+
+fn cmd_packages_import(file: &str, merge: bool) -> color_eyre::Result<()> {
+    let contents = std::fs::read_to_string(file)?;
+    let imported: SystemPackages = toml::from_str(&contents)?;
+
+    let mut manifest = if merge {
+        let mut current = SystemPackages::load()?;
+        for entry in imported.packages {
+            current.remove(&entry.name);
+            current.packages.push(entry);
+        }
+        current
+    } else {
+        imported.clone()
+    };
+
+    manifest.version = 1;
+    manifest.save()?;
+
+    // Sync the nix profile: install all packages from the manifest.
+    let mut installed = 0u32;
+    for entry in &manifest.packages {
+        let installable = manifest.resolve_installable(entry);
+        tracing::info!("Installing {installable}...");
+        let status = Command::new("sudo")
+            .arg("nix")
+            .arg("profile")
+            .arg("install")
+            .arg("--profile")
+            .arg(PACKAGES_PROFILE)
+            .arg(&installable)
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .status();
+
+        match status {
+            Ok(s) if s.success() => installed += 1,
+            Ok(_) => tracing::warn!("Failed to install {}", entry.name),
+            Err(e) => tracing::warn!("Failed to install {}: {e}", entry.name),
+        }
+    }
+
+    println!(
+        "Imported {} package(s) ({installed} installed to profile)",
+        manifest.packages.len()
+    );
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Build output
+// ---------------------------------------------------------------------------
 
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase")]

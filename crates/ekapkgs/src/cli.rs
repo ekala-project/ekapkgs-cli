@@ -631,6 +631,58 @@ pub enum SystemCommand {
         #[arg(long)]
         dry_run: bool,
     },
+
+    /// Manage imperatively-installed system packages.
+    Packages {
+        #[command(subcommand)]
+        command: SystemPackagesCommand,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum SystemPackagesCommand {
+    /// Add packages to the system.
+    Add {
+        /// Package names or attribute paths (e.g., `htop`,
+        /// `linuxPackages.perf`).
+        #[arg(required = true)]
+        packages: Vec<String>,
+
+        /// Flake to resolve packages from (overrides manifest default).
+        #[arg(long)]
+        flake: Option<String>,
+    },
+
+    /// Remove packages from the system.
+    Remove {
+        /// Package names to remove.
+        #[arg(required = true)]
+        packages: Vec<String>,
+    },
+
+    /// List imperatively-installed system packages.
+    List {
+        /// Output as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Export the system package manifest.
+    Export {
+        /// Output file (default: stdout).
+        #[arg(short, long)]
+        output: Option<String>,
+    },
+
+    /// Import a system package manifest.
+    Import {
+        /// Path to the manifest file.
+        file: String,
+
+        /// Merge with existing packages instead of replacing.
+        #[arg(long)]
+        merge: bool,
+    },
 }
 
 #[derive(Subcommand)]
