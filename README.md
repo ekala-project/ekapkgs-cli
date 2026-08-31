@@ -123,6 +123,20 @@ ekapkgs system prune-boot-entries --gc     # garbage collect first, then prune
 ekapkgs system prune-boot-entries --dry-run
 ```
 
+#### Imperative system packages
+
+Add packages to the system imperatively. Managed via
+`~/.config/ekapkgs/system-packages.toml` with immediate install (via sudo)
+into a dedicated nix profile at `/nix/var/nix/profiles/ekapkgs-system-packages`:
+
+```
+ekapkgs system packages add htop vim         # add and install (requires sudo)
+ekapkgs system packages remove htop          # remove from manifest and profile
+ekapkgs system packages list                 # list installed packages
+ekapkgs system packages export -o sys.toml   # export manifest
+ekapkgs system packages import sys.toml      # import and install
+```
+
 ### Home configuration
 
 Replaces `home-manager` for per-user dotfiles, packages, and environment:
@@ -131,11 +145,109 @@ Replaces `home-manager` for per-user dotfiles, packages, and environment:
 ekapkgs home switch                        # build and activate home config
 ekapkgs home build                         # build only, print store path
 ekapkgs home generations                   # list home generations
-ekapkgs home packages                      # list packages in active profile
 ```
 
 Home configuration is defined in the ekaos module system under
 `users.users.<name>` and built via `system.build.home`.
+
+#### Imperative home packages
+
+Add packages to your home without editing nix configuration. Managed via
+`~/.config/ekapkgs/home-packages.toml` with immediate install into a
+dedicated nix profile at `~/.ekapkgs-packages`:
+
+```
+ekapkgs home packages add alacritty ripgrep  # add and install immediately
+ekapkgs home packages remove alacritty       # remove from manifest and profile
+ekapkgs home packages list                   # list installed packages
+ekapkgs home packages list --json            # machine-readable output
+ekapkgs home packages export                 # print manifest to stdout
+ekapkgs home packages export -o pkgs.toml    # export to file
+ekapkgs home packages import pkgs.toml       # import and install
+ekapkgs home packages import pkgs.toml --merge  # merge with existing
+```
+
+Packages can come from different flakes:
+
+```
+ekapkgs home packages add my-tool --flake github:user/repo
+```
+
+### Directory environments
+
+Per-directory package environments with automatic activation, similar to
+direnv. Each directory can have a `.ekapkgs-env.toml` manifest specifying
+packages and flake dev shells:
+
+```
+ekapkgs env init                           # create .ekapkgs-env.toml
+ekapkgs env add jq ripgrep fd              # add packages
+ekapkgs env remove fd                      # remove a package
+ekapkgs env list                           # show packages and flakes
+ekapkgs env reload                         # rebuild profile from manifest
+ekapkgs env allow                          # trust this environment
+ekapkgs env disallow                       # revoke trust
+```
+
+#### Composable flake dev shells
+
+Multiple flakes can be composed into a single environment. Each can
+specify a dev shell attribute, pinned revision, and input overrides:
+
+```
+ekapkgs env flake-add .                    # add local flake
+ekapkgs env flake-add github:user/repo --devshell python
+ekapkgs env flake-add github:other/tools --rev abc123
+ekapkgs env flake-add github:foo/bar --override-input nixpkgs=github:NixOS/nixpkgs/nixos-24.05
+ekapkgs env flake-remove github:user/repo
+ekapkgs env flake-pin github:other/tools   # pin to current revision
+ekapkgs env flake-pin github:other/tools --rev deadbeef
+```
+
+#### Shell hooks
+
+Add to your shell configuration for automatic activation on `cd`:
+
+```bash
+# ~/.bashrc
+eval "$(ekapkgs env hook bash)"
+
+# ~/.zshrc
+eval "$(ekapkgs env hook zsh)"
+
+# ~/.config/fish/config.fish
+ekapkgs env hook fish | source
+```
+
+The hook automatically activates when you enter a directory with a trusted
+`.ekapkgs-env.toml`, deactivates when you leave, and reloads when
+`flake.nix`, `flake.lock`, or the manifest changes.
+
+#### Manifest format
+
+```toml
+version = 1
+flake = "nixpkgs"
+
+[[packages]]
+name = "jq"
+
+[[packages]]
+name = "my-tool"
+flake = "github:user/repo"
+
+[[flakes]]
+ref_ = "."
+devshell = "default"
+
+[[flakes]]
+ref_ = "github:other/tools"
+devshell = "default"
+rev = "abc123def456"
+
+[flakes.inputs]
+nixpkgs = "github:NixOS/nixpkgs/nixos-24.05"
+```
 
 ### Search
 
