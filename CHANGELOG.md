@@ -25,12 +25,14 @@
   - Packages managed via `~/.config/ekapkgs/home-packages.toml` manifest
   - Immediate install/remove via dedicated nix profile at `~/.ekapkgs-packages`
   - Export/import manifest for syncing packages across machines
-- `env init/add/remove/list/reload/allow/disallow/hook` command for directory-scoped package environments
-  - Per-directory `.ekapkgs-env.toml` manifest with automatic nix profile management
-  - `use_flake = true` option to activate the directory's `flake.nix` dev shell
+- `env` command for directory-scoped package environments (direnv-style)
+  - `env init/add/remove/list/reload/allow/disallow/hook` for manifest and trust management
+  - `env flake-add/flake-remove/flake-pin` for composable multi-flake dev shells
+  - Per-directory `.ekapkgs-env.toml` manifest with `[[packages]]` and `[[flakes]]` sections
+  - Multiple flake dev shells composable into a single environment with input overrides
+  - `flake-pin` locks flake entries to specific revisions (auto-resolves if omitted)
   - Shell hooks for bash, zsh, and fish that auto-activate/deactivate on `cd`
   - File watching: hooks detect changes to `flake.nix`, `flake.lock`, and the manifest, then auto-reload
-  - `env reload` to force re-sync the profile from the current manifest and flake state
   - Trust model: `env allow` / `env disallow` gate auto-activation (re-allow required after manifest edits)
   - Profiles cached at `~/.cache/ekapkgs/envs/<hash>/profile`
 - `deploy` command with build, transfer, and activation lifecycle

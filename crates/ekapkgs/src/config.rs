@@ -282,10 +282,9 @@ pub struct EnvManifest {
     pub flake: String,
     #[serde(default)]
     pub packages: Vec<EnvPackageEntry>,
-    /// When `true`, activate the directory's `flake.nix` dev shell
-    /// instead of (or in addition to) individual packages.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub use_flake: bool,
+    /// Flake dev shells to compose into the environment.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub flakes: Vec<EnvFlakeEntry>,
 }
 
 impl Default for EnvManifest {
@@ -294,7 +293,7 @@ impl Default for EnvManifest {
             version: default_manifest_version(),
             flake: default_flake(),
             packages: Vec::new(),
-            use_flake: false,
+            flakes: Vec::new(),
         }
     }
 }
@@ -304,6 +303,26 @@ pub struct EnvPackageEntry {
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub flake: Option<String>,
+}
+
+/// A flake dev shell to include in the environment.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct EnvFlakeEntry {
+    /// Flake reference (e.g., `.`, `github:user/repo`, `path:../other`).
+    pub ref_: String,
+    /// Dev shell attribute to use (default: `default`).
+    #[serde(default = "default_devshell")]
+    pub devshell: String,
+    /// Pin to a specific revision.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rev: Option<String>,
+    /// Override flake inputs (e.g., `nixpkgs` → a pinned ref).
+    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub inputs: std::collections::HashMap<String, String>,
+}
+
+fn default_devshell() -> String {
+    "default".to_owned()
 }
 
 /// Name of the manifest file in a project directory.
@@ -352,6 +371,22 @@ impl EnvManifest {
     pub fn resolve_installable(&self, entry: &EnvPackageEntry) -> String {
         let flake = entry.flake.as_deref().unwrap_or(&self.flake);
         format!("{flake}#{}", entry.name)
+    }
+
+    /// Add a flake entry if not already present. Returns `true` if added.
+    pub fn add_flake(&mut self, entry: EnvFlakeEntry) -> bool {
+        if self.flakes.iter().any(|f| f.ref_ == entry.ref_) {
+            return false;
+        }
+        self.flakes.push(entry);
+        true
+    }
+
+    /// Remove a flake entry by ref. Returns `true` if it was present.
+    pub fn remove_flake(&mut self, ref_: &str) -> bool {
+        let before = self.flakes.len();
+        self.flakes.retain(|f| f.ref_ != ref_);
+        self.flakes.len() < before
     }
 
     /// Hash the manifest contents for trust verification.

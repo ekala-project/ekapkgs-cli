@@ -2,13 +2,21 @@ use ekapkgs_nix::NixCommand;
 use yansi::Paint;
 
 use crate::cli::{EnvCommand, EnvHookShell};
-use crate::config::{ENV_MANIFEST_NAME, EnvManifest, EnvPackageEntry, TrustedEnvs};
+use crate::config::{ENV_MANIFEST_NAME, EnvFlakeEntry, EnvManifest, EnvPackageEntry, TrustedEnvs};
 
 pub fn execute(command: EnvCommand) -> color_eyre::Result<()> {
     match command {
-        EnvCommand::Init { flake, use_flake } => cmd_init(&flake, use_flake),
+        EnvCommand::Init { flake } => cmd_init(&flake),
         EnvCommand::Add { packages, flake } => cmd_add(&packages, flake.as_deref()),
         EnvCommand::Remove { packages } => cmd_remove(&packages),
+        EnvCommand::FlakeAdd {
+            ref_,
+            devshell,
+            rev,
+            override_inputs,
+        } => cmd_flake_add(&ref_, &devshell, rev.as_deref(), &override_inputs),
+        EnvCommand::FlakeRemove { ref_ } => cmd_flake_remove(&ref_),
+        EnvCommand::FlakePin { ref_, rev } => cmd_flake_pin(&ref_, rev.as_deref()),
         EnvCommand::List { json } => cmd_list(json),
         EnvCommand::Reload => cmd_reload(),
         EnvCommand::Allow => cmd_allow(),
@@ -32,7 +40,7 @@ fn cwd() -> color_eyre::Result<std::path::PathBuf> {
         .map_err(|e| color_eyre::eyre::eyre!("failed to determine current directory: {e}"))
 }
 
-fn cmd_init(flake: &str, use_flake: bool) -> color_eyre::Result<()> {
+fn cmd_init(flake: &str) -> color_eyre::Result<()> {
     let dir = cwd()?;
     let path = dir.join(ENV_MANIFEST_NAME);
 
@@ -45,20 +53,15 @@ fn cmd_init(flake: &str, use_flake: bool) -> color_eyre::Result<()> {
 
     let manifest = EnvManifest {
         flake: flake.to_owned(),
-        use_flake,
         ..EnvManifest::default()
     };
     manifest.save_to(&dir)?;
 
     println!("Created {}", path.display());
-    if use_flake {
-        println!(
-            "{}",
-            "Flake dev shell enabled. Run `ekapkgs env allow` to trust this environment.".dim()
-        );
-    } else {
-        println!("{}", "Add packages with `ekapkgs env add <package>`".dim());
-    }
+    println!(
+        "{}",
+        "Add packages with `ekapkgs env add` or flakes with `ekapkgs env flake-add`".dim()
+    );
 
     Ok(())
 }
@@ -137,30 +140,151 @@ fn cmd_remove(packages: &[String]) -> color_eyre::Result<()> {
     Ok(())
 }
 
+fn cmd_flake_add(
+    ref_: &str,
+    devshell: &str,
+    rev: Option<&str>,
+    override_inputs: &[String],
+) -> color_eyre::Result<()> {
+    let dir = cwd()?;
+    let mut manifest = EnvManifest::load_from(&dir)?;
+
+    let inputs: std::collections::HashMap<String, String> = override_inputs
+        .iter()
+        .filter_map(|s| {
+            let (k, v) = s.split_once('=')?;
+            Some((k.to_owned(), v.to_owned()))
+        })
+        .collect();
+
+    let entry = EnvFlakeEntry {
+        ref_: ref_.to_owned(),
+        devshell: devshell.to_owned(),
+        rev: rev.map(str::to_owned),
+        inputs,
+    };
+
+    if !manifest.add_flake(entry) {
+        println!("Flake {ref_} is already in the manifest");
+        return Ok(());
+    }
+
+    manifest.save_to(&dir)?;
+    println!("Added flake {ref_} to {ENV_MANIFEST_NAME}");
+    println!(
+        "{}",
+        "Run `ekapkgs env reload` to build, then `ekapkgs env allow` to trust.".dim()
+    );
+
+    Ok(())
+}
+
+fn cmd_flake_remove(ref_: &str) -> color_eyre::Result<()> {
+    let dir = cwd()?;
+    let mut manifest = EnvManifest::load_from(&dir)?;
+
+    if !manifest.remove_flake(ref_) {
+        tracing::warn!("Flake {ref_} is not in the manifest");
+        return Ok(());
+    }
+
+    manifest.save_to(&dir)?;
+    println!("Removed flake {ref_} from {ENV_MANIFEST_NAME}");
+
+    Ok(())
+}
+
+fn cmd_flake_pin(ref_: &str, rev: Option<&str>) -> color_eyre::Result<()> {
+    let dir = cwd()?;
+    let mut manifest = EnvManifest::load_from(&dir)?;
+
+    let Some(entry) = manifest.flakes.iter_mut().find(|f| f.ref_ == ref_) else {
+        return Err(color_eyre::eyre::eyre!(
+            "Flake {ref_} is not in the manifest"
+        ));
+    };
+
+    let pin_rev = match rev {
+        Some(r) => r.to_owned(),
+        None => {
+            // Resolve the current revision via `nix flake metadata`.
+            let output = NixCommand::new(&["flake", "metadata", "--json"])
+                .arg(ref_)
+                .output()?;
+            let meta: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+            meta["revision"]
+                .as_str()
+                .or_else(|| meta["locked"]["rev"].as_str())
+                .ok_or_else(|| color_eyre::eyre::eyre!("Could not resolve revision for {ref_}"))?
+                .to_owned()
+        },
+    };
+
+    entry.rev = Some(pin_rev.clone());
+    manifest.save_to(&dir)?;
+    println!("Pinned {ref_} to {pin_rev}");
+
+    Ok(())
+}
+
 fn cmd_list(json_output: bool) -> color_eyre::Result<()> {
     let dir = cwd()?;
     let manifest = EnvManifest::load_from(&dir)?;
 
     if json_output {
-        println!("{}", serde_json::to_string_pretty(&manifest.packages)?);
+        println!("{}", serde_json::to_string_pretty(&manifest)?);
         return Ok(());
     }
 
-    if manifest.packages.is_empty() {
-        println!("No packages in this environment.");
-        println!("{}", "Use `ekapkgs env add <package>` to add one.".dim());
-        return Ok(());
-    }
+    let has_packages = !manifest.packages.is_empty();
+    let has_flakes = !manifest.flakes.is_empty();
 
-    for entry in &manifest.packages {
-        let flake_display = entry.flake.as_deref().unwrap_or(&manifest.flake);
+    if !has_packages && !has_flakes {
+        println!("No packages or flakes in this environment.");
         println!(
-            "  {} {}",
-            entry.name.bold(),
-            format!("({flake_display})").dim()
+            "{}",
+            "Use `ekapkgs env add` or `ekapkgs env flake-add` to add one.".dim()
         );
+        return Ok(());
     }
-    println!("\n{} package(s)", manifest.packages.len());
+
+    if has_flakes {
+        println!("{}:", "Flakes".bold());
+        for entry in &manifest.flakes {
+            let mut desc = format!("  {} ", entry.ref_.bold());
+            if entry.devshell != "default" {
+                desc.push_str(&format!("devshell={} ", entry.devshell));
+            }
+            if let Some(rev) = &entry.rev {
+                let short = if rev.len() > 8 { &rev[..8] } else { rev };
+                desc.push_str(&format!("{}", format!("(pinned {short})").dim()));
+            }
+            if !entry.inputs.is_empty() {
+                for (k, v) in &entry.inputs {
+                    desc.push_str(&format!(" {}", format!("{k}={v}").dim()));
+                }
+            }
+            println!("{desc}");
+        }
+    }
+
+    if has_packages {
+        if has_flakes {
+            println!();
+        }
+        println!("{}:", "Packages".bold());
+        for entry in &manifest.packages {
+            let flake_display = entry.flake.as_deref().unwrap_or(&manifest.flake);
+            println!(
+                "  {} {}",
+                entry.name.bold(),
+                format!("({flake_display})").dim()
+            );
+        }
+    }
+
+    let total = manifest.flakes.len() + manifest.packages.len();
+    println!("\n{total} entry(ies)");
 
     Ok(())
 }
@@ -295,33 +419,47 @@ fn compute_fingerprint(dir: &std::path::Path) -> String {
     h.to_hex().as_str()[..32].to_owned()
 }
 
-/// Build the profile from manifest packages and/or flake dev shell.
+/// Build the profile from manifest packages and flake dev shells.
+#[allow(clippy::unnecessary_wraps)]
 fn sync_profile_from_manifest(
     manifest: &EnvManifest,
     profile_str: &str,
-    dir: &std::path::Path,
+    _dir: &std::path::Path,
 ) -> color_eyre::Result<()> {
-    if manifest.use_flake {
-        tracing::info!("Building flake dev shell...");
-        let dir_str = dir.to_string_lossy();
-        let installable = format!("{dir_str}#devShells.{}.default", current_system());
-        // Try the standard devShells output first, fall back to bare flake ref.
-        let result = NixCommand::new(&["profile", "install"])
-            .arg("--profile")
-            .arg(profile_str)
-            .arg(&installable)
-            .stream();
+    // Install each flake dev shell.
+    for flake_entry in &manifest.flakes {
+        let mut flake_ref = flake_entry.ref_.clone();
+        if let Some(rev) = &flake_entry.rev {
+            // Append ?rev= if not already present.
+            if !flake_ref.contains('?') {
+                flake_ref.push_str(&format!("?rev={rev}"));
+            }
+        }
 
-        if result.is_err() {
-            tracing::info!("Falling back to nix develop profile...");
-            NixCommand::new(&["profile", "install"])
-                .arg("--profile")
-                .arg(profile_str)
-                .arg(dir.to_string_lossy().to_string())
-                .stream()?;
+        let installable = format!(
+            "{flake_ref}#devShells.{}.{}",
+            current_system(),
+            flake_entry.devshell
+        );
+        tracing::info!("Installing flake dev shell {installable}...");
+
+        let mut cmd = NixCommand::new(&["profile", "install"])
+            .arg("--profile")
+            .arg(profile_str);
+
+        // Apply input overrides.
+        for (name, value) in &flake_entry.inputs {
+            cmd = cmd.arg("--override-input").arg(name).arg(value);
+        }
+
+        cmd = cmd.arg(&installable);
+
+        if let Err(e) = cmd.stream() {
+            tracing::warn!("Failed to install flake {}: {e}", flake_entry.ref_);
         }
     }
 
+    // Install individual packages.
     for entry in &manifest.packages {
         let installable = manifest.resolve_installable(entry);
         tracing::info!("Installing {installable}...");

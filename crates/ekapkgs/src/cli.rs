@@ -700,12 +700,6 @@ pub enum EnvCommand {
         /// Default flake for packages.
         #[arg(long, default_value = "nixpkgs")]
         flake: String,
-
-        /// Activate the directory's `flake.nix` dev shell.
-        /// The shell hook will watch `flake.nix` and `flake.lock` for
-        /// changes and reload automatically.
-        #[arg(long)]
-        use_flake: bool,
     },
 
     /// Add packages to the directory environment.
@@ -726,7 +720,50 @@ pub enum EnvCommand {
         packages: Vec<String>,
     },
 
-    /// List packages in the directory environment.
+    /// Add a flake dev shell to the environment.
+    ///
+    /// Multiple flakes can be composed — their dev shell outputs are
+    /// merged into a single profile.
+    #[command(name = "flake-add")]
+    FlakeAdd {
+        /// Flake reference (e.g., `.`, `github:user/repo`, `path:../other`).
+        #[arg(name = "ref")]
+        ref_: String,
+
+        /// Dev shell attribute to use (default: `default`).
+        #[arg(long, default_value = "default")]
+        devshell: String,
+
+        /// Pin to a specific revision.
+        #[arg(long)]
+        rev: Option<String>,
+
+        /// Override a flake input (can be repeated, format: `name=flakeref`).
+        #[arg(long = "override-input", value_name = "NAME=REF")]
+        override_inputs: Vec<String>,
+    },
+
+    /// Remove a flake dev shell from the environment.
+    #[command(name = "flake-remove")]
+    FlakeRemove {
+        /// Flake reference to remove.
+        #[arg(name = "ref")]
+        ref_: String,
+    },
+
+    /// Pin a flake to a specific revision.
+    #[command(name = "flake-pin")]
+    FlakePin {
+        /// Flake reference to pin.
+        #[arg(name = "ref")]
+        ref_: String,
+
+        /// Revision to pin to. If omitted, pins to the currently resolved revision.
+        #[arg(long)]
+        rev: Option<String>,
+    },
+
+    /// List packages and flakes in the directory environment.
     List {
         /// Output as JSON.
         #[arg(long)]
