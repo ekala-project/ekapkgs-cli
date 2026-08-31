@@ -700,6 +700,12 @@ pub enum EnvCommand {
         /// Default flake for packages.
         #[arg(long, default_value = "nixpkgs")]
         flake: String,
+
+        /// Activate the directory's `flake.nix` dev shell.
+        /// The shell hook will watch `flake.nix` and `flake.lock` for
+        /// changes and reload automatically.
+        #[arg(long)]
+        use_flake: bool,
     },
 
     /// Add packages to the directory environment.
@@ -726,6 +732,9 @@ pub enum EnvCommand {
         #[arg(long)]
         json: bool,
     },
+
+    /// Rebuild the environment profile from the current manifest and flake state.
+    Reload,
 
     /// Allow the environment in the current directory.
     ///
@@ -761,6 +770,20 @@ pub enum EnvCommand {
     #[command(name = "_is-trusted", hide = true)]
     IsTrusted {
         /// Directory to check.
+        dir: String,
+    },
+
+    /// Print a fingerprint of the environment files for change detection (used by shell hooks).
+    #[command(name = "_fingerprint", hide = true)]
+    Fingerprint {
+        /// Directory to fingerprint.
+        dir: String,
+    },
+
+    /// Rebuild the profile and print the bin path (used by shell hooks).
+    #[command(name = "_reload", hide = true)]
+    ReloadHook {
+        /// Directory to reload.
         dir: String,
     },
 }

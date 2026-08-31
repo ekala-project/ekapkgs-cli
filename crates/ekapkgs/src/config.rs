@@ -282,6 +282,10 @@ pub struct EnvManifest {
     pub flake: String,
     #[serde(default)]
     pub packages: Vec<EnvPackageEntry>,
+    /// When `true`, activate the directory's `flake.nix` dev shell
+    /// instead of (or in addition to) individual packages.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub use_flake: bool,
 }
 
 impl Default for EnvManifest {
@@ -290,6 +294,7 @@ impl Default for EnvManifest {
             version: default_manifest_version(),
             flake: default_flake(),
             packages: Vec::new(),
+            use_flake: false,
         }
     }
 }
