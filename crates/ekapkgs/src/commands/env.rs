@@ -752,3 +752,126 @@ end
 _ekapkgs_env_hook
 "#
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{ENV_MANIFEST_NAME, EnvManifest, EnvPackageEntry};
+
+    #[test]
+    fn fingerprint_stable_for_same_files() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let manifest = EnvManifest::default();
+        manifest.save_to(dir.path()).unwrap();
+
+        let fp1 = compute_fingerprint(dir.path());
+        let fp2 = compute_fingerprint(dir.path());
+        assert_eq!(fp1, fp2);
+    }
+
+    #[test]
+    fn fingerprint_changes_on_manifest_edit() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut manifest = EnvManifest::default();
+        manifest.save_to(dir.path()).unwrap();
+
+        let fp1 = compute_fingerprint(dir.path());
+
+        // Wait briefly so mtime differs.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        manifest.add(EnvPackageEntry {
+            name: "jq".into(),
+            flake: None,
+        });
+        manifest.save_to(dir.path()).unwrap();
+
+        let fp2 = compute_fingerprint(dir.path());
+        assert_ne!(fp1, fp2);
+    }
+
+    #[test]
+    fn fingerprint_changes_on_flake_nix_creation() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let manifest = EnvManifest::default();
+        manifest.save_to(dir.path()).unwrap();
+
+        let fp1 = compute_fingerprint(dir.path());
+
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        std::fs::write(dir.path().join("flake.nix"), "{ }").unwrap();
+
+        let fp2 = compute_fingerprint(dir.path());
+        assert_ne!(fp1, fp2);
+    }
+
+    #[test]
+    fn fingerprint_changes_on_flake_lock_update() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let manifest = EnvManifest::default();
+        manifest.save_to(dir.path()).unwrap();
+        std::fs::write(dir.path().join("flake.lock"), "{}").unwrap();
+
+        let fp1 = compute_fingerprint(dir.path());
+
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        std::fs::write(dir.path().join("flake.lock"), "{\"version\": 2}").unwrap();
+
+        let fp2 = compute_fingerprint(dir.path());
+        assert_ne!(fp1, fp2);
+    }
+
+    #[test]
+    fn fingerprint_ignores_unrelated_files() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let manifest = EnvManifest::default();
+        manifest.save_to(dir.path()).unwrap();
+
+        let fp1 = compute_fingerprint(dir.path());
+
+        std::fs::write(dir.path().join("README.md"), "hello").unwrap();
+
+        let fp2 = compute_fingerprint(dir.path());
+        assert_eq!(fp1, fp2);
+    }
+
+    #[test]
+    fn fingerprint_handles_missing_manifest() {
+        let dir = tempfile::TempDir::new().unwrap();
+        // No manifest at all — should still produce a stable fingerprint.
+        let fp1 = compute_fingerprint(dir.path());
+        let fp2 = compute_fingerprint(dir.path());
+        assert_eq!(fp1, fp2);
+    }
+
+    #[test]
+    fn hook_output_contains_manifest_name() {
+        let bash = bash_hook();
+        assert!(bash.contains(ENV_MANIFEST_NAME));
+        let zsh = zsh_hook();
+        assert!(zsh.contains(ENV_MANIFEST_NAME));
+        let fish = fish_hook();
+        assert!(fish.contains(ENV_MANIFEST_NAME));
+    }
+
+    #[test]
+    fn hook_bash_contains_fingerprint_check() {
+        let bash = bash_hook();
+        assert!(bash.contains("_fingerprint"));
+        assert!(bash.contains("_EKAPKGS_ENV_FINGERPRINT"));
+    }
+
+    #[test]
+    fn hook_zsh_contains_trust_check() {
+        let zsh = zsh_hook();
+        assert!(zsh.contains("_is-trusted"));
+        assert!(zsh.contains("ekapkgs env allow"));
+    }
+
+    #[test]
+    fn hook_fish_contains_deactivate() {
+        let fish = fish_hook();
+        assert!(fish.contains("_ekapkgs_env_deactivate"));
+        assert!(fish.contains("_EKAPKGS_ENV_PATH_BACKUP"));
+    }
+}

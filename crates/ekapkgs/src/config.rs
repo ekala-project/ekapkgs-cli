@@ -484,3 +484,506 @@ impl TrustedEnvs {
         *stored_hash == current_hash
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -----------------------------------------------------------------------
+    // HomePackages
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn home_packages_default() {
+        let hp = HomePackages::default();
+        assert_eq!(hp.version, 1);
+        assert_eq!(hp.flake, "nixpkgs");
+        assert!(hp.packages.is_empty());
+    }
+
+    #[test]
+    fn home_packages_add_and_dedup() {
+        let mut hp = HomePackages::default();
+        let entry = HomePackageEntry {
+            name: "hello".into(),
+            flake: None,
+        };
+        assert!(hp.add(entry.clone()));
+        assert!(!hp.add(entry)); // duplicate
+        assert_eq!(hp.packages.len(), 1);
+    }
+
+    #[test]
+    fn home_packages_remove() {
+        let mut hp = HomePackages::default();
+        hp.add(HomePackageEntry {
+            name: "hello".into(),
+            flake: None,
+        });
+        hp.add(HomePackageEntry {
+            name: "world".into(),
+            flake: None,
+        });
+        assert!(hp.remove("hello"));
+        assert!(!hp.remove("hello")); // already gone
+        assert_eq!(hp.packages.len(), 1);
+        assert_eq!(hp.packages[0].name, "world");
+    }
+
+    #[test]
+    fn home_packages_resolve_installable_default_flake() {
+        let hp = HomePackages::default();
+        let entry = HomePackageEntry {
+            name: "ripgrep".into(),
+            flake: None,
+        };
+        assert_eq!(hp.resolve_installable(&entry), "nixpkgs#ripgrep");
+    }
+
+    #[test]
+    fn home_packages_resolve_installable_override_flake() {
+        let hp = HomePackages::default();
+        let entry = HomePackageEntry {
+            name: "my-tool".into(),
+            flake: Some("github:user/repo".into()),
+        };
+        assert_eq!(hp.resolve_installable(&entry), "github:user/repo#my-tool");
+    }
+
+    #[test]
+    fn home_packages_toml_roundtrip() {
+        let mut hp = HomePackages::default();
+        hp.add(HomePackageEntry {
+            name: "jq".into(),
+            flake: None,
+        });
+        hp.add(HomePackageEntry {
+            name: "special".into(),
+            flake: Some("github:foo/bar".into()),
+        });
+
+        let toml_str = toml::to_string_pretty(&hp).unwrap();
+        let parsed: HomePackages = toml::from_str(&toml_str).unwrap();
+        assert_eq!(parsed.packages.len(), 2);
+        assert_eq!(parsed.packages[0].name, "jq");
+        assert!(parsed.packages[0].flake.is_none());
+        assert_eq!(parsed.packages[1].name, "special");
+        assert_eq!(parsed.packages[1].flake.as_deref(), Some("github:foo/bar"));
+    }
+
+    #[test]
+    fn home_packages_deserialize_minimal() {
+        let toml_str = r#"
+            [[packages]]
+            name = "hello"
+        "#;
+        let hp: HomePackages = toml::from_str(toml_str).unwrap();
+        assert_eq!(hp.version, 1);
+        assert_eq!(hp.flake, "nixpkgs");
+        assert_eq!(hp.packages.len(), 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // SystemPackages (mirrors HomePackages structure)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn system_packages_add_remove() {
+        let mut sp = SystemPackages::default();
+        assert!(sp.add(SystemPackageEntry {
+            name: "htop".into(),
+            flake: None,
+        }));
+        assert!(!sp.add(SystemPackageEntry {
+            name: "htop".into(),
+            flake: None,
+        }));
+        assert!(sp.remove("htop"));
+        assert!(!sp.remove("htop"));
+    }
+
+    #[test]
+    fn system_packages_resolve_installable() {
+        let sp = SystemPackages {
+            flake: "my-flake".into(),
+            ..SystemPackages::default()
+        };
+        let entry = SystemPackageEntry {
+            name: "vim".into(),
+            flake: None,
+        };
+        assert_eq!(sp.resolve_installable(&entry), "my-flake#vim");
+    }
+
+    // -----------------------------------------------------------------------
+    // EnvManifest
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn env_manifest_default() {
+        let em = EnvManifest::default();
+        assert_eq!(em.version, 1);
+        assert_eq!(em.flake, "nixpkgs");
+        assert!(em.packages.is_empty());
+        assert!(em.flakes.is_empty());
+    }
+
+    #[test]
+    fn env_manifest_add_remove_packages() {
+        let mut em = EnvManifest::default();
+        assert!(em.add(EnvPackageEntry {
+            name: "fd".into(),
+            flake: None,
+        }));
+        assert!(em.add(EnvPackageEntry {
+            name: "rg".into(),
+            flake: None,
+        }));
+        assert!(!em.add(EnvPackageEntry {
+            name: "fd".into(),
+            flake: None,
+        }));
+        assert_eq!(em.packages.len(), 2);
+        assert!(em.remove("fd"));
+        assert_eq!(em.packages.len(), 1);
+        assert_eq!(em.packages[0].name, "rg");
+    }
+
+    #[test]
+    fn env_manifest_add_remove_flakes() {
+        let mut em = EnvManifest::default();
+        let entry = EnvFlakeEntry {
+            ref_: ".".into(),
+            devshell: "default".into(),
+            rev: None,
+            inputs: std::collections::HashMap::new(),
+        };
+        assert!(em.add_flake(entry.clone()));
+        assert!(!em.add_flake(entry)); // dedup by ref_
+        assert_eq!(em.flakes.len(), 1);
+        assert!(em.remove_flake("."));
+        assert!(em.flakes.is_empty());
+        assert!(!em.remove_flake(".")); // already gone
+    }
+
+    #[test]
+    fn env_manifest_resolve_installable() {
+        let em = EnvManifest::default();
+        let entry = EnvPackageEntry {
+            name: "jq".into(),
+            flake: None,
+        };
+        assert_eq!(em.resolve_installable(&entry), "nixpkgs#jq");
+    }
+
+    #[test]
+    fn env_manifest_save_load_roundtrip() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut em = EnvManifest::default();
+        em.add(EnvPackageEntry {
+            name: "jq".into(),
+            flake: None,
+        });
+        em.flakes.push(EnvFlakeEntry {
+            ref_: "github:user/repo".into(),
+            devshell: "python".into(),
+            rev: Some("abc123".into()),
+            inputs: [("nixpkgs".into(), "github:NixOS/nixpkgs/nixos-24.05".into())]
+                .into_iter()
+                .collect(),
+        });
+
+        em.save_to(dir.path()).unwrap();
+        let loaded = EnvManifest::load_from(dir.path()).unwrap();
+
+        assert_eq!(loaded.packages.len(), 1);
+        assert_eq!(loaded.packages[0].name, "jq");
+        assert_eq!(loaded.flakes.len(), 1);
+        assert_eq!(loaded.flakes[0].ref_, "github:user/repo");
+        assert_eq!(loaded.flakes[0].devshell, "python");
+        assert_eq!(loaded.flakes[0].rev.as_deref(), Some("abc123"));
+        assert_eq!(
+            loaded.flakes[0].inputs.get("nixpkgs").map(String::as_str),
+            Some("github:NixOS/nixpkgs/nixos-24.05")
+        );
+    }
+
+    #[test]
+    fn env_manifest_load_missing_returns_error() {
+        let dir = tempfile::TempDir::new().unwrap();
+        assert!(EnvManifest::load_from(dir.path()).is_err());
+    }
+
+    #[test]
+    fn env_manifest_toml_format_packages_only() {
+        let mut em = EnvManifest::default();
+        em.add(EnvPackageEntry {
+            name: "jq".into(),
+            flake: None,
+        });
+        let toml_str = toml::to_string_pretty(&em).unwrap();
+        // Should not contain [[flakes]] when empty.
+        assert!(!toml_str.contains("[[flakes]]"));
+        assert!(toml_str.contains("[[packages]]"));
+        assert!(toml_str.contains("name = \"jq\""));
+    }
+
+    #[test]
+    fn env_manifest_toml_format_with_flakes() {
+        let mut em = EnvManifest::default();
+        em.flakes.push(EnvFlakeEntry {
+            ref_: ".".into(),
+            devshell: "default".into(),
+            rev: None,
+            inputs: std::collections::HashMap::new(),
+        });
+        let toml_str = toml::to_string_pretty(&em).unwrap();
+        assert!(toml_str.contains("[[flakes]]"));
+        assert!(toml_str.contains("ref_ = \".\""));
+    }
+
+    #[test]
+    fn env_manifest_deserialize_packages_only() {
+        let toml_str = r#"
+            version = 1
+            flake = "nixpkgs"
+
+            [[packages]]
+            name = "jq"
+        "#;
+        let em: EnvManifest = toml::from_str(toml_str).unwrap();
+        assert_eq!(em.packages.len(), 1);
+        assert!(em.flakes.is_empty());
+    }
+
+    #[test]
+    fn env_manifest_deserialize_full() {
+        let toml_str = r#"
+            version = 1
+            flake = "nixpkgs"
+
+            [[packages]]
+            name = "jq"
+
+            [[packages]]
+            name = "my-tool"
+            flake = "github:user/repo"
+
+            [[flakes]]
+            ref_ = "."
+            devshell = "default"
+
+            [[flakes]]
+            ref_ = "github:other/flake"
+            devshell = "python"
+            rev = "deadbeef"
+
+            [flakes.inputs]
+            nixpkgs = "github:NixOS/nixpkgs/nixos-24.05"
+        "#;
+        let em: EnvManifest = toml::from_str(toml_str).unwrap();
+        assert_eq!(em.packages.len(), 2);
+        assert_eq!(em.flakes.len(), 2);
+        assert_eq!(em.flakes[0].ref_, ".");
+        assert_eq!(em.flakes[1].rev.as_deref(), Some("deadbeef"));
+        assert_eq!(
+            em.flakes[1].inputs.get("nixpkgs").map(String::as_str),
+            Some("github:NixOS/nixpkgs/nixos-24.05")
+        );
+    }
+
+    #[test]
+    fn env_manifest_devshell_defaults_to_default() {
+        let toml_str = r#"
+            [[flakes]]
+            ref_ = "."
+        "#;
+        let em: EnvManifest = toml::from_str(toml_str).unwrap();
+        assert_eq!(em.flakes[0].devshell, "default");
+    }
+
+    #[test]
+    fn env_manifest_content_hash_changes_on_edit() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut em = EnvManifest::default();
+        em.save_to(dir.path()).unwrap();
+
+        let hash1 = EnvManifest::content_hash(dir.path()).unwrap();
+
+        em.add(EnvPackageEntry {
+            name: "ripgrep".into(),
+            flake: None,
+        });
+        em.save_to(dir.path()).unwrap();
+
+        let hash2 = EnvManifest::content_hash(dir.path()).unwrap();
+        assert_ne!(hash1, hash2);
+    }
+
+    // -----------------------------------------------------------------------
+    // TrustedEnvs
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn trusted_envs_allow_and_check() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let em = EnvManifest::default();
+        em.save_to(dir.path()).unwrap();
+
+        let mut trusted = TrustedEnvs::default();
+        trusted.allow(dir.path()).unwrap();
+        assert!(trusted.is_trusted(dir.path()));
+    }
+
+    #[test]
+    fn trusted_envs_not_trusted_when_absent() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let em = EnvManifest::default();
+        em.save_to(dir.path()).unwrap();
+
+        let trusted = TrustedEnvs::default();
+        assert!(!trusted.is_trusted(dir.path()));
+    }
+
+    #[test]
+    fn trusted_envs_invalidated_by_manifest_edit() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut em = EnvManifest::default();
+        em.save_to(dir.path()).unwrap();
+
+        let mut trusted = TrustedEnvs::default();
+        trusted.allow(dir.path()).unwrap();
+        assert!(trusted.is_trusted(dir.path()));
+
+        // Edit the manifest — trust should be invalidated.
+        em.add(EnvPackageEntry {
+            name: "new-pkg".into(),
+            flake: None,
+        });
+        em.save_to(dir.path()).unwrap();
+        assert!(!trusted.is_trusted(dir.path()));
+    }
+
+    #[test]
+    fn trusted_envs_disallow() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let em = EnvManifest::default();
+        em.save_to(dir.path()).unwrap();
+
+        let mut trusted = TrustedEnvs::default();
+        trusted.allow(dir.path()).unwrap();
+        assert!(trusted.is_trusted(dir.path()));
+
+        trusted.disallow(dir.path());
+        assert!(!trusted.is_trusted(dir.path()));
+    }
+
+    #[test]
+    fn trusted_envs_toml_roundtrip() {
+        let mut trusted = TrustedEnvs::default();
+        trusted.entries.insert("/some/path".into(), "abc123".into());
+
+        let toml_str = toml::to_string_pretty(&trusted).unwrap();
+        let parsed: TrustedEnvs = toml::from_str(&toml_str).unwrap();
+        assert_eq!(
+            parsed.entries.get("/some/path").map(String::as_str),
+            Some("abc123")
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // EnvFlakeEntry pinning
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn env_flake_entry_pinned_serialization() {
+        let entry = EnvFlakeEntry {
+            ref_: "github:NixOS/nixpkgs".into(),
+            devshell: "default".into(),
+            rev: Some("abc123def456".into()),
+            inputs: std::collections::HashMap::new(),
+        };
+        let toml_str = toml::to_string_pretty(&entry).unwrap();
+        assert!(toml_str.contains("rev = \"abc123def456\""));
+    }
+
+    #[test]
+    fn env_flake_entry_unpinned_omits_rev() {
+        let entry = EnvFlakeEntry {
+            ref_: ".".into(),
+            devshell: "default".into(),
+            rev: None,
+            inputs: std::collections::HashMap::new(),
+        };
+        let toml_str = toml::to_string_pretty(&entry).unwrap();
+        assert!(!toml_str.contains("rev"));
+    }
+
+    #[test]
+    fn env_flake_entry_with_input_overrides() {
+        let entry = EnvFlakeEntry {
+            ref_: "github:user/repo".into(),
+            devshell: "default".into(),
+            rev: None,
+            inputs: [("nixpkgs".into(), "github:NixOS/nixpkgs/nixos-24.05".into())]
+                .into_iter()
+                .collect(),
+        };
+        let toml_str = toml::to_string_pretty(&entry).unwrap();
+        assert!(toml_str.contains("[inputs]"));
+        assert!(toml_str.contains("nixpkgs = \"github:NixOS/nixpkgs/nixos-24.05\""));
+    }
+
+    #[test]
+    fn env_manifest_multiple_flakes_composable() {
+        let mut em = EnvManifest::default();
+        em.add_flake(EnvFlakeEntry {
+            ref_: ".".into(),
+            devshell: "default".into(),
+            rev: None,
+            inputs: std::collections::HashMap::new(),
+        });
+        em.add_flake(EnvFlakeEntry {
+            ref_: "github:user/rust-tools".into(),
+            devshell: "default".into(),
+            rev: Some("abc123".into()),
+            inputs: std::collections::HashMap::new(),
+        });
+        em.add_flake(EnvFlakeEntry {
+            ref_: "github:another/devenv".into(),
+            devshell: "python".into(),
+            rev: None,
+            inputs: [("nixpkgs".into(), "github:NixOS/nixpkgs/nixos-24.05".into())]
+                .into_iter()
+                .collect(),
+        });
+
+        assert_eq!(em.flakes.len(), 3);
+
+        // Roundtrip through TOML.
+        let toml_str = toml::to_string_pretty(&em).unwrap();
+        let parsed: EnvManifest = toml::from_str(&toml_str).unwrap();
+        assert_eq!(parsed.flakes.len(), 3);
+        assert_eq!(parsed.flakes[0].ref_, ".");
+        assert_eq!(parsed.flakes[1].rev.as_deref(), Some("abc123"));
+        assert_eq!(parsed.flakes[2].devshell, "python");
+        assert!(parsed.flakes[2].inputs.contains_key("nixpkgs"));
+    }
+
+    #[test]
+    fn env_manifest_profile_path_deterministic() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path1 = EnvManifest::profile_path(dir.path()).unwrap();
+        let path2 = EnvManifest::profile_path(dir.path()).unwrap();
+        assert_eq!(path1, path2);
+    }
+
+    #[test]
+    fn env_manifest_profile_path_differs_per_dir() {
+        let dir1 = tempfile::TempDir::new().unwrap();
+        let dir2 = tempfile::TempDir::new().unwrap();
+        let path1 = EnvManifest::profile_path(dir1.path()).unwrap();
+        let path2 = EnvManifest::profile_path(dir2.path()).unwrap();
+        assert_ne!(path1, path2);
+    }
+}
