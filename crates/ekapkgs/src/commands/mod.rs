@@ -5,6 +5,7 @@ mod deploy;
 mod develop;
 mod doctor;
 mod dry_run;
+mod env;
 mod flake;
 mod home;
 mod log;
@@ -48,6 +49,7 @@ pub fn run(command: Command) -> color_eyre::Result<()> {
         Command::Store { command } => store::execute(command),
         Command::Log { installable } => log::execute(&installable),
         Command::DryRun { installable, extra } => dry_run::execute(&installable, &extra),
+        Command::Env { command } => env::execute(command),
         Command::Doctor => doctor::execute(),
         Command::Substituter { port, upstream } => substituter::execute(port, upstream),
         Command::Completions { .. } => unreachable!("handled in main"),

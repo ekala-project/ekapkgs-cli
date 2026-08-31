@@ -143,6 +143,12 @@ pub enum Command {
         command: SearchCommand,
     },
 
+    /// Manage directory-scoped package environments.
+    Env {
+        #[command(subcommand)]
+        command: EnvCommand,
+    },
+
     /// Check system health and configuration.
     Doctor,
 
@@ -683,6 +689,68 @@ pub enum SystemPackagesCommand {
         #[arg(long)]
         merge: bool,
     },
+}
+
+#[derive(Subcommand)]
+pub enum EnvCommand {
+    /// Initialize a new environment in the current directory.
+    ///
+    /// Creates a `.ekapkgs-env.toml` manifest in the current directory.
+    Init {
+        /// Default flake for packages.
+        #[arg(long, default_value = "nixpkgs")]
+        flake: String,
+    },
+
+    /// Add packages to the directory environment.
+    Add {
+        /// Package names or attribute paths.
+        #[arg(required = true)]
+        packages: Vec<String>,
+
+        /// Flake to resolve packages from (overrides manifest default).
+        #[arg(long)]
+        flake: Option<String>,
+    },
+
+    /// Remove packages from the directory environment.
+    Remove {
+        /// Package names to remove.
+        #[arg(required = true)]
+        packages: Vec<String>,
+    },
+
+    /// List packages in the directory environment.
+    List {
+        /// Output as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Print a shell hook for automatic environment activation.
+    ///
+    /// Add the output to your shell configuration (e.g., `.bashrc`,
+    /// `.zshrc`) to automatically activate/deactivate directory
+    /// environments when navigating with `cd`.
+    Hook {
+        /// Shell to generate the hook for.
+        #[arg(value_enum)]
+        shell: EnvHookShell,
+    },
+
+    /// Print the profile bin path for a directory (used by shell hooks).
+    #[command(name = "_profile-bin", hide = true)]
+    ProfileBin {
+        /// Directory containing the environment manifest.
+        dir: String,
+    },
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+pub enum EnvHookShell {
+    Bash,
+    Zsh,
+    Fish,
 }
 
 #[derive(Subcommand)]
