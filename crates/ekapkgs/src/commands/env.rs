@@ -2,7 +2,7 @@ use ekapkgs_nix::NixCommand;
 use yansi::Paint;
 
 use crate::cli::{EnvCommand, EnvHookShell};
-use crate::config::{ENV_MANIFEST_NAME, EnvManifest, EnvPackageEntry};
+use crate::config::{ENV_MANIFEST_NAME, EnvManifest, EnvPackageEntry, TrustedEnvs};
 
 pub fn execute(command: EnvCommand) -> color_eyre::Result<()> {
     match command {
@@ -10,11 +10,14 @@ pub fn execute(command: EnvCommand) -> color_eyre::Result<()> {
         EnvCommand::Add { packages, flake } => cmd_add(&packages, flake.as_deref()),
         EnvCommand::Remove { packages } => cmd_remove(&packages),
         EnvCommand::List { json } => cmd_list(json),
+        EnvCommand::Allow => cmd_allow(),
+        EnvCommand::Disallow => cmd_disallow(),
         EnvCommand::Hook { shell } => {
             cmd_hook(shell);
             Ok(())
         },
         EnvCommand::ProfileBin { dir } => cmd_profile_bin(&dir),
+        EnvCommand::IsTrusted { dir } => cmd_is_trusted(&dir),
     }
 }
 
@@ -156,14 +159,65 @@ fn cmd_hook(shell: EnvHookShell) {
     }
 }
 
+fn cmd_allow() -> color_eyre::Result<()> {
+    let dir = cwd()?;
+    let manifest_path = dir.join(ENV_MANIFEST_NAME);
+
+    if !manifest_path.exists() {
+        return Err(color_eyre::eyre::eyre!(
+            "No {ENV_MANIFEST_NAME} found in {}",
+            dir.display()
+        ));
+    }
+
+    let mut trusted = TrustedEnvs::load()?;
+    trusted.allow(&dir)?;
+    trusted.save()?;
+
+    println!("Allowed {}", dir.canonicalize().unwrap_or(dir).display());
+
+    Ok(())
+}
+
+fn cmd_disallow() -> color_eyre::Result<()> {
+    let dir = cwd()?;
+
+    let mut trusted = TrustedEnvs::load()?;
+    trusted.disallow(&dir);
+    trusted.save()?;
+
+    println!("Disallowed {}", dir.canonicalize().unwrap_or(dir).display());
+
+    Ok(())
+}
+
 fn cmd_profile_bin(dir: &str) -> color_eyre::Result<()> {
     let dir_path = std::path::Path::new(dir);
+
+    // Only return the profile bin if the environment is trusted.
+    let trusted = TrustedEnvs::load()?;
+    if !trusted.is_trusted(dir_path) {
+        return Ok(());
+    }
+
     let profile = EnvManifest::profile_path(dir_path)?;
     let bin = profile.join("bin");
     if bin.is_dir() {
         println!("{}", bin.display());
     }
     Ok(())
+}
+
+fn cmd_is_trusted(dir: &str) -> color_eyre::Result<()> {
+    let dir_path = std::path::Path::new(dir);
+    let trusted = TrustedEnvs::load()?;
+    if trusted.is_trusted(dir_path) {
+        // Exit 0 — trusted.
+        Ok(())
+    } else {
+        // Exit 1 — not trusted.
+        std::process::exit(1);
+    }
 }
 
 fn bash_hook() -> &'static str {
@@ -197,7 +251,19 @@ _ekapkgs_env_hook() {
             # Deactivate previous environment if any.
             if [[ -n "$prev_env" && -n "${_EKAPKGS_ENV_PATH_BACKUP:-}" ]]; then
                 export PATH="$_EKAPKGS_ENV_PATH_BACKUP"
+                unset _EKAPKGS_ENV_PATH_BACKUP
+                unset EKAPKGS_ENV
             fi
+
+            # Check trust before activating.
+            if ! ekapkgs env _is-trusted "$found_dir" 2>/dev/null; then
+                if [[ "${_EKAPKGS_ENV_WARNED:-}" != "$found_dir" ]]; then
+                    echo "ekapkgs: $found_dir is blocked. Run \`ekapkgs env allow\` to approve." >&2
+                    _EKAPKGS_ENV_WARNED="$found_dir"
+                fi
+                return
+            fi
+            unset _EKAPKGS_ENV_WARNED
 
             # Activate new environment.
             local profile_bin
@@ -252,7 +318,19 @@ _ekapkgs_env_hook() {
         if [[ "$found_dir" != "$prev_env" ]]; then
             if [[ -n "$prev_env" && -n "${_EKAPKGS_ENV_PATH_BACKUP:-}" ]]; then
                 export PATH="$_EKAPKGS_ENV_PATH_BACKUP"
+                unset _EKAPKGS_ENV_PATH_BACKUP
+                unset EKAPKGS_ENV
             fi
+
+            # Check trust before activating.
+            if ! ekapkgs env _is-trusted "$found_dir" 2>/dev/null; then
+                if [[ "${_EKAPKGS_ENV_WARNED:-}" != "$found_dir" ]]; then
+                    echo "ekapkgs: $found_dir is blocked. Run \`ekapkgs env allow\` to approve." >&2
+                    _EKAPKGS_ENV_WARNED="$found_dir"
+                fi
+                return
+            fi
+            unset _EKAPKGS_ENV_WARNED
 
             local profile_bin
             profile_bin="$(ekapkgs env _profile-bin "$found_dir" 2>/dev/null)"
@@ -305,7 +383,19 @@ function _ekapkgs_env_hook --on-variable PWD
             # Deactivate previous.
             if test -n "$prev_env"; and set -q _EKAPKGS_ENV_PATH_BACKUP
                 set -gx PATH $_EKAPKGS_ENV_PATH_BACKUP
+                set -e _EKAPKGS_ENV_PATH_BACKUP
+                set -e EKAPKGS_ENV
             end
+
+            # Check trust before activating.
+            if not ekapkgs env _is-trusted "$found_dir" 2>/dev/null
+                if test "$_EKAPKGS_ENV_WARNED" != "$found_dir"
+                    echo "ekapkgs: $found_dir is blocked. Run \`ekapkgs env allow\` to approve." >&2
+                    set -g _EKAPKGS_ENV_WARNED "$found_dir"
+                end
+                return
+            end
+            set -e _EKAPKGS_ENV_WARNED
 
             # Activate new.
             set -l profile_bin (ekapkgs env _profile-bin "$found_dir" 2>/dev/null)

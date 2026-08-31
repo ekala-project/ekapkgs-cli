@@ -349,6 +349,14 @@ impl EnvManifest {
         format!("{flake}#{}", entry.name)
     }
 
+    /// Hash the manifest contents for trust verification.
+    pub fn content_hash(dir: &Path) -> color_eyre::Result<String> {
+        let path = dir.join(ENV_MANIFEST_NAME);
+        let contents = std::fs::read(&path)?;
+        let h = blake3::hash(&contents);
+        Ok(h.to_hex().as_str()[..64].to_owned())
+    }
+
     /// Compute the profile path for a given directory under the cache.
     pub fn profile_path(dir: &Path) -> color_eyre::Result<PathBuf> {
         let cache_dir = directories::ProjectDirs::from("", "", "ekapkgs")
@@ -365,5 +373,74 @@ impl EnvManifest {
         let env_dir = cache_dir.join("envs").join(hash);
         std::fs::create_dir_all(&env_dir)?;
         Ok(env_dir.join("profile"))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Environment trust database
+// ---------------------------------------------------------------------------
+
+/// Maps canonical directory paths to the blake3 hash of their manifest at
+/// the time `env allow` was run.  Stored at `~/.config/ekapkgs/trusted-envs.toml`.
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+pub struct TrustedEnvs {
+    #[serde(default)]
+    pub entries: std::collections::HashMap<String, String>,
+}
+
+impl TrustedEnvs {
+    fn db_path() -> PathBuf {
+        let config_dir = directories::ProjectDirs::from("", "", "ekapkgs")
+            .map(|d| d.config_dir().to_path_buf())
+            .unwrap_or_else(|| PathBuf::from("~/.config/ekapkgs"));
+        config_dir.join("trusted-envs.toml")
+    }
+
+    pub fn load() -> color_eyre::Result<Self> {
+        let path = Self::db_path();
+        if path.exists() {
+            let contents = std::fs::read_to_string(&path)?;
+            Ok(toml::from_str(&contents)?)
+        } else {
+            Ok(Self::default())
+        }
+    }
+
+    pub fn save(&self) -> color_eyre::Result<()> {
+        let path = Self::db_path();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let contents = toml::to_string_pretty(self)?;
+        std::fs::write(&path, contents)?;
+        Ok(())
+    }
+
+    /// Mark a directory as trusted with the current manifest hash.
+    pub fn allow(&mut self, dir: &Path) -> color_eyre::Result<()> {
+        let canonical = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+        let hash = EnvManifest::content_hash(dir)?;
+        self.entries
+            .insert(canonical.to_string_lossy().into_owned(), hash);
+        Ok(())
+    }
+
+    /// Remove trust for a directory.
+    pub fn disallow(&mut self, dir: &Path) {
+        let canonical = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+        self.entries.remove(canonical.to_string_lossy().as_ref());
+    }
+
+    /// Check if a directory's manifest is trusted (hash matches).
+    pub fn is_trusted(&self, dir: &Path) -> bool {
+        let canonical = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+        let key = canonical.to_string_lossy();
+        let Some(stored_hash) = self.entries.get(key.as_ref()) else {
+            return false;
+        };
+        let Ok(current_hash) = EnvManifest::content_hash(dir) else {
+            return false;
+        };
+        *stored_hash == current_hash
     }
 }

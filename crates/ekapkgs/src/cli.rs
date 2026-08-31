@@ -727,6 +727,18 @@ pub enum EnvCommand {
         json: bool,
     },
 
+    /// Allow the environment in the current directory.
+    ///
+    /// Marks the current manifest as trusted so the shell hook will
+    /// activate it automatically.  Must be re-run after editing the
+    /// manifest.
+    Allow,
+
+    /// Disallow the environment in the current directory.
+    ///
+    /// Removes trust so the shell hook will no longer auto-activate.
+    Disallow,
+
     /// Print a shell hook for automatic environment activation.
     ///
     /// Add the output to your shell configuration (e.g., `.bashrc`,
@@ -742,6 +754,13 @@ pub enum EnvCommand {
     #[command(name = "_profile-bin", hide = true)]
     ProfileBin {
         /// Directory containing the environment manifest.
+        dir: String,
+    },
+
+    /// Check if a directory environment is trusted (used by shell hooks).
+    #[command(name = "_is-trusted", hide = true)]
+    IsTrusted {
+        /// Directory to check.
         dir: String,
     },
 }

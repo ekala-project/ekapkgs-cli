@@ -25,9 +25,10 @@
   - Packages managed via `~/.config/ekapkgs/home-packages.toml` manifest
   - Immediate install/remove via dedicated nix profile at `~/.ekapkgs-packages`
   - Export/import manifest for syncing packages across machines
-- `env init/add/remove/list/hook` command for directory-scoped package environments
+- `env init/add/remove/list/allow/disallow/hook` command for directory-scoped package environments
   - Per-directory `.ekapkgs-env.toml` manifest with automatic nix profile management
   - Shell hooks for bash, zsh, and fish that auto-activate/deactivate on `cd`
+  - Trust model: `env allow` / `env disallow` gate auto-activation (re-allow required after manifest edits)
   - Profiles cached at `~/.cache/ekapkgs/envs/<hash>/profile`
 - `deploy` command with build, transfer, and activation lifecycle
 - `develop` command with cache-aware pre-fetching for dev environments
