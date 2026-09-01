@@ -496,6 +496,12 @@ pub enum HomeCommand {
         #[command(subcommand)]
         command: HomePackagesCommand,
     },
+
+    /// Manage user services.
+    Services {
+        #[command(subcommand)]
+        command: HomeServicesCommand,
+    },
 }
 
 #[derive(Subcommand)]
@@ -541,6 +547,189 @@ pub enum HomePackagesCommand {
         /// Merge with existing packages instead of replacing.
         #[arg(long)]
         merge: bool,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum HomeServicesCommand {
+    /// Add a service to the manifest and activate it.
+    Add {
+        /// Service name (e.g., `openssh`, `my-api`).
+        service: String,
+
+        /// Flake to resolve the service package from.
+        #[arg(long)]
+        flake: Option<String>,
+
+        /// Set configuration options inline (e.g., `--set ports.http.port=8080`).
+        /// Can be repeated.
+        #[arg(long = "set", value_name = "KEY=VALUE")]
+        sets: Vec<String>,
+
+        /// Only update the manifest without building or activating.
+        #[arg(long)]
+        no_apply: bool,
+    },
+
+    /// Remove services from the manifest, stop and uninstall them.
+    Remove {
+        /// Service names to remove.
+        #[arg(required = true)]
+        services: Vec<String>,
+
+        /// Only update the manifest without stopping or uninstalling.
+        #[arg(long)]
+        no_apply: bool,
+    },
+
+    /// Set a configuration option on a service.
+    Set {
+        /// Service name.
+        service: String,
+
+        /// Dot-separated option path (e.g., `ports.http.port`).
+        key: String,
+
+        /// Value to set (parsed according to the option's type).
+        value: String,
+    },
+
+    /// Remove a configuration option, reverting to default.
+    Unset {
+        /// Service name.
+        service: String,
+
+        /// Dot-separated option path to remove.
+        key: String,
+    },
+
+    /// Enable one or more disabled services in the manifest.
+    Enable {
+        /// Service names to enable.
+        #[arg(required = true)]
+        services: Vec<String>,
+    },
+
+    /// Disable services without removing their configuration.
+    Disable {
+        /// Service names to disable.
+        #[arg(required = true)]
+        services: Vec<String>,
+    },
+
+    /// Build service configurations and synchronize with the service manager.
+    Apply {
+        /// Show what would change without making changes.
+        #[arg(long)]
+        dry_run: bool,
+    },
+
+    /// Show the runtime status of managed services.
+    Status {
+        /// Show status for a specific service (default: all).
+        service: Option<String>,
+
+        /// Output as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// View service logs.
+    Logs {
+        /// Service name.
+        service: String,
+
+        /// Follow log output.
+        #[arg(short, long)]
+        follow: bool,
+
+        /// Number of lines to show.
+        #[arg(short = 'n', long, default_value = "100")]
+        lines: u32,
+
+        /// Show logs since a time (e.g., `1h`, `today`).
+        #[arg(long)]
+        since: Option<String>,
+    },
+
+    /// Restart one or more running services.
+    Restart {
+        /// Service names to restart.
+        #[arg(required = true)]
+        services: Vec<String>,
+    },
+
+    /// List managed services.
+    List {
+        /// Output as JSON.
+        #[arg(long)]
+        json: bool,
+
+        /// Include disabled services.
+        #[arg(long)]
+        all: bool,
+    },
+
+    /// Show the full resolved configuration for a service.
+    Inspect {
+        /// Service name.
+        service: String,
+
+        /// Output as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Validate the service manifest without building.
+    Validate {
+        /// Output as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Export the service manifest.
+    Export {
+        /// Output file (default: stdout).
+        #[arg(short, long)]
+        output: Option<String>,
+    },
+
+    /// Import a service manifest.
+    Import {
+        /// Path to the manifest file.
+        file: String,
+
+        /// Merge with existing services instead of replacing.
+        #[arg(long)]
+        merge: bool,
+    },
+
+    /// Manage loginctl linger (required for services to persist beyond login).
+    Linger {
+        /// Enable linger for the current user.
+        #[arg(long)]
+        enable: bool,
+
+        /// Disable linger for the current user.
+        #[arg(long)]
+        disable: bool,
+    },
+
+    /// Show available service options from the schema.
+    Schema {
+        /// Show options for a specific service.
+        service: Option<String>,
+
+        /// Output as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Regenerate the cached service options schema.
+    Update {
+        /// Flake reference to evaluate services from.
+        #[arg(long, default_value = ".")]
+        flake: String,
     },
 }
 

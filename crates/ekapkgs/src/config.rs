@@ -270,6 +270,151 @@ impl SystemPackages {
 }
 
 // ---------------------------------------------------------------------------
+// Home services manifest
+// ---------------------------------------------------------------------------
+
+/// Imperative user service manifest stored at `~/.config/ekapkgs/home-services.toml`.
+///
+/// Each entry describes a user service and its configuration. The `config`
+/// field is a free-form TOML table whose keys correspond to service option
+/// paths from the `ServiceOptionsSchema`.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct HomeServices {
+    #[serde(default = "default_manifest_version")]
+    pub version: u32,
+    #[serde(default = "default_flake")]
+    pub flake: String,
+    #[serde(default)]
+    pub services: Vec<HomeServiceEntry>,
+}
+
+impl Default for HomeServices {
+    fn default() -> Self {
+        Self {
+            version: default_manifest_version(),
+            flake: default_flake(),
+            services: Vec::new(),
+        }
+    }
+}
+
+/// A single service entry in the manifest.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct HomeServiceEntry {
+    pub name: String,
+    #[serde(default = "default_true")]
+    pub enable: bool,
+    /// Overrides the manifest-level default flake for this service.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flake: Option<String>,
+    /// Service configuration options. Keys are dot-path option names
+    /// (e.g., `command`, `ports.http.port`, `settings.permitRootLogin`).
+    /// Validated against the `ServiceOptionsSchema` at the CLI level.
+    #[serde(default, skip_serializing_if = "toml::Table::is_empty")]
+    pub config: toml::Table,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl HomeServices {
+    /// Path to the manifest file.
+    pub fn manifest_path() -> PathBuf {
+        let config_dir = directories::ProjectDirs::from("", "", "ekapkgs")
+            .map(|d| d.config_dir().to_path_buf())
+            .unwrap_or_else(|| PathBuf::from("~/.config/ekapkgs"));
+        config_dir.join("home-services.toml")
+    }
+
+    /// Load from disk, returning defaults if the file does not exist.
+    pub fn load() -> color_eyre::Result<Self> {
+        let path = Self::manifest_path();
+        if path.exists() {
+            let contents = std::fs::read_to_string(&path)?;
+            Ok(toml::from_str(&contents)?)
+        } else {
+            Ok(Self::default())
+        }
+    }
+
+    /// Write the manifest back to disk.
+    pub fn save(&self) -> color_eyre::Result<()> {
+        let path = Self::manifest_path();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let contents = toml::to_string_pretty(self)?;
+        std::fs::write(&path, contents)?;
+        Ok(())
+    }
+
+    /// Add a service if it is not already present. Returns `true` if added.
+    pub fn add(&mut self, entry: HomeServiceEntry) -> bool {
+        if self.services.iter().any(|s| s.name == entry.name) {
+            return false;
+        }
+        self.services.push(entry);
+        true
+    }
+
+    /// Remove a service by name. Returns `true` if it was present.
+    pub fn remove(&mut self, name: &str) -> bool {
+        let before = self.services.len();
+        self.services.retain(|s| s.name != name);
+        self.services.len() < before
+    }
+
+    /// Find a service by name (mutable).
+    pub fn get_mut(&mut self, name: &str) -> Option<&mut HomeServiceEntry> {
+        self.services.iter_mut().find(|s| s.name == name)
+    }
+
+    /// Find a service by name.
+    pub fn get(&self, name: &str) -> Option<&HomeServiceEntry> {
+        self.services.iter().find(|s| s.name == name)
+    }
+}
+
+impl HomeServiceEntry {
+    /// Set a dot-separated config key to a TOML value.
+    ///
+    /// For example, `set_config("ports.http.port", toml::Value::Integer(8080))`
+    /// creates the nested table structure `[config.ports.http]` with `port = 8080`.
+    pub fn set_config(&mut self, key: &str, value: toml::Value) {
+        let segments: Vec<&str> = key.split('.').collect();
+        let mut table = &mut self.config;
+        for &seg in &segments[..segments.len() - 1] {
+            // Navigate or create intermediate tables.
+            if !table.contains_key(seg) {
+                table.insert(seg.to_owned(), toml::Value::Table(toml::Table::new()));
+            }
+            table = table
+                .get_mut(seg)
+                .unwrap()
+                .as_table_mut()
+                .expect("intermediate config key is not a table");
+        }
+        let leaf = segments.last().expect("empty key");
+        table.insert((*leaf).to_owned(), value);
+    }
+
+    /// Remove a dot-separated config key. Returns `true` if it existed.
+    pub fn unset_config(&mut self, key: &str) -> bool {
+        let segments: Vec<&str> = key.split('.').collect();
+        let mut table = &mut self.config;
+        for &seg in &segments[..segments.len() - 1] {
+            match table.get_mut(seg).and_then(|v| v.as_table_mut()) {
+                Some(t) => table = t,
+                None => return false,
+            }
+        }
+        let leaf = segments.last().expect("empty key");
+        table.remove(*leaf).is_some()
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Directory environment manifest (.ekapkgs-env.toml)
 // ---------------------------------------------------------------------------
 
@@ -985,5 +1130,134 @@ mod tests {
         let path1 = EnvManifest::profile_path(dir1.path()).unwrap();
         let path2 = EnvManifest::profile_path(dir2.path()).unwrap();
         assert_ne!(path1, path2);
+    }
+
+    // -----------------------------------------------------------------------
+    // HomeServices
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn home_services_default() {
+        let hs = HomeServices::default();
+        assert_eq!(hs.version, 1);
+        assert_eq!(hs.flake, "nixpkgs");
+        assert!(hs.services.is_empty());
+    }
+
+    #[test]
+    fn home_services_add_remove() {
+        let mut hs = HomeServices::default();
+        let entry = HomeServiceEntry {
+            name: "my-api".into(),
+            enable: true,
+            flake: None,
+            config: toml::Table::new(),
+        };
+        assert!(hs.add(entry.clone()));
+        assert!(!hs.add(entry)); // duplicate
+        assert_eq!(hs.services.len(), 1);
+
+        assert!(hs.remove("my-api"));
+        assert!(!hs.remove("my-api")); // already removed
+        assert!(hs.services.is_empty());
+    }
+
+    #[test]
+    fn home_services_get() {
+        let mut hs = HomeServices::default();
+        hs.add(HomeServiceEntry {
+            name: "sshd".into(),
+            enable: true,
+            flake: None,
+            config: toml::Table::new(),
+        });
+        assert!(hs.get("sshd").is_some());
+        assert!(hs.get("nonexistent").is_none());
+        assert!(hs.get_mut("sshd").is_some());
+    }
+
+    #[test]
+    fn home_service_entry_set_unset_config() {
+        let mut entry = HomeServiceEntry {
+            name: "test".into(),
+            enable: true,
+            flake: None,
+            config: toml::Table::new(),
+        };
+
+        // Set a simple key
+        entry.set_config("command", toml::Value::String("/bin/test".into()));
+        assert_eq!(
+            entry.config.get("command").unwrap().as_str().unwrap(),
+            "/bin/test"
+        );
+
+        // Set a nested key
+        entry.set_config("ports.http.port", toml::Value::Integer(8080));
+        let ports = entry.config.get("ports").unwrap().as_table().unwrap();
+        let http = ports.get("http").unwrap().as_table().unwrap();
+        assert_eq!(http.get("port").unwrap().as_integer().unwrap(), 8080);
+
+        // Unset a leaf key
+        assert!(entry.unset_config("ports.http.port"));
+        let ports = entry.config.get("ports").unwrap().as_table().unwrap();
+        let http = ports.get("http").unwrap().as_table().unwrap();
+        assert!(!http.contains_key("port"));
+
+        // Unset non-existent key
+        assert!(!entry.unset_config("nonexistent.key"));
+    }
+
+    #[test]
+    fn home_services_roundtrip_toml() {
+        let mut hs = HomeServices::default();
+        let mut entry = HomeServiceEntry {
+            name: "my-api".into(),
+            enable: true,
+            flake: Some("github:user/repo".into()),
+            config: toml::Table::new(),
+        };
+        entry.set_config("command", toml::Value::String("/bin/my-api".into()));
+        entry.set_config("description", toml::Value::String("My API".into()));
+        entry.set_config("ports.http.port", toml::Value::Integer(8080));
+        hs.add(entry);
+
+        let toml_str = toml::to_string_pretty(&hs).unwrap();
+        let parsed: HomeServices = toml::from_str(&toml_str).unwrap();
+        assert_eq!(parsed.services.len(), 1);
+        assert_eq!(parsed.services[0].name, "my-api");
+        assert!(parsed.services[0].enable);
+        assert_eq!(
+            parsed.services[0].flake.as_deref(),
+            Some("github:user/repo")
+        );
+        assert_eq!(
+            parsed.services[0]
+                .config
+                .get("command")
+                .unwrap()
+                .as_str()
+                .unwrap(),
+            "/bin/my-api"
+        );
+    }
+
+    #[test]
+    fn home_services_enable_disable() {
+        let mut hs = HomeServices::default();
+        hs.add(HomeServiceEntry {
+            name: "svc".into(),
+            enable: true,
+            flake: None,
+            config: toml::Table::new(),
+        });
+
+        // Disable
+        hs.get_mut("svc").unwrap().enable = false;
+        assert!(!hs.get("svc").unwrap().enable);
+
+        // Enable
+        hs.get_mut("svc").unwrap().enable = true;
+        assert!(hs.get("svc").unwrap().enable);
     }
 }

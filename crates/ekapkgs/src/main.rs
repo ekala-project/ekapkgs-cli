@@ -4,6 +4,7 @@ mod config;
 mod download;
 mod negotiate;
 mod prefetch;
+pub mod service_schema;
 
 use clap::{CommandFactory, Parser};
 
