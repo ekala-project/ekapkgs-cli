@@ -38,10 +38,11 @@ pub enum Command {
     /// Enter a shell with the given packages available.
     Shell {
         /// The installable(s) to make available.
+        #[arg(required = true)]
         installable: Vec<String>,
 
-        /// Extra arguments passed through to nix.
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        /// Extra arguments passed through to nix (after `--`).
+        #[arg(last = true, allow_hyphen_values = true)]
         extra: Vec<String>,
     },
 
@@ -96,6 +97,12 @@ pub enum Command {
         command: FlakeCommand,
     },
 
+    /// Manage flake registries.
+    Registry {
+        #[command(subcommand)]
+        command: RegistryCommand,
+    },
+
     /// Manage the local nix store.
     Store {
         #[command(subcommand)]
@@ -136,6 +143,12 @@ pub enum Command {
         command: SearchCommand,
     },
 
+    /// Manage directory-scoped package environments.
+    Env {
+        #[command(subcommand)]
+        command: EnvCommand,
+    },
+
     /// Check system health and configuration.
     Doctor,
 
@@ -152,6 +165,13 @@ pub enum Command {
         /// Upstream ekapkgs server URL.
         #[arg(long)]
         upstream: Option<String>,
+    },
+
+    /// Generate shell completions.
+    Completions {
+        /// Shell to generate completions for.
+        #[arg(value_enum)]
+        shell: clap_complete::Shell,
     },
 }
 
@@ -258,6 +278,70 @@ pub enum ClosureCommand {
         /// Second installable or store path.
         b: String,
     },
+
+    /// Generate a Software Bill of Materials (SBOM) for a closure.
+    ///
+    /// Produces a CycloneDX 1.7 JSON document listing all packages in
+    /// the runtime closure with dependency relationships. For ekaos
+    /// system closures, enriches components with authoritative metadata
+    /// (license, role, provenance) from the embedded package manifest.
+    Sbom {
+        /// The installable to generate an SBOM for (e.g., `nixpkgs#hello`
+        /// or `.#config.system.build.toplevel`).
+        installable: String,
+
+        /// Output format.
+        #[arg(long, value_enum, default_value = "cyclonedx")]
+        format: SbomFormat,
+
+        /// Include build-time dependencies (default: runtime only).
+        #[arg(long)]
+        buildtime: bool,
+
+        /// Output file (default: stdout).
+        #[arg(short, long)]
+        output: Option<String>,
+    },
+
+    /// Diff two closures and show package changes.
+    ///
+    /// Builds both installables, compares their runtime closures by
+    /// package name, and reports added, removed, and changed packages.
+    /// Useful for reviewing what changed between system generations
+    /// or flake input updates.
+    SbomDiff {
+        /// The old installable or store path.
+        old: String,
+
+        /// The new installable or store path.
+        new: String,
+
+        /// Output format.
+        #[arg(long, value_enum, default_value = "text")]
+        format: SbomDiffFormat,
+
+        /// Output file (default: stdout).
+        #[arg(short, long)]
+        output: Option<String>,
+    },
+}
+
+#[derive(Clone, clap::ValueEnum)]
+pub enum SbomFormat {
+    /// CycloneDX 1.7 JSON.
+    Cyclonedx,
+    /// CSV for quick inspection.
+    Csv,
+}
+
+#[derive(Clone, clap::ValueEnum)]
+pub enum SbomDiffFormat {
+    /// Human-readable text summary (default).
+    Text,
+    /// JSON with structured change records.
+    Json,
+    /// CSV for quick inspection.
+    Csv,
 }
 
 #[derive(Subcommand)]
@@ -320,6 +404,65 @@ pub enum FlakeCommand {
 }
 
 #[derive(Subcommand)]
+pub enum RegistryCommand {
+    /// List all flake registry entries.
+    List,
+
+    /// Add or replace a flake in the user registry.
+    Add {
+        /// Flake reference to map from (e.g., `nixpkgs`).
+        from: String,
+
+        /// Flake reference to map to (e.g., `github:NixOS/nixpkgs`).
+        to: String,
+
+        /// Registry file to operate on (default: user registry).
+        #[arg(long)]
+        registry: Option<String>,
+    },
+
+    /// Remove a flake from the user registry.
+    Remove {
+        /// Flake reference to remove (e.g., `nixpkgs`).
+        entry: String,
+
+        /// Registry file to operate on (default: user registry).
+        #[arg(long)]
+        registry: Option<String>,
+    },
+
+    /// Pin a flake to its current version.
+    Pin {
+        /// Flake reference to pin (e.g., `nixpkgs`).
+        entry: String,
+
+        /// Registry file to operate on (default: user registry).
+        #[arg(long)]
+        registry: Option<String>,
+    },
+
+    /// Unpin a flake by removing its user registry entry.
+    ///
+    /// After unpinning, the flake reference falls through to the
+    /// system or global registry, restoring the default (floating)
+    /// resolution.
+    Unpin {
+        /// Flake reference to unpin (e.g., `nixpkgs`).
+        entry: String,
+
+        /// Registry file to operate on (default: user registry).
+        #[arg(long)]
+        registry: Option<String>,
+    },
+
+    /// Resolve flake references using the registry.
+    Resolve {
+        /// Flake references to resolve.
+        refs: Vec<String>,
+    },
+}
+
+#[derive(Subcommand)]
 pub enum HomeCommand {
     /// Build and activate the home configuration.
     Switch {
@@ -348,8 +491,246 @@ pub enum HomeCommand {
     /// List home configuration generations.
     Generations,
 
-    /// List packages installed via home configuration.
-    Packages,
+    /// Manage imperatively-installed home packages.
+    Packages {
+        #[command(subcommand)]
+        command: HomePackagesCommand,
+    },
+
+    /// Manage user services.
+    Services {
+        #[command(subcommand)]
+        command: HomeServicesCommand,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum HomePackagesCommand {
+    /// Add packages to the home configuration.
+    Add {
+        /// Package names or attribute paths (e.g., `alacritty`,
+        /// `python311Packages.requests`).
+        #[arg(required = true)]
+        packages: Vec<String>,
+
+        /// Flake to resolve packages from (overrides manifest default).
+        #[arg(long)]
+        flake: Option<String>,
+    },
+
+    /// Remove packages from the home configuration.
+    Remove {
+        /// Package names to remove.
+        #[arg(required = true)]
+        packages: Vec<String>,
+    },
+
+    /// List imperatively-installed packages.
+    List {
+        /// Output as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Export the package manifest for syncing to another machine.
+    Export {
+        /// Output file (default: stdout).
+        #[arg(short, long)]
+        output: Option<String>,
+    },
+
+    /// Import a package manifest from another machine.
+    Import {
+        /// Path to the manifest file.
+        file: String,
+
+        /// Merge with existing packages instead of replacing.
+        #[arg(long)]
+        merge: bool,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum HomeServicesCommand {
+    /// Add a service to the manifest and activate it.
+    Add {
+        /// Service name (e.g., `openssh`, `my-api`).
+        service: String,
+
+        /// Flake to resolve the service package from.
+        #[arg(long)]
+        flake: Option<String>,
+
+        /// Set configuration options inline (e.g., `--set ports.http.port=8080`).
+        /// Can be repeated.
+        #[arg(long = "set", value_name = "KEY=VALUE")]
+        sets: Vec<String>,
+
+        /// Only update the manifest without building or activating.
+        #[arg(long)]
+        no_apply: bool,
+    },
+
+    /// Remove services from the manifest, stop and uninstall them.
+    Remove {
+        /// Service names to remove.
+        #[arg(required = true)]
+        services: Vec<String>,
+
+        /// Only update the manifest without stopping or uninstalling.
+        #[arg(long)]
+        no_apply: bool,
+    },
+
+    /// Set a configuration option on a service.
+    Set {
+        /// Service name.
+        service: String,
+
+        /// Dot-separated option path (e.g., `ports.http.port`).
+        key: String,
+
+        /// Value to set (parsed according to the option's type).
+        value: String,
+    },
+
+    /// Remove a configuration option, reverting to default.
+    Unset {
+        /// Service name.
+        service: String,
+
+        /// Dot-separated option path to remove.
+        key: String,
+    },
+
+    /// Enable one or more disabled services in the manifest.
+    Enable {
+        /// Service names to enable.
+        #[arg(required = true)]
+        services: Vec<String>,
+    },
+
+    /// Disable services without removing their configuration.
+    Disable {
+        /// Service names to disable.
+        #[arg(required = true)]
+        services: Vec<String>,
+    },
+
+    /// Build service configurations and synchronize with the service manager.
+    Apply {
+        /// Show what would change without making changes.
+        #[arg(long)]
+        dry_run: bool,
+    },
+
+    /// Show the runtime status of managed services.
+    Status {
+        /// Show status for a specific service (default: all).
+        service: Option<String>,
+
+        /// Output as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// View service logs.
+    Logs {
+        /// Service name.
+        service: String,
+
+        /// Follow log output.
+        #[arg(short, long)]
+        follow: bool,
+
+        /// Number of lines to show.
+        #[arg(short = 'n', long, default_value = "100")]
+        lines: u32,
+
+        /// Show logs since a time (e.g., `1h`, `today`).
+        #[arg(long)]
+        since: Option<String>,
+    },
+
+    /// Restart one or more running services.
+    Restart {
+        /// Service names to restart.
+        #[arg(required = true)]
+        services: Vec<String>,
+    },
+
+    /// List managed services.
+    List {
+        /// Output as JSON.
+        #[arg(long)]
+        json: bool,
+
+        /// Include disabled services.
+        #[arg(long)]
+        all: bool,
+    },
+
+    /// Show the full resolved configuration for a service.
+    Inspect {
+        /// Service name.
+        service: String,
+
+        /// Output as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Validate the service manifest without building.
+    Validate {
+        /// Output as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Export the service manifest.
+    Export {
+        /// Output file (default: stdout).
+        #[arg(short, long)]
+        output: Option<String>,
+    },
+
+    /// Import a service manifest.
+    Import {
+        /// Path to the manifest file.
+        file: String,
+
+        /// Merge with existing services instead of replacing.
+        #[arg(long)]
+        merge: bool,
+    },
+
+    /// Manage loginctl linger (required for services to persist beyond login).
+    Linger {
+        /// Enable linger for the current user.
+        #[arg(long)]
+        enable: bool,
+
+        /// Disable linger for the current user.
+        #[arg(long)]
+        disable: bool,
+    },
+
+    /// Show available service options from the schema.
+    Schema {
+        /// Show options for a specific service.
+        service: Option<String>,
+
+        /// Output as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Regenerate the cached service options schema.
+    Update {
+        /// Flake reference to evaluate services from.
+        #[arg(long, default_value = ".")]
+        flake: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -445,6 +826,199 @@ pub enum SystemCommand {
         #[arg(long)]
         dry_run: bool,
     },
+
+    /// Manage imperatively-installed system packages.
+    Packages {
+        #[command(subcommand)]
+        command: SystemPackagesCommand,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum SystemPackagesCommand {
+    /// Add packages to the system.
+    Add {
+        /// Package names or attribute paths (e.g., `htop`,
+        /// `linuxPackages.perf`).
+        #[arg(required = true)]
+        packages: Vec<String>,
+
+        /// Flake to resolve packages from (overrides manifest default).
+        #[arg(long)]
+        flake: Option<String>,
+    },
+
+    /// Remove packages from the system.
+    Remove {
+        /// Package names to remove.
+        #[arg(required = true)]
+        packages: Vec<String>,
+    },
+
+    /// List imperatively-installed system packages.
+    List {
+        /// Output as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Export the system package manifest.
+    Export {
+        /// Output file (default: stdout).
+        #[arg(short, long)]
+        output: Option<String>,
+    },
+
+    /// Import a system package manifest.
+    Import {
+        /// Path to the manifest file.
+        file: String,
+
+        /// Merge with existing packages instead of replacing.
+        #[arg(long)]
+        merge: bool,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum EnvCommand {
+    /// Initialize a new environment in the current directory.
+    ///
+    /// Creates a `.ekapkgs-env.toml` manifest in the current directory.
+    Init {
+        /// Default flake for packages.
+        #[arg(long, default_value = "nixpkgs")]
+        flake: String,
+    },
+
+    /// Add packages to the directory environment.
+    Add {
+        /// Package names or attribute paths.
+        #[arg(required = true)]
+        packages: Vec<String>,
+
+        /// Flake to resolve packages from (overrides manifest default).
+        #[arg(long)]
+        flake: Option<String>,
+    },
+
+    /// Remove packages from the directory environment.
+    Remove {
+        /// Package names to remove.
+        #[arg(required = true)]
+        packages: Vec<String>,
+    },
+
+    /// Add a flake dev shell to the environment.
+    ///
+    /// Multiple flakes can be composed — their dev shell outputs are
+    /// merged into a single profile.
+    #[command(name = "flake-add")]
+    FlakeAdd {
+        /// Flake reference (e.g., `.`, `github:user/repo`, `path:../other`).
+        #[arg(name = "ref")]
+        ref_: String,
+
+        /// Dev shell attribute to use (default: `default`).
+        #[arg(long, default_value = "default")]
+        devshell: String,
+
+        /// Pin to a specific revision.
+        #[arg(long)]
+        rev: Option<String>,
+
+        /// Override a flake input (can be repeated, format: `name=flakeref`).
+        #[arg(long = "override-input", value_name = "NAME=REF")]
+        override_inputs: Vec<String>,
+    },
+
+    /// Remove a flake dev shell from the environment.
+    #[command(name = "flake-remove")]
+    FlakeRemove {
+        /// Flake reference to remove.
+        #[arg(name = "ref")]
+        ref_: String,
+    },
+
+    /// Pin a flake to a specific revision.
+    #[command(name = "flake-pin")]
+    FlakePin {
+        /// Flake reference to pin.
+        #[arg(name = "ref")]
+        ref_: String,
+
+        /// Revision to pin to. If omitted, pins to the currently resolved revision.
+        #[arg(long)]
+        rev: Option<String>,
+    },
+
+    /// List packages and flakes in the directory environment.
+    List {
+        /// Output as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Rebuild the environment profile from the current manifest and flake state.
+    Reload,
+
+    /// Allow the environment in the current directory.
+    ///
+    /// Marks the current manifest as trusted so the shell hook will
+    /// activate it automatically.  Must be re-run after editing the
+    /// manifest.
+    Allow,
+
+    /// Disallow the environment in the current directory.
+    ///
+    /// Removes trust so the shell hook will no longer auto-activate.
+    Disallow,
+
+    /// Print a shell hook for automatic environment activation.
+    ///
+    /// Add the output to your shell configuration (e.g., `.bashrc`,
+    /// `.zshrc`) to automatically activate/deactivate directory
+    /// environments when navigating with `cd`.
+    Hook {
+        /// Shell to generate the hook for.
+        #[arg(value_enum)]
+        shell: EnvHookShell,
+    },
+
+    /// Print the profile bin path for a directory (used by shell hooks).
+    #[command(name = "_profile-bin", hide = true)]
+    ProfileBin {
+        /// Directory containing the environment manifest.
+        dir: String,
+    },
+
+    /// Check if a directory environment is trusted (used by shell hooks).
+    #[command(name = "_is-trusted", hide = true)]
+    IsTrusted {
+        /// Directory to check.
+        dir: String,
+    },
+
+    /// Print a fingerprint of the environment files for change detection (used by shell hooks).
+    #[command(name = "_fingerprint", hide = true)]
+    Fingerprint {
+        /// Directory to fingerprint.
+        dir: String,
+    },
+
+    /// Rebuild the profile and print the bin path (used by shell hooks).
+    #[command(name = "_reload", hide = true)]
+    ReloadHook {
+        /// Directory to reload.
+        dir: String,
+    },
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+pub enum EnvHookShell {
+    Bash,
+    Zsh,
+    Fish,
 }
 
 #[derive(Subcommand)]

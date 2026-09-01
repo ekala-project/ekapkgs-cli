@@ -759,18 +759,19 @@ fn build_services_nix_expr(manifest: &HomeServices) -> color_eyre::Result<String
             continue;
         }
         let nix_config = toml_table_to_nix(&entry.config);
+        let escaped_name = escape_nix_string(&entry.name);
         service_defs.push(format!(
-            r#"    "{name}" = {{ enable = true; {config} }};"#,
-            name = entry.name,
+            r#"    "{escaped_name}" = {{ enable = true; {config} }};"#,
             config = nix_config,
         ));
     }
     let services_attrset = service_defs.join("\n");
 
+    let escaped_flake_ref = escape_nix_string(&flake_ref);
     let expr = format!(
         r#"
 let
-  flake = builtins.getFlake "{flake_ref}";
+  flake = builtins.getFlake "{escaped_flake_ref}";
   system = builtins.currentSystem;
   pkgs = flake.legacyPackages.${{system}}
          or flake.pkgs.${{system}}
@@ -796,9 +797,9 @@ in merged
                 if !entry.enable {
                     continue;
                 }
+                let escaped_name = escape_nix_string(&entry.name);
                 cmds.push(format!(
-                    r#"    cp ${{units."{name}"}}/{name}.service $out/{name}.service"#,
-                    name = entry.name,
+                    r#"    cp ${{units."{escaped_name}"}}/{escaped_name}.service $out/{escaped_name}.service"#,
                 ));
             }
             cmds.join("\n")
