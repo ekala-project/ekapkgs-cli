@@ -188,8 +188,14 @@ fn cmd_generations() -> color_eyre::Result<()> {
         return Ok(());
     }
 
+    let current_num = entries.last().map(|(num, _)| *num);
     for (num, target) in &entries {
-        println!("{num:>4}  {}", target.display());
+        let marker = if Some(*num) == current_num {
+            " (current)"
+        } else {
+            ""
+        };
+        println!("{num:>4}  {}{marker}", target.display());
     }
 
     Ok(())
