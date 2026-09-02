@@ -361,9 +361,10 @@ fn cmd_packages_import(file: &str, merge: bool) -> color_eyre::Result<()> {
     let contents = std::fs::read_to_string(file)?;
     let imported: HomePackages = toml::from_str(&contents)?;
     let profile = packages_profile_path()?;
+    let old_manifest = HomePackages::load()?;
 
     let mut manifest = if merge {
-        let mut current = HomePackages::load()?;
+        let mut current = old_manifest.clone();
         for entry in imported.packages {
             // Imported entries win on name conflict.
             current.remove(&entry.name);
@@ -376,6 +377,22 @@ fn cmd_packages_import(file: &str, merge: bool) -> color_eyre::Result<()> {
 
     // Preserve the version field.
     manifest.version = default_manifest_version();
+
+    // Remove packages from the nix profile that are in the old manifest
+    // but absent from the new one, so the profile doesn't accumulate
+    // stale entries.
+    let new_names: std::collections::HashSet<&str> =
+        manifest.packages.iter().map(|p| p.name.as_str()).collect();
+    for old_entry in &old_manifest.packages {
+        if !new_names.contains(old_entry.name.as_str()) {
+            tracing::info!("Removing {} from profile...", old_entry.name);
+            let _ = NixCommand::new(&["profile", "remove"])
+                .arg("--profile")
+                .arg(&profile)
+                .arg(&old_entry.name)
+                .stream();
+        }
+    }
 
     manifest.save()?;
 
