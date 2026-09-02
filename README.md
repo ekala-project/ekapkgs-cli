@@ -182,9 +182,19 @@ ekapkgs home packages add my-tool --flake github:user/repo
 
 ### Directory environments
 
-Per-directory package environments with automatic activation, similar to
-direnv. Each directory can have a `.ekapkgs-env.toml` manifest specifying
-packages and flake dev shells:
+Per-directory package environments with automatic activation. Each
+directory can have a `.ekapkgs-env.toml` manifest specifying packages
+and flake dev shells.
+
+When flake dev shells are configured, the shell hook spawns a child shell
+with the full dev environment (environment variables, compiler flags,
+pkg-config paths, etc.) pre-loaded from a cached `nix print-dev-env`
+render. Entering the directory pushes the child shell; leaving it pops
+back to the parent. The environment is pre-rendered on first use and
+re-rendered automatically when manifest or flake files change.
+
+For packages-only manifests (no `[[flakes]]`), the hook uses lightweight
+PATH-only activation without spawning a child shell.
 
 ```
 ekapkgs env init                           # create .ekapkgs-env.toml

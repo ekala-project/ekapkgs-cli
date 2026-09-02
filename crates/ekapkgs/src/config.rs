@@ -608,8 +608,8 @@ impl EnvManifest {
         Ok(h.to_hex().as_str()[..64].to_owned())
     }
 
-    /// Compute the profile path for a given directory under the cache.
-    pub fn profile_path(dir: &Path) -> color_eyre::Result<PathBuf> {
+    /// Compute the env cache directory for a given project directory.
+    pub fn env_dir_path(dir: &Path) -> color_eyre::Result<PathBuf> {
         let cache_dir = directories::ProjectDirs::from("", "", "ekapkgs")
             .map(|d| d.cache_dir().to_path_buf())
             .unwrap_or_else(|| {
@@ -623,7 +623,12 @@ impl EnvManifest {
         };
         let env_dir = cache_dir.join("envs").join(hash);
         std::fs::create_dir_all(&env_dir)?;
-        Ok(env_dir.join("profile"))
+        Ok(env_dir)
+    }
+
+    /// Compute the profile path for a given directory under the cache.
+    pub fn profile_path(dir: &Path) -> color_eyre::Result<PathBuf> {
+        Ok(Self::env_dir_path(dir)?.join("profile"))
     }
 }
 
