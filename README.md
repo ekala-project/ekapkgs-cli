@@ -123,6 +123,9 @@ ekapkgs system prune-boot-entries --gc     # garbage collect first, then prune
 ekapkgs system prune-boot-entries --dry-run
 ```
 
+If activation fails during `system switch`, the previous profile is
+automatically restored and re-activated.
+
 #### Imperative system packages
 
 Add packages to the system imperatively. Managed via
@@ -145,7 +148,11 @@ Replaces `home-manager` for per-user dotfiles, packages, and environment:
 ekapkgs home switch                        # build and activate home config
 ekapkgs home build                         # build only, print store path
 ekapkgs home generations                   # list home generations
+ekapkgs home rollback                      # roll back to previous generation
 ```
+
+If activation fails during `home switch`, the previous generation is
+automatically re-activated.
 
 Home configuration is defined in the ekaos module system under
 `users.users.<name>` and built via `system.build.home`.
@@ -271,6 +278,9 @@ ekapkgs deploy .#nixosConfigurations.prod --target-host prod-server --mode boot
 ekapkgs deploy .#nixosConfigurations.prod --target-host prod-server --build-host builder
 ekapkgs deploy .#nixosConfigurations.prod --target-host prod-server --dry-run
 ```
+
+If remote activation fails, `deploy` prints the SSH command to roll back
+the target host to its previous configuration.
 
 ### System diagnostics
 

@@ -4,6 +4,18 @@
 
 ### Client
 
+- `home rollback` command to revert to the previous home configuration generation
+- `home generations` output now marks the current generation with `(current)`
+- Auto-rollback on activation failure: `system switch` restores the previous profile and re-activates it; `home switch` re-activates the previous generation
+- `deploy` prints a recovery command when remote activation fails
+- `home services apply` reports which services failed to start instead of silently continuing
+- Manifest writes are now atomic (write-then-rename) to prevent data loss on crash
+- Manifest load-modify-save cycles are now protected by advisory file locking to prevent concurrent corruption
+- `home/system packages add` saves the manifest after each successful install so partial failures leave the manifest in sync with the profile
+- `home/system packages import` removes packages from the nix profile that are absent from the new manifest
+- `env reload` resets the profile before rebuilding so packages removed from the manifest don't accumulate
+- `build`, `log`, and `store gc` now return proper errors instead of calling `process::exit()` directly
+
 - `completions` command generating shell completions for bash, zsh, fish, elvish, powershell
 - `registry list/add/remove/pin/unpin/resolve` commands for managing flake registries
 - `closure sbom-diff` command comparing closures by package with CVE, license, and provenance change tracking
