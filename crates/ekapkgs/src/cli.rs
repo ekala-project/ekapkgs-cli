@@ -1015,6 +1015,26 @@ pub enum EnvCommand {
         /// Directory to reload.
         dir: String,
     },
+
+    /// Check if a fresh dev shell env script exists and print its path (used by shell hooks).
+    #[command(name = "_has-devshell", hide = true)]
+    HasDevshell {
+        /// Directory containing the environment manifest.
+        dir: String,
+        /// Shell type.
+        #[arg(value_enum)]
+        shell: EnvHookShell,
+    },
+
+    /// Render the dev shell environment and print the script path (used by shell hooks).
+    #[command(name = "_render-env", hide = true)]
+    RenderEnv {
+        /// Directory containing the environment manifest.
+        dir: String,
+        /// Shell type to render for.
+        #[arg(value_enum)]
+        shell: EnvHookShell,
+    },
 }
 
 #[derive(Clone, Copy, clap::ValueEnum)]

@@ -4,6 +4,12 @@
 
 ### Client
 
+- Pre-rendered dev shell environments with child shell spawning for directory environments
+  - Flake dev shells are rendered via `nix print-dev-env --json` and cached as sourceable scripts
+  - Entering a directory with flake dev shells spawns a child shell with the full dev environment
+  - Leaving the directory exits the child shell, returning to the parent
+  - Environment re-renders automatically when manifest or flake files change
+  - Packages-only manifests retain the existing lightweight PATH-only behavior
 - `home rollback` command to revert to the previous home configuration generation
 - `home generations` output now marks the current generation with `(current)`
 - Auto-rollback on activation failure: `system switch` restores the previous profile and re-activates it; `home switch` re-activates the previous generation
