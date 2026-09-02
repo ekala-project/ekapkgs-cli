@@ -1,6 +1,20 @@
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+
+/// Write contents to a file atomically using write-then-rename.
+///
+/// Writes to a temporary file in the same directory, then renames it
+/// over the target path. This ensures readers never see a truncated file
+/// on crash or power loss.
+fn atomic_write(path: &Path, contents: &str) -> std::io::Result<()> {
+    let dir = path.parent().unwrap_or(Path::new("."));
+    let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
+    tmp.write_all(contents.as_bytes())?;
+    tmp.persist(path)?;
+    Ok(())
+}
 
 #[derive(Debug, Deserialize, Clone, Default)]
 pub struct ClientConfig {
@@ -155,7 +169,7 @@ impl HomePackages {
             std::fs::create_dir_all(parent)?;
         }
         let contents = toml::to_string_pretty(self)?;
-        std::fs::write(&path, contents)?;
+        atomic_write(&path, &contents)?;
         Ok(())
     }
 
@@ -242,7 +256,7 @@ impl SystemPackages {
             std::fs::create_dir_all(parent)?;
         }
         let contents = toml::to_string_pretty(self)?;
-        std::fs::write(&path, contents)?;
+        atomic_write(&path, &contents)?;
         Ok(())
     }
 
@@ -345,7 +359,7 @@ impl HomeServices {
             std::fs::create_dir_all(parent)?;
         }
         let contents = toml::to_string_pretty(self)?;
-        std::fs::write(&path, contents)?;
+        atomic_write(&path, &contents)?;
         Ok(())
     }
 
@@ -492,7 +506,7 @@ impl EnvManifest {
     pub fn save_to(&self, dir: &Path) -> color_eyre::Result<()> {
         let path = dir.join(ENV_MANIFEST_NAME);
         let contents = toml::to_string_pretty(self)?;
-        std::fs::write(&path, contents)?;
+        atomic_write(&path, &contents)?;
         Ok(())
     }
 
@@ -597,7 +611,7 @@ impl TrustedEnvs {
             std::fs::create_dir_all(parent)?;
         }
         let contents = toml::to_string_pretty(self)?;
-        std::fs::write(&path, contents)?;
+        atomic_write(&path, &contents)?;
         Ok(())
     }
 
