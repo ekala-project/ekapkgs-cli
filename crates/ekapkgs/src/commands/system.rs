@@ -686,9 +686,10 @@ fn cmd_packages_export(output: Option<&str>) -> color_eyre::Result<()> {
 fn cmd_packages_import(file: &str, merge: bool) -> color_eyre::Result<()> {
     let contents = std::fs::read_to_string(file)?;
     let imported: SystemPackages = toml::from_str(&contents)?;
+    let old_manifest = SystemPackages::load()?;
 
     let mut manifest = if merge {
-        let mut current = SystemPackages::load()?;
+        let mut current = old_manifest.clone();
         for entry in imported.packages {
             current.remove(&entry.name);
             current.packages.push(entry);
@@ -699,6 +700,22 @@ fn cmd_packages_import(file: &str, merge: bool) -> color_eyre::Result<()> {
     };
 
     manifest.version = 1;
+
+    // Remove packages from the nix profile that are in the old manifest
+    // but absent from the new one.
+    let new_names: HashSet<&str> = manifest.packages.iter().map(|p| p.name.as_str()).collect();
+    for old_entry in &old_manifest.packages {
+        if !new_names.contains(old_entry.name.as_str()) {
+            tracing::info!("Removing {} from profile...", old_entry.name);
+            let _ = Command::new("sudo")
+                .args(["nix", "profile", "remove", "--profile", PACKAGES_PROFILE])
+                .arg(&old_entry.name)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
+    }
+
     manifest.save()?;
 
     // Sync the nix profile: install all packages from the manifest.
