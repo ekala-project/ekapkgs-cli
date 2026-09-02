@@ -165,16 +165,23 @@ fn cmd_packages_add(packages: &[String], flake_override: Option<&str>) -> color_
         }
 
         tracing::info!("Installing {installable}...");
-        NixCommand::new(&["profile", "install"])
+        if let Err(e) = NixCommand::new(&["profile", "install"])
             .arg("--profile")
             .arg(&profile)
             .arg(&installable)
-            .stream()?;
+            .stream()
+        {
+            // Install failed — remove the entry we just added so the
+            // manifest stays in sync with the profile.
+            manifest.remove(name);
+            return Err(e.into());
+        }
 
+        // Save after each successful install so the manifest reflects
+        // what is actually in the profile even if a later install fails.
+        manifest.save()?;
         added += 1;
     }
-
-    manifest.save()?;
 
     if added > 0 {
         println!(
