@@ -64,6 +64,7 @@ uuid = { version = "1", features = ["v4"] }
 toml = "0.8"
 directories = "6"
 tempfile = "3"
+fs2 = "0.4"
 
 aws-sdk-s3 = "1"
 aws-config = { version = "1", features = ["behavior-version-latest"] }
