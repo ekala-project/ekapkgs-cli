@@ -8,7 +8,10 @@ pub fn execute(installable: &str) -> color_eyre::Result<()> {
                 tracing::warn!("Build log not available locally");
                 tracing::info!("Hint: the derivation may need to be built first");
             }
-            std::process::exit(status.code().unwrap_or(1));
+            Err(color_eyre::eyre::eyre!(
+                "nix log failed (exit {})",
+                status.code().unwrap_or(1)
+            ))
         },
         Err(e) => Err(e.into()),
     }
