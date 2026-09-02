@@ -540,7 +540,7 @@ fn cmd_packages(command: SystemPackagesCommand) -> color_eyre::Result<()> {
 }
 
 fn cmd_packages_add(packages: &[String], flake_override: Option<&str>) -> color_eyre::Result<()> {
-    let mut manifest = SystemPackages::load()?;
+    let (mut manifest, _lock) = SystemPackages::load_locked()?;
     let mut added = 0u32;
 
     for name in packages {
@@ -596,7 +596,7 @@ fn cmd_packages_add(packages: &[String], flake_override: Option<&str>) -> color_
 }
 
 fn cmd_packages_remove(packages: &[String]) -> color_eyre::Result<()> {
-    let mut manifest = SystemPackages::load()?;
+    let (mut manifest, _lock) = SystemPackages::load_locked()?;
     let mut removed = 0u32;
 
     for name in packages {
@@ -686,7 +686,7 @@ fn cmd_packages_export(output: Option<&str>) -> color_eyre::Result<()> {
 fn cmd_packages_import(file: &str, merge: bool) -> color_eyre::Result<()> {
     let contents = std::fs::read_to_string(file)?;
     let imported: SystemPackages = toml::from_str(&contents)?;
-    let old_manifest = SystemPackages::load()?;
+    let (old_manifest, _lock) = SystemPackages::load_locked()?;
 
     let mut manifest = if merge {
         let mut current = old_manifest.clone();
