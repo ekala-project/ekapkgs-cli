@@ -106,6 +106,10 @@ pub fn execute(
         .map_err(|e| color_eyre::eyre::eyre!("failed to ssh to {target_host}: {e}"))?;
 
     if !status.success() {
+        tracing::error!(
+            "To roll back on the remote host, run:\n  ssh {target_host} sudo \
+             /nix/var/nix/profiles/system/bin/switch-to-configuration switch"
+        );
         return Err(color_eyre::eyre::eyre!(
             "Activation failed on {target_host} (exit {})",
             status.code().unwrap_or(1)
@@ -144,7 +148,10 @@ fn deploy_via_nixos_rebuild(
         .map_err(|e| color_eyre::eyre::eyre!("failed to run nixos-rebuild: {e}"))?;
 
     if !status.success() {
-        std::process::exit(status.code().unwrap_or(1));
+        return Err(color_eyre::eyre::eyre!(
+            "nixos-rebuild failed (exit {})",
+            status.code().unwrap_or(1)
+        ));
     }
 
     tracing::info!("Deploy complete");
