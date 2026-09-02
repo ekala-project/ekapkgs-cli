@@ -780,6 +780,7 @@ fn cmd_services_apply(dry_run: bool) -> color_eyre::Result<()> {
             .stderr(Stdio::null())
             .status();
 
+        let mut failed_services: Vec<String> = Vec::new();
         for entry in &enabled {
             let unit = format!("{}.service", entry.name);
             // Enable the service
@@ -799,9 +800,23 @@ fn cmd_services_apply(dry_run: bool) -> color_eyre::Result<()> {
                     tracing::info!("Started {}", entry.name);
                 },
                 _ => {
-                    tracing::warn!("Failed to start {}", entry.name);
+                    failed_services.push(entry.name.clone());
                 },
             }
+        }
+
+        if !failed_services.is_empty() {
+            println!("Services applied with {} error(s):", failed_services.len());
+            for name in &failed_services {
+                println!(
+                    "  {} failed to start — check logs with `ekapkgs home services logs {name}`",
+                    name.bold()
+                );
+            }
+            return Err(color_eyre::eyre::eyre!(
+                "{} service(s) failed to start",
+                failed_services.len()
+            ));
         }
     } else if !to_remove.is_empty() {
         // Only removals — still need daemon-reload
