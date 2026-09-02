@@ -218,7 +218,7 @@ fn packages_profile_path() -> color_eyre::Result<String> {
 }
 
 fn cmd_packages_add(packages: &[String], flake_override: Option<&str>) -> color_eyre::Result<()> {
-    let mut manifest = HomePackages::load()?;
+    let (mut manifest, _lock) = HomePackages::load_locked()?;
     let profile = packages_profile_path()?;
     let mut added = 0u32;
 
@@ -280,7 +280,7 @@ fn cmd_packages_add(packages: &[String], flake_override: Option<&str>) -> color_
 }
 
 fn cmd_packages_remove(packages: &[String]) -> color_eyre::Result<()> {
-    let mut manifest = HomePackages::load()?;
+    let (mut manifest, _lock) = HomePackages::load_locked()?;
     let profile = packages_profile_path()?;
     let mut removed = 0u32;
 
@@ -361,7 +361,7 @@ fn cmd_packages_import(file: &str, merge: bool) -> color_eyre::Result<()> {
     let contents = std::fs::read_to_string(file)?;
     let imported: HomePackages = toml::from_str(&contents)?;
     let profile = packages_profile_path()?;
-    let old_manifest = HomePackages::load()?;
+    let (old_manifest, _lock) = HomePackages::load_locked()?;
 
     let mut manifest = if merge {
         let mut current = old_manifest.clone();
@@ -475,7 +475,7 @@ fn cmd_services_add(
     sets: &[String],
     no_apply: bool,
 ) -> color_eyre::Result<()> {
-    let mut manifest = HomeServices::load()?;
+    let (mut manifest, _lock) = HomeServices::load_locked()?;
 
     if manifest.get(service).is_some() {
         return Err(color_eyre::eyre::eyre!(
@@ -516,7 +516,7 @@ fn cmd_services_add(
 }
 
 fn cmd_services_remove(services: &[String], no_apply: bool) -> color_eyre::Result<()> {
-    let mut manifest = HomeServices::load()?;
+    let (mut manifest, _lock) = HomeServices::load_locked()?;
     let mut removed = 0u32;
 
     for name in services {
@@ -540,7 +540,7 @@ fn cmd_services_remove(services: &[String], no_apply: bool) -> color_eyre::Resul
 }
 
 fn cmd_services_set(service: &str, key: &str, value: &str) -> color_eyre::Result<()> {
-    let mut manifest = HomeServices::load()?;
+    let (mut manifest, _lock) = HomeServices::load_locked()?;
 
     let entry = manifest.get_mut(service).ok_or_else(|| {
         color_eyre::eyre::eyre!("Service '{service}' not found in manifest. Use `add` first.")
@@ -560,7 +560,7 @@ fn cmd_services_set(service: &str, key: &str, value: &str) -> color_eyre::Result
 }
 
 fn cmd_services_unset(service: &str, key: &str) -> color_eyre::Result<()> {
-    let mut manifest = HomeServices::load()?;
+    let (mut manifest, _lock) = HomeServices::load_locked()?;
 
     let entry = manifest
         .get_mut(service)
@@ -581,7 +581,7 @@ fn cmd_services_unset(service: &str, key: &str) -> color_eyre::Result<()> {
 }
 
 fn cmd_services_enable(services: &[String]) -> color_eyre::Result<()> {
-    let mut manifest = HomeServices::load()?;
+    let (mut manifest, _lock) = HomeServices::load_locked()?;
     let mut count = 0u32;
 
     for name in services {
@@ -611,7 +611,7 @@ fn cmd_services_enable(services: &[String]) -> color_eyre::Result<()> {
 }
 
 fn cmd_services_disable(services: &[String]) -> color_eyre::Result<()> {
-    let mut manifest = HomeServices::load()?;
+    let (mut manifest, _lock) = HomeServices::load_locked()?;
     let mut count = 0u32;
 
     for name in services {
@@ -1281,6 +1281,7 @@ fn cmd_services_export(output: Option<&str>) -> color_eyre::Result<()> {
 fn cmd_services_import(file: &str, merge: bool) -> color_eyre::Result<()> {
     let contents = std::fs::read_to_string(file)?;
     let imported: HomeServices = toml::from_str(&contents)?;
+    let _lock = crate::config::FileLock::acquire(&HomeServices::manifest_path())?;
 
     let manifest = if merge {
         let mut current = HomeServices::load()?;

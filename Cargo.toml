@@ -57,6 +57,7 @@ prometheus = "0.13"
 toml = "0.8"
 directories = "6"
 tempfile = "3"
+fs2 = "0.4"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

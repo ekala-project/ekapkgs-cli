@@ -1,6 +1,7 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 
 /// Write contents to a file atomically using write-then-rename.
@@ -14,6 +15,33 @@ fn atomic_write(path: &Path, contents: &str) -> std::io::Result<()> {
     tmp.write_all(contents.as_bytes())?;
     tmp.persist(path)?;
     Ok(())
+}
+
+/// Guard that holds an exclusive advisory lock on a file.
+///
+/// The lock is released when the guard is dropped.  Used to prevent
+/// concurrent manifest modifications from corrupting state.
+pub struct FileLock {
+    _file: std::fs::File,
+}
+
+impl FileLock {
+    /// Acquire an exclusive lock on a `.lock` file next to `path`.
+    ///
+    /// Blocks until the lock is available.
+    pub fn acquire(path: &Path) -> std::io::Result<Self> {
+        let lock_path = path.with_extension("toml.lock");
+        if let Some(parent) = lock_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&lock_path)?;
+        file.lock_exclusive()?;
+        Ok(Self { _file: file })
+    }
 }
 
 #[derive(Debug, Deserialize, Clone, Default)]
@@ -162,6 +190,16 @@ impl HomePackages {
         }
     }
 
+    /// Load from disk while holding an exclusive lock.
+    ///
+    /// The returned [`FileLock`] must be held until all modifications
+    /// are saved.  Dropping it releases the lock.
+    pub fn load_locked() -> color_eyre::Result<(Self, FileLock)> {
+        let lock = FileLock::acquire(&Self::manifest_path())?;
+        let manifest = Self::load()?;
+        Ok((manifest, lock))
+    }
+
     /// Write the manifest back to disk.
     pub fn save(&self) -> color_eyre::Result<()> {
         let path = Self::manifest_path();
@@ -247,6 +285,13 @@ impl SystemPackages {
         } else {
             Ok(Self::default())
         }
+    }
+
+    /// Load from disk while holding an exclusive lock.
+    pub fn load_locked() -> color_eyre::Result<(Self, FileLock)> {
+        let lock = FileLock::acquire(&Self::manifest_path())?;
+        let manifest = Self::load()?;
+        Ok((manifest, lock))
     }
 
     /// Write the manifest back to disk.
@@ -350,6 +395,13 @@ impl HomeServices {
         } else {
             Ok(Self::default())
         }
+    }
+
+    /// Load from disk while holding an exclusive lock.
+    pub fn load_locked() -> color_eyre::Result<(Self, FileLock)> {
+        let lock = FileLock::acquire(&Self::manifest_path())?;
+        let manifest = Self::load()?;
+        Ok((manifest, lock))
     }
 
     /// Write the manifest back to disk.
