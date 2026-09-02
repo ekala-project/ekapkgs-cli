@@ -420,12 +420,28 @@ fn compute_fingerprint(dir: &std::path::Path) -> String {
 }
 
 /// Build the profile from manifest packages and flake dev shells.
+///
+/// Removes the existing profile first so stale entries from packages or
+/// flakes that were removed from the manifest don't accumulate.
 #[allow(clippy::unnecessary_wraps)]
 fn sync_profile_from_manifest(
     manifest: &EnvManifest,
     profile_str: &str,
     _dir: &std::path::Path,
 ) -> color_eyre::Result<()> {
+    // Remove the existing profile so we start fresh.  This ensures
+    // packages/flakes removed from the manifest are also removed from
+    // the profile rather than accumulating as stale entries.
+    let profile_path = std::path::Path::new(profile_str);
+    if profile_path.exists() {
+        let _ = std::fs::remove_file(profile_path);
+    }
+    // Also remove the profile lock file that nix creates alongside it.
+    let lock_path = profile_path.with_extension("lock");
+    if lock_path.exists() {
+        let _ = std::fs::remove_file(&lock_path);
+    }
+
     // Install each flake dev shell.
     for flake_entry in &manifest.flakes {
         let mut flake_ref = flake_entry.ref_.clone();
