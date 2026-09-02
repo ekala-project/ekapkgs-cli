@@ -54,6 +54,9 @@ fn cmd_activate(
         return Ok(());
     }
 
+    // Record previous profile target so we can roll back on failure.
+    let prev_target = std::fs::read_link(SYSTEM_PROFILE).ok();
+
     // Update the system profile (requires root).
     tracing::info!("Setting system profile...");
     let status = Command::new("sudo")
@@ -86,6 +89,27 @@ fn cmd_activate(
         .map_err(|e| color_eyre::eyre::eyre!("failed to run activation: {e}"))?;
 
     if !status.success() {
+        // Activation failed — try to restore the previous profile and
+        // re-activate it so the system isn't left in a broken state.
+        if let Some(prev) = &prev_target {
+            let prev_str = prev.to_string_lossy();
+            tracing::warn!(
+                "Activation failed, rolling back to previous configuration ({prev_str})..."
+            );
+            let _ = Command::new("sudo")
+                .args(["nix-env", "--profile", SYSTEM_PROFILE, "--set"])
+                .arg(prev_str.as_ref())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+            let prev_activate = format!("{prev_str}/bin/switch-to-configuration");
+            let _ = Command::new("sudo")
+                .arg(&prev_activate)
+                .arg("switch")
+                .stdout(Stdio::inherit())
+                .stderr(Stdio::inherit())
+                .status();
+        }
         return Err(color_eyre::eyre::eyre!(
             "Activation failed (exit {})",
             status.code().unwrap_or(1)

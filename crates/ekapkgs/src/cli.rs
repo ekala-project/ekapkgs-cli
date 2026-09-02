@@ -491,6 +491,9 @@ pub enum HomeCommand {
     /// List home configuration generations.
     Generations,
 
+    /// Roll back to the previous home configuration generation.
+    Rollback,
+
     /// Manage imperatively-installed home packages.
     Packages {
         #[command(subcommand)]

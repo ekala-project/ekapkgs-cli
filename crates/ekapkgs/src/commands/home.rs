@@ -15,6 +15,7 @@ pub fn execute(command: HomeCommand) -> color_eyre::Result<()> {
         HomeCommand::Switch { installable, extra } => cmd_switch(&installable, &extra),
         HomeCommand::Build { installable, extra } => cmd_build(&installable, &extra),
         HomeCommand::Generations => cmd_generations(),
+        HomeCommand::Rollback => cmd_rollback(),
         HomeCommand::Packages { command } => cmd_packages(command),
         HomeCommand::Services { command } => cmd_services(command),
     }
@@ -27,6 +28,9 @@ pub fn execute(command: HomeCommand) -> color_eyre::Result<()> {
 fn cmd_switch(installable: &str, extra: &[String]) -> color_eyre::Result<()> {
     let store_path = build_home(installable, extra)?;
 
+    // Record the previous generation so we can roll back on failure.
+    let prev_generation = find_previous_generation();
+
     // Activate as current user (no sudo).
     tracing::info!("Activating home configuration...");
     let activate_path = format!("{store_path}/activate");
@@ -37,6 +41,19 @@ fn cmd_switch(installable: &str, extra: &[String]) -> color_eyre::Result<()> {
         .map_err(|e| color_eyre::eyre::eyre!("failed to run activation script: {e}"))?;
 
     if !status.success() {
+        // Activation failed — try to re-activate the previous generation
+        // so the home directory isn't left in a broken state.
+        if let Some((prev_num, prev_path)) = &prev_generation {
+            let prev_str = prev_path.to_string_lossy();
+            tracing::warn!(
+                "Activation failed, rolling back to generation {prev_num} ({prev_str})..."
+            );
+            let prev_activate = format!("{prev_str}/activate");
+            let _ = std::process::Command::new(&prev_activate)
+                .stdout(Stdio::inherit())
+                .stderr(Stdio::inherit())
+                .status();
+        }
         return Err(color_eyre::eyre::eyre!(
             "Home activation failed (exit {})",
             status.code().unwrap_or(1)
@@ -45,6 +62,60 @@ fn cmd_switch(installable: &str, extra: &[String]) -> color_eyre::Result<()> {
 
     tracing::info!("Home configuration activated");
     Ok(())
+}
+
+fn cmd_rollback() -> color_eyre::Result<()> {
+    let (prev_num, prev_path) = find_previous_generation().ok_or_else(|| {
+        color_eyre::eyre::eyre!("No previous home generation found to roll back to")
+    })?;
+
+    let prev_str = prev_path.to_string_lossy();
+    tracing::info!("Rolling back to generation {prev_num}: {prev_str}");
+
+    let activate_path = format!("{prev_str}/activate");
+    let status = std::process::Command::new(&activate_path)
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
+        .map_err(|e| color_eyre::eyre::eyre!("failed to run activation script: {e}"))?;
+
+    if !status.success() {
+        return Err(color_eyre::eyre::eyre!(
+            "Rollback activation failed (exit {})",
+            status.code().unwrap_or(1)
+        ));
+    }
+
+    tracing::info!("Rolled back to generation {prev_num}");
+    Ok(())
+}
+
+/// Find the previous home generation by reading the generations directory.
+fn find_previous_generation() -> Option<(u64, std::path::PathBuf)> {
+    let state_dir = dirs_path().ok()?.join("generations");
+    if !state_dir.exists() {
+        return None;
+    }
+
+    let mut entries: Vec<(u64, std::path::PathBuf)> = std::fs::read_dir(&state_dir)
+        .ok()?
+        .filter_map(std::result::Result::ok)
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let num: u64 = name.parse().ok()?;
+            let target = std::fs::read_link(e.path()).ok()?;
+            Some((num, target))
+        })
+        .collect();
+
+    entries.sort_by_key(|(num, _)| *num);
+
+    // The previous generation is the second-to-last entry.
+    if entries.len() >= 2 {
+        Some(entries[entries.len() - 2].clone())
+    } else {
+        None
+    }
 }
 
 fn cmd_build(installable: &str, extra: &[String]) -> color_eyre::Result<()> {
