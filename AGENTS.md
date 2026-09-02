@@ -163,12 +163,16 @@ Two models supported:
 
 Replaces `nixos-rebuild` for local system configuration. Builds `system.build.toplevel` from the flake, manages `/nix/var/nix/profiles/system`, and activates via `switch-to-configuration`. Subcommands: `switch`, `boot`, `test`, `build`, `list-generations`, `rollback`, `prune-boot-entries`.
 
+- `switch` auto-rolls back to the previous profile if activation fails
 - `prune-boot-entries` removes orphaned BLS entries, kernel/initrd files, and UKI files from the ESP after generations are garbage collected
 - `--gc` flag on `prune-boot-entries` runs `nix-collect-garbage -d` first
 
 ### Home Configuration (`ekapkgs home`)
 
-Replaces `home-manager`. Per-user dotfiles, packages, environment variables, shell aliases, and activation scripts are defined in the ekaos module system under `users.users.<name>` and built as `system.build.home`. The activation script runs as the user (no root) and manages symlinks into `$HOME` with a JSON manifest for cleanup. State stored at `~/.config/ekaos/`.
+Replaces `home-manager`. Per-user dotfiles, packages, environment variables, shell aliases, and activation scripts are defined in the ekaos module system under `users.users.<name>` and built as `system.build.home`. The activation script runs as the user (no root) and manages symlinks into `$HOME` with a JSON manifest for cleanup. State stored at `~/.config/ekaos/`. Subcommands: `switch`, `build`, `generations`, `rollback`, `packages`, `services`.
+
+- `switch` auto-rolls back to the previous generation if activation fails
+- `rollback` activates the previous home generation
 
 Related ekaos module: `modules/config/home.nix` in the `core-pkgs` repo.
 
@@ -194,6 +198,49 @@ Generates CycloneDX 1.7 JSON or CSV Software Bill of Materials from a nix closur
 
 Related ekaos module: `modules/system/package-manifest.nix` in the `core-pkgs` repo generates the embedded manifest with role classification (`default`, `user`, `service`, `home`, `boot`).
 
+### Directory Environments (`ekapkgs env`)
+
+Per-directory package and dev shell environments with automatic shell hook activation. Manifests are `.ekapkgs-env.toml` files in the project root. Two activation modes:
+
+**Packages-only mode** (manifest has only `[[packages]]`): The shell hook prepends the nix profile's `bin/` to PATH. Lightweight, no child shell.
+
+**Dev shell mode** (manifest has `[[flakes]]`): The shell hook spawns a child shell with the full dev environment pre-loaded. The environment is rendered via `nix print-dev-env --json` and cached as sourceable scripts. Entering the directory pushes the child shell; leaving exits it, returning to the parent.
+
+#### Key files and state
+
+- Manifest: `.ekapkgs-env.toml` (per-directory, committed to repo)
+- Profile: `~/.cache/ekapkgs/envs/{blake3(dir)[..32]}/profile` (nix profile with packages/flake outputs)
+- Rendered env scripts: `~/.cache/ekapkgs/envs/{hash}/env.{bash,zsh,fish}` (sourceable dev shell scripts)
+- Fingerprint: `~/.cache/ekapkgs/envs/{hash}/env.fingerprint` (for staleness checks)
+- Trust database: `~/.config/ekapkgs/trusted-envs.toml` (maps canonical dir path → manifest content hash)
+
+#### Dev shell rendering pipeline
+
+`render_dev_env()` in `commands/env.rs`:
+1. For each `[[flakes]]` entry, runs `nix print-dev-env --json {flake}#devShells.{system}.{devshell}`
+2. Parses `PrintDevEnvOutput` (variables + bashFunctions)
+3. Merges results from multiple flakes (PATH concatenated, other vars last-wins, functions unioned)
+4. Filters out skip-listed variables (session, bash-internal, nix-build-internal — `SKIP_VARIABLES` const)
+5. Writes shell-specific scripts (`env.bash`, `env.zsh`, `env.fish`) and `env.fingerprint`
+6. Triggered by `ekapkgs env reload` or lazily by the shell hook on first activation
+
+#### Shell hook architecture
+
+Three embedded shell hooks (bash, zsh, fish) in `commands/env.rs`. Key functions:
+
+- `_ekapkgs_env_hook()` — runs on every prompt/chpwd; walks up directory tree looking for `.ekapkgs-env.toml`; guarded by `_EKAPKGS_ENV_CHILD`, `_EKAPKGS_ENV_SPAWNING`, and `_EKAPKGS_ENV_COOLDOWN` to prevent recursion and re-spawn loops
+- `_ekapkgs_env_activate()` — checks trust, probes for cached dev shell (`_has-devshell`), spawns child shell or falls back to PATH-only; lazy-renders on first activation
+- `_ekapkgs_env_spawn_child()` — spawns a child shell (bash: `--rcfile`, zsh: `ZDOTDIR` tempdir, fish: `--init-command`) that sources the pre-rendered env script and monitors `cd` via prompt hook
+- `_ekapkgs_env_deactivate()` — restores PATH from backup (packages-only mode)
+
+Hidden internal commands used by hooks: `_profile-bin`, `_is-trusted`, `_fingerprint`, `_reload`, `_has-devshell`, `_render-env`.
+
+#### Trust and change detection
+
+- `env allow` stores `blake3(manifest contents)` — any manifest edit invalidates trust
+- `compute_fingerprint()` hashes mtimes of `.ekapkgs-env.toml`, `flake.nix`, `flake.lock` — cheap per-prompt staleness check
+- Inside a child shell, fingerprint changes trigger `_render-env` + re-source (live reload without exiting)
+
 ### Flake Registry (`ekapkgs registry`)
 
 Wraps `nix registry` subcommands for managing flake registries. Registries map symbolic flake identifiers (e.g., `nixpkgs`) to full URLs (e.g., `github:NixOS/nixpkgs`). Subcommands: `list`, `add`, `remove`, `pin`, `resolve`.
@@ -205,3 +252,5 @@ Wraps `nix registry` subcommands for managing flake registries. Registries map s
 ### Client Configuration
 
 Config at `~/.config/ekapkgs/config.toml`. Supports multiple caches with priorities and per-cache tokens.
+
+All TOML manifest writes (home-packages, system-packages, home-services, env manifests, trusted-envs) use atomic write-then-rename via `tempfile::NamedTempFile`. Mutation commands hold an advisory file lock (`fs2::lock_exclusive`) for the entire load-modify-save window to prevent concurrent corruption.
