@@ -105,8 +105,10 @@ pub fn execute(installable: &str, extra: &[String]) -> color_eyre::Result<()> {
         },
         Err(NixError::Failed { status, .. }) => {
             // Nix's stderr was already printed by stream_with_monitor.
-            // Exit with nix's exit code without additional ekapkgs error output.
-            std::process::exit(status.code().unwrap_or(1));
+            Err(color_eyre::eyre::eyre!(
+                "nix build failed (exit {})",
+                status.code().unwrap_or(1)
+            ))
         },
         Err(e) => Err(e.into()),
     }
