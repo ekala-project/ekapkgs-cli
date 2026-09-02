@@ -1,5 +1,5 @@
 use ekapkgs_nix::installable::Installable;
-use ekapkgs_nix::{NixCommand, eval, store};
+use ekapkgs_nix::{NixCommand, NixError, eval, store};
 
 use crate::config::ClientConfig;
 
@@ -55,12 +55,8 @@ pub fn execute(installable: &str, extra: &[String]) -> color_eyre::Result<()> {
             rt.block_on(async {
                 let spinner = ekapkgs_ui::progress::spinner("Negotiating with cache...");
 
-                let response = crate::negotiate::negotiate(
-                    &server_url,
-                    want_hashes,
-                    have_hashes,
-                )
-                .await?;
+                let response =
+                    crate::negotiate::negotiate(&server_url, want_hashes, have_hashes).await?;
 
                 spinner.finish_and_clear();
 
@@ -72,8 +68,8 @@ pub fn execute(installable: &str, extra: &[String]) -> color_eyre::Result<()> {
                 if avail > 0 {
                     tracing::info!(
                         "{avail} paths to download ({} download, {} unpacked)",
-                        format_bytes(dl_size),
-                        format_bytes(nar_size),
+                        ekapkgs_ui::format::format_bytes(dl_size),
+                        ekapkgs_ui::format::format_bytes(nar_size),
                     );
 
                     crate::download::download_and_import(
@@ -102,24 +98,18 @@ pub fn execute(installable: &str, extra: &[String]) -> color_eyre::Result<()> {
     for arg in extra {
         cmd = cmd.arg(arg);
     }
-    cmd.stream()?;
-
-    tracing::info!("Build complete");
-    Ok(())
-}
-
-fn format_bytes(bytes: u64) -> String {
-    const KIB: u64 = 1024;
-    const MIB: u64 = 1024 * 1024;
-    const GIB: u64 = 1024 * 1024 * 1024;
-
-    if bytes >= GIB {
-        format!("{:.1} GiB", bytes as f64 / GIB as f64)
-    } else if bytes >= MIB {
-        format!("{:.1} MiB", bytes as f64 / MIB as f64)
-    } else if bytes >= KIB {
-        format!("{:.1} KiB", bytes as f64 / KIB as f64)
-    } else {
-        format!("{bytes} B")
+    match cmd.stream_with_monitor() {
+        Ok(_) => {
+            tracing::info!("Build complete");
+            Ok(())
+        },
+        Err(NixError::Failed { status, .. }) => {
+            // Nix's stderr was already printed by stream_with_monitor.
+            Err(color_eyre::eyre::eyre!(
+                "nix build failed (exit {})",
+                status.code().unwrap_or(1)
+            ))
+        },
+        Err(e) => Err(e.into()),
     }
 }

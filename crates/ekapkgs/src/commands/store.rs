@@ -41,7 +41,10 @@ fn cmd_gc(older_than: Option<&str>, dry_run: bool) -> color_eyre::Result<()> {
         .map_err(|e| color_eyre::eyre::eyre!("failed to run nix-collect-garbage: {e}"))?;
 
     if !status.success() {
-        std::process::exit(status.code().unwrap_or(1));
+        return Err(color_eyre::eyre::eyre!(
+            "nix-collect-garbage failed (exit {})",
+            status.code().unwrap_or(1)
+        ));
     }
 
     Ok(())
