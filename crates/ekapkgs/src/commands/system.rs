@@ -96,19 +96,47 @@ fn cmd_activate(
             tracing::warn!(
                 "Activation failed, rolling back to previous configuration ({prev_str})..."
             );
-            let _ = Command::new("sudo")
+
+            let profile_restored = Command::new("sudo")
                 .args(["nix-env", "--profile", SYSTEM_PROFILE, "--set"])
                 .arg(prev_str.as_ref())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
-                .status();
-            let prev_activate = format!("{prev_str}/bin/switch-to-configuration");
-            let _ = Command::new("sudo")
-                .arg(&prev_activate)
-                .arg("switch")
-                .stdout(Stdio::inherit())
-                .stderr(Stdio::inherit())
-                .status();
+                .status()
+                .is_ok_and(|s| s.success());
+
+            if profile_restored {
+                let prev_activate = format!("{prev_str}/bin/switch-to-configuration");
+                match Command::new("sudo")
+                    .arg(&prev_activate)
+                    .arg("switch")
+                    .stdout(Stdio::inherit())
+                    .stderr(Stdio::inherit())
+                    .status()
+                {
+                    Ok(s) if s.success() => {
+                        tracing::info!("Rolled back to previous configuration");
+                    },
+                    Ok(s) => {
+                        tracing::error!(
+                            "Rollback activation also failed (exit {}); system may be in an \
+                             inconsistent state",
+                            s.code().unwrap_or(1)
+                        );
+                    },
+                    Err(e) => {
+                        tracing::error!(
+                            "Failed to run rollback activation: {e}; system may be in an \
+                             inconsistent state"
+                        );
+                    },
+                }
+            } else {
+                tracing::error!(
+                    "Failed to restore system profile; system may be in an inconsistent state — \
+                     manually run: sudo nix-env --profile {SYSTEM_PROFILE} --set {prev_str}"
+                );
+            }
         }
         return Err(color_eyre::eyre::eyre!(
             "Activation failed (exit {})",
@@ -544,18 +572,19 @@ fn cmd_packages_add(packages: &[String], flake_override: Option<&str>) -> color_
     let mut added = 0u32;
 
     for name in packages {
-        let entry = SystemPackageEntry {
-            name: name.clone(),
-            flake: flake_override.map(str::to_owned),
-        };
-
-        let installable = manifest.resolve_installable(&entry);
-
-        if !manifest.add(entry) {
+        if manifest.packages.iter().any(|p| p.name == *name) {
             tracing::warn!("{name} is already in the manifest, skipping");
             continue;
         }
 
+        let entry = SystemPackageEntry {
+            name: name.clone(),
+            flake: flake_override.map(str::to_owned),
+        };
+        let installable = manifest.resolve_installable(&entry);
+
+        // Install to the nix profile first — only record in the manifest
+        // after the profile mutation succeeds.
         tracing::info!("Installing {installable}...");
         let status = Command::new("sudo")
             .arg("nix")
@@ -570,17 +599,14 @@ fn cmd_packages_add(packages: &[String], flake_override: Option<&str>) -> color_
             .map_err(|e| color_eyre::eyre::eyre!("failed to run nix profile install: {e}"))?;
 
         if !status.success() {
-            // Install failed — remove the entry so the manifest stays
-            // in sync with the profile.
-            manifest.remove(name);
             return Err(color_eyre::eyre::eyre!(
                 "Failed to install {installable} (exit {})",
                 status.code().unwrap_or(1)
             ));
         }
 
-        // Save after each successful install so the manifest reflects
-        // what is actually in the profile even if a later install fails.
+        // Profile install succeeded — now record in the manifest.
+        manifest.add(entry);
         manifest.save()?;
         added += 1;
     }
