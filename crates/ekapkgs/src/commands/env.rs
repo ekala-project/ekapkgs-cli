@@ -70,24 +70,25 @@ fn cmd_init(flake: &str) -> color_eyre::Result<()> {
 
 fn cmd_add(packages: &[String], flake_override: Option<&str>) -> color_eyre::Result<()> {
     let dir = cwd()?;
-    let mut manifest = EnvManifest::load_from(&dir)?;
+    let (mut manifest, _lock) = EnvManifest::load_from_locked(&dir)?;
     let profile = EnvManifest::profile_path(&dir)?;
     let profile_str = profile.to_string_lossy();
     let mut added = 0u32;
 
     for name in packages {
-        let entry = EnvPackageEntry {
-            name: name.clone(),
-            flake: flake_override.map(str::to_owned),
-        };
-
-        let installable = manifest.resolve_installable(&entry);
-
-        if !manifest.add(entry) {
+        if manifest.packages.iter().any(|p| p.name == *name) {
             tracing::warn!("{name} is already in the manifest, skipping");
             continue;
         }
 
+        let entry = EnvPackageEntry {
+            name: name.clone(),
+            flake: flake_override.map(str::to_owned),
+        };
+        let installable = manifest.resolve_installable(&entry);
+
+        // Install to the nix profile first — only record in the manifest
+        // after the profile mutation succeeds.
         tracing::info!("Installing {installable}...");
         NixCommand::new(&["profile", "install"])
             .arg("--profile")
@@ -95,10 +96,10 @@ fn cmd_add(packages: &[String], flake_override: Option<&str>) -> color_eyre::Res
             .arg(&installable)
             .stream()?;
 
+        manifest.add(entry);
+        manifest.save_to(&dir)?;
         added += 1;
     }
-
-    manifest.save_to(&dir)?;
 
     if added > 0 {
         println!("Added {added} package(s) to {ENV_MANIFEST_NAME}");
@@ -109,7 +110,7 @@ fn cmd_add(packages: &[String], flake_override: Option<&str>) -> color_eyre::Res
 
 fn cmd_remove(packages: &[String]) -> color_eyre::Result<()> {
     let dir = cwd()?;
-    let mut manifest = EnvManifest::load_from(&dir)?;
+    let (mut manifest, _lock) = EnvManifest::load_from_locked(&dir)?;
     let profile = EnvManifest::profile_path(&dir)?;
     let profile_str = profile.to_string_lossy();
     let mut removed = 0u32;
@@ -149,7 +150,7 @@ fn cmd_flake_add(
     override_inputs: &[String],
 ) -> color_eyre::Result<()> {
     let dir = cwd()?;
-    let mut manifest = EnvManifest::load_from(&dir)?;
+    let (mut manifest, _lock) = EnvManifest::load_from_locked(&dir)?;
 
     let inputs: std::collections::HashMap<String, String> = override_inputs
         .iter()
@@ -183,7 +184,7 @@ fn cmd_flake_add(
 
 fn cmd_flake_remove(ref_: &str) -> color_eyre::Result<()> {
     let dir = cwd()?;
-    let mut manifest = EnvManifest::load_from(&dir)?;
+    let (mut manifest, _lock) = EnvManifest::load_from_locked(&dir)?;
 
     if !manifest.remove_flake(ref_) {
         tracing::warn!("Flake {ref_} is not in the manifest");
@@ -198,7 +199,7 @@ fn cmd_flake_remove(ref_: &str) -> color_eyre::Result<()> {
 
 fn cmd_flake_pin(ref_: &str, rev: Option<&str>) -> color_eyre::Result<()> {
     let dir = cwd()?;
-    let mut manifest = EnvManifest::load_from(&dir)?;
+    let (mut manifest, _lock) = EnvManifest::load_from_locked(&dir)?;
 
     let Some(entry) = manifest.flakes.iter_mut().find(|f| f.ref_ == ref_) else {
         return Err(color_eyre::eyre::eyre!(
