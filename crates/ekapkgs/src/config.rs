@@ -554,6 +554,16 @@ impl EnvManifest {
         }
     }
 
+    /// Load from a specific directory while holding an exclusive lock.
+    ///
+    /// The returned [`FileLock`] must be held until all modifications
+    /// are saved.  Dropping it releases the lock.
+    pub fn load_from_locked(dir: &Path) -> color_eyre::Result<(Self, FileLock)> {
+        let lock = FileLock::acquire(&dir.join(ENV_MANIFEST_NAME))?;
+        let manifest = Self::load_from(dir)?;
+        Ok((manifest, lock))
+    }
+
     /// Save to a specific directory.
     pub fn save_to(&self, dir: &Path) -> color_eyre::Result<()> {
         let path = dir.join(ENV_MANIFEST_NAME);

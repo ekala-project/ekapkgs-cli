@@ -49,10 +49,28 @@ fn cmd_switch(installable: &str, extra: &[String]) -> color_eyre::Result<()> {
                 "Activation failed, rolling back to generation {prev_num} ({prev_str})..."
             );
             let prev_activate = format!("{prev_str}/activate");
-            let _ = std::process::Command::new(&prev_activate)
+            match std::process::Command::new(&prev_activate)
                 .stdout(Stdio::inherit())
                 .stderr(Stdio::inherit())
-                .status();
+                .status()
+            {
+                Ok(s) if s.success() => {
+                    tracing::info!("Rolled back to generation {prev_num}");
+                },
+                Ok(s) => {
+                    tracing::error!(
+                        "Rollback activation also failed (exit {}); home may be in an \
+                         inconsistent state — manually run: {prev_activate}",
+                        s.code().unwrap_or(1)
+                    );
+                },
+                Err(e) => {
+                    tracing::error!(
+                        "Failed to run rollback activation: {e}; home may be in an inconsistent \
+                         state — manually run: {prev_activate}"
+                    );
+                },
+            }
         }
         return Err(color_eyre::eyre::eyre!(
             "Home activation failed (exit {})",
@@ -229,33 +247,31 @@ fn cmd_packages_add(packages: &[String], flake_override: Option<&str>) -> color_
     let mut added = 0u32;
 
     for name in packages {
-        let entry = HomePackageEntry {
-            name: name.clone(),
-            flake: flake_override.map(str::to_owned),
-        };
-
-        let installable = manifest.resolve_installable(&entry);
-
-        if !manifest.add(entry) {
+        if manifest.packages.iter().any(|p| p.name == *name) {
             tracing::warn!("{name} is already in the manifest, skipping");
             continue;
         }
 
+        let entry = HomePackageEntry {
+            name: name.clone(),
+            flake: flake_override.map(str::to_owned),
+        };
+        let installable = manifest.resolve_installable(&entry);
+
+        // Install to the nix profile first — only add to the manifest
+        // after the profile mutation succeeds.  This avoids a state where
+        // the manifest claims a package exists but the profile doesn't
+        // have it (e.g. if the install fails or the process is killed
+        // between manifest.save and profile install).
         tracing::info!("Installing {installable}...");
-        if let Err(e) = NixCommand::new(&["profile", "install"])
+        NixCommand::new(&["profile", "install"])
             .arg("--profile")
             .arg(&profile)
             .arg(&installable)
-            .stream()
-        {
-            // Install failed — remove the entry we just added so the
-            // manifest stays in sync with the profile.
-            manifest.remove(name);
-            return Err(e.into());
-        }
+            .stream()?;
 
-        // Save after each successful install so the manifest reflects
-        // what is actually in the profile even if a later install fails.
+        // Profile install succeeded — now record in the manifest.
+        manifest.add(entry);
         manifest.save()?;
         added += 1;
     }
