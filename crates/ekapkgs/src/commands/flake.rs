@@ -174,17 +174,82 @@ fn chrono_format_timestamp(ts: i64) -> String {
     format!("{y:04}-{m:02}-{d:02} {hours:02}:{mins:02}:{secs:02} UTC")
 }
 
+/// Guard that restores flake.lock from a disk-persisted backup on drop.
+///
+/// The backup is written to `flake.lock.bak` before any mutation. On normal
+/// completion, the caller restores flake.lock explicitly and calls
+/// [`FlakeLockGuard::disarm`] to remove the backup. If the process panics,
+/// `Drop` restores from the backup. If the process is killed (SIGKILL/OOM),
+/// the `.bak` file survives on disk and is recovered on the next invocation.
+struct FlakeLockGuard {
+    lock_path: std::path::PathBuf,
+    bak_path: std::path::PathBuf,
+    armed: bool,
+}
+
+impl FlakeLockGuard {
+    fn new(lock_path: &std::path::Path) -> color_eyre::Result<Self> {
+        let bak_path = lock_path.with_extension("lock.bak");
+        let backup = std::fs::read(lock_path)?;
+        std::fs::write(&bak_path, &backup)?;
+        Ok(Self {
+            lock_path: lock_path.to_owned(),
+            bak_path,
+            armed: true,
+        })
+    }
+
+    /// Disarm the guard after a successful restore — removes the .bak file.
+    fn disarm(&mut self) {
+        if self.armed {
+            let _ = std::fs::remove_file(&self.bak_path);
+            self.armed = false;
+        }
+    }
+}
+
+impl Drop for FlakeLockGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            if let Ok(backup) = std::fs::read(&self.bak_path) {
+                let _ = std::fs::write(&self.lock_path, &backup);
+                let _ = std::fs::remove_file(&self.bak_path);
+            }
+        }
+    }
+}
+
+/// If a previous run was killed (SIGKILL/OOM) between mutating flake.lock
+/// and restoring it, a stale `.lock.bak` file will be on disk. Recover from it.
+fn recover_stale_flake_lock_backup(lock_path: &std::path::Path) {
+    let bak_path = lock_path.with_extension("lock.bak");
+    if bak_path.exists() {
+        if let Ok(backup) = std::fs::read(&bak_path) {
+            if std::fs::write(lock_path, &backup).is_ok() {
+                let _ = std::fs::remove_file(&bak_path);
+                tracing::warn!(
+                    "Recovered flake.lock from stale backup (previous run was likely interrupted)"
+                );
+            }
+        }
+    }
+}
+
 fn cmd_update_diff(input: &str, installable: &str) -> color_eyre::Result<()> {
     let inst = Installable::new(installable);
 
-    // Backup the current flake.lock.
     let lock_path = std::path::Path::new("flake.lock");
     if !lock_path.exists() {
         return Err(color_eyre::eyre::eyre!(
             "flake.lock not found in current directory"
         ));
     }
-    let backup = std::fs::read(lock_path)?;
+
+    // Recover from a previous interrupted run (SIGKILL/OOM safety).
+    recover_stale_flake_lock_backup(lock_path);
+
+    // Persist backup to disk so it survives process death.
+    let mut guard = FlakeLockGuard::new(lock_path)?;
 
     // Evaluate current closure.
     let spinner = ekapkgs_ui::progress::spinner("Evaluating current closure...");
@@ -208,8 +273,9 @@ fn cmd_update_diff(input: &str, installable: &str) -> color_eyre::Result<()> {
     let new_paths = eval::derivation_closure_paths(&inst);
     spinner.finish_and_clear();
 
-    // Restore the original flake.lock regardless of outcome.
-    std::fs::write(lock_path, &backup)?;
+    // Restore the original flake.lock and disarm the guard.
+    std::fs::write(lock_path, std::fs::read(&guard.bak_path)?)?;
+    guard.disarm();
     tracing::info!("Restored original flake.lock");
 
     let new_paths = new_paths?;
