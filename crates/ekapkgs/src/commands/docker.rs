@@ -137,6 +137,50 @@ pub fn execute(
     Ok(())
 }
 
+/// Parse an installable like `nixpkgs#hello` or `.#packages.x86_64-linux.foo`
+/// into a nix expression that evaluates to the package.
+///
+/// Returns `(pkg_expr, nixpkgs_expr)` where `nixpkgs_expr` resolves to a
+/// nixpkgs package set for `dockerTools`.
+fn installable_to_nix_expr(installable: &str) -> (String, String) {
+    let (flake_ref, attr) = installable
+        .split_once('#')
+        .unwrap_or(("nixpkgs", installable));
+
+    // Resolve the flake reference to a nix expression.
+    let escaped_flake_ref = escape_nix_string(flake_ref);
+    let flake_expr =
+        if flake_ref == "." || flake_ref.starts_with("./") || flake_ref.starts_with('/') {
+            format!("builtins.getFlake \"path:{escaped_flake_ref}\"")
+        } else {
+            format!("builtins.getFlake \"{escaped_flake_ref}\"")
+        };
+
+    // Build the package expression.  Installables can be either a plain attribute
+    // name (resolved under legacyPackages) or a full dotted path.
+    let pkg_expr = if attr.contains('.') {
+        // Full path like `packages.x86_64-linux.hello` — traverse directly.
+        format!("({flake_expr}).{attr}")
+    } else {
+        // Short name like `hello` — resolve under legacyPackages.<system>.
+        format!(
+            "({flake_expr}).legacyPackages.${{builtins.currentSystem}}.{attr}"
+        )
+    };
+
+    // For dockerTools we need a nixpkgs.  If the flake IS nixpkgs, reuse it;
+    // otherwise pull nixpkgs separately.
+    let nixpkgs_expr = if flake_ref == "nixpkgs" {
+        format!(
+            "({flake_expr}).legacyPackages.${{builtins.currentSystem}}"
+        )
+    } else {
+        "(builtins.getFlake \"nixpkgs\").legacyPackages.${builtins.currentSystem}".to_owned()
+    };
+
+    (pkg_expr, nixpkgs_expr)
+}
+
 /// Build the inline nix expression that creates a `streamLayeredImage`.
 fn build_docker_expr(
     installable: &str,
@@ -145,6 +189,8 @@ fn build_docker_expr(
     entrypoint: Option<&str>,
     cmd: Option<&[String]>,
 ) -> String {
+    let (pkg_expr, nixpkgs_expr) = installable_to_nix_expr(installable);
+
     let entrypoint_nix = match entrypoint {
         Some(ep) => {
             let escaped = escape_nix_string(ep);
@@ -176,8 +222,8 @@ fn build_docker_expr(
     format!(
         r#"
 let
-  pkgs = import <nixpkgs> {{}};
-  pkg = {installable};
+  pkgs = {nixpkgs_expr};
+  pkg = {pkg_expr};
 in pkgs.dockerTools.streamLayeredImage {{
   name = "{escaped_name}";
   tag = "{escaped_tag}";
@@ -244,6 +290,30 @@ mod tests {
     }
 
     #[test]
+    fn installable_to_nix_short_attr() {
+        let (pkg, nixpkgs) = installable_to_nix_expr("nixpkgs#hello");
+        assert!(pkg.contains("getFlake \"nixpkgs\""));
+        assert!(pkg.contains("legacyPackages"));
+        assert!(pkg.contains(".hello"));
+        assert!(nixpkgs.contains("getFlake \"nixpkgs\""));
+    }
+
+    #[test]
+    fn installable_to_nix_dotted_attr() {
+        let (pkg, _) = installable_to_nix_expr("nixpkgs#packages.x86_64-linux.hello");
+        assert!(pkg.contains("packages.x86_64-linux.hello"));
+        assert!(!pkg.contains("legacyPackages"));
+    }
+
+    #[test]
+    fn installable_to_nix_local_flake() {
+        let (pkg, nixpkgs) = installable_to_nix_expr(".#myapp");
+        assert!(pkg.contains("getFlake \"path:.\""));
+        // Local flake uses separate nixpkgs for dockerTools
+        assert!(nixpkgs.contains("getFlake \"nixpkgs\""));
+    }
+
+    #[test]
     fn docker_expr_with_entrypoint() {
         let expr = build_docker_expr("nixpkgs#nginx", "nginx", "latest", Some("nginx"), None);
         assert!(expr.contains("streamLayeredImage"));
@@ -251,6 +321,7 @@ mod tests {
         assert!(expr.contains("tag = \"latest\""));
         assert!(expr.contains("Entrypoint"));
         assert!(expr.contains("${pkg}/bin/nginx"));
+        assert!(expr.contains("getFlake \"nixpkgs\""));
     }
 
     #[test]
