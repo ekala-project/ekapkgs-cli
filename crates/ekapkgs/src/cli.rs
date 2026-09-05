@@ -167,6 +167,24 @@ pub enum Command {
         upstream: Option<String>,
     },
 
+    /// Run a command you don't have installed.
+    ///
+    /// Searches nixpkgs for packages that provide the given command,
+    /// lets you pick one if there are multiple matches, and runs it.
+    #[command(name = "wtf")]
+    Wtf {
+        /// The command to find and run.
+        command_name: String,
+
+        /// Arguments passed through to the command.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+
+        /// Flake to resolve packages from (default: `nixpkgs`).
+        #[arg(long, default_value = "nixpkgs")]
+        flake: String,
+    },
+
     /// Generate shell completions.
     Completions {
         /// Shell to generate completions for.
@@ -299,6 +317,38 @@ pub enum ClosureCommand {
         buildtime: bool,
 
         /// Output file (default: stdout).
+        #[arg(short, long)]
+        output: Option<String>,
+    },
+
+    /// Create a Docker image from a nix closure.
+    ///
+    /// Builds the installable, then uses `dockerTools.streamLayeredImage`
+    /// to produce a layered Docker image containing its runtime closure.
+    /// By default the result is piped into `docker load`; use `--output`
+    /// to write a tarball instead.
+    Docker {
+        /// The installable to containerize (e.g., `nixpkgs#hello`).
+        installable: String,
+
+        /// Docker image name (default: derived from the installable).
+        #[arg(long)]
+        name: Option<String>,
+
+        /// Docker image tag.
+        #[arg(long, default_value = "latest")]
+        tag: String,
+
+        /// Entrypoint for the container. If omitted, auto-detected from
+        /// `meta.mainProgram` when possible.
+        #[arg(long)]
+        entrypoint: Option<String>,
+
+        /// Default command passed to the entrypoint.
+        #[arg(long)]
+        cmd: Option<Vec<String>>,
+
+        /// Write the image tarball to a file instead of loading into Docker.
         #[arg(short, long)]
         output: Option<String>,
     },

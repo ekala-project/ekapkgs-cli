@@ -31,6 +31,7 @@ blake3.workspace = true
 uuid.workspace = true
 zstd.workspace = true
 yansi.workspace = true
+dialoguer.workspace = true
 axum.workspace = true
 
 [lints]
