@@ -3,17 +3,22 @@ mod cache;
 mod closure;
 mod deploy;
 mod develop;
+mod docker;
 mod doctor;
 mod dry_run;
+mod env;
 mod flake;
 mod home;
 mod log;
+mod registry;
 mod run;
+mod sbom;
 mod search;
 mod shell;
 mod store;
 mod substituter;
 mod system;
+mod wtf;
 
 use crate::cli::Command;
 
@@ -42,10 +47,18 @@ pub fn run(command: Command) -> color_eyre::Result<()> {
         Command::Cache { command } => cache::execute(command),
         Command::Closure { command } => closure::execute(command),
         Command::Flake { command } => flake::execute(command),
+        Command::Registry { command } => registry::execute(command),
         Command::Store { command } => store::execute(command),
         Command::Log { installable } => log::execute(&installable),
         Command::DryRun { installable, extra } => dry_run::execute(&installable, &extra),
+        Command::Env { command } => env::execute(command),
         Command::Doctor => doctor::execute(),
         Command::Substituter { port, upstream } => substituter::execute(port, upstream),
+        Command::Wtf {
+            command_name,
+            args,
+            flake,
+        } => wtf::execute(&command_name, &args, &flake),
+        Command::Completions { .. } => unreachable!("handled in main"),
     }
 }

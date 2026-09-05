@@ -2,7 +2,7 @@ use ekapkgs_nix::installable::Installable;
 use ekapkgs_nix::{NixCommand, store};
 
 use crate::cli::ClosureCommand;
-use crate::commands::sbom;
+use crate::commands::{docker, sbom};
 
 pub fn execute(command: ClosureCommand) -> color_eyre::Result<()> {
     match command {
@@ -18,6 +18,21 @@ pub fn execute(command: ClosureCommand) -> color_eyre::Result<()> {
             buildtime,
             output,
         } => sbom::execute(&installable, &format, buildtime, output.as_deref()),
+        ClosureCommand::Docker {
+            installable,
+            name,
+            tag,
+            entrypoint,
+            cmd,
+            output,
+        } => docker::execute(
+            &installable,
+            name.as_deref(),
+            &tag,
+            entrypoint.as_deref(),
+            cmd.as_deref(),
+            output.as_deref(),
+        ),
         ClosureCommand::SbomDiff {
             old,
             new,

@@ -58,6 +58,7 @@ toml = "0.8"
 directories = "6"
 tempfile = "3"
 fs2 = "0.4"
+dialoguer = "0.11"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
