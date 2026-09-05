@@ -13,15 +13,26 @@
 - `home rollback` command to revert to the previous home configuration generation
 - `home generations` output now marks the current generation with `(current)`
 - Auto-rollback on activation failure: `system switch` restores the previous profile and re-activates it; `home switch` re-activates the previous generation
+  - Rollback failures now report the exit code and a manual recovery command instead of being silently discarded
 - `deploy` prints a recovery command when remote activation fails
 - `home services apply` reports which services failed to start instead of silently continuing
 - Manifest writes are now atomic (write-then-rename) to prevent data loss on crash
 - Manifest load-modify-save cycles are now protected by advisory file locking to prevent concurrent corruption
-- `home/system packages add` saves the manifest after each successful install so partial failures leave the manifest in sync with the profile
+  - `env add/remove/flake-add/flake-remove/flake-pin` now use file locking consistent with home/system packages
+- `flake update-diff` crash safety: backup persisted to `flake.lock.bak` on disk with Drop guard and startup recovery for SIGKILL/OOM/panic resilience
+- `home/system packages add` installs to the nix profile before recording in the manifest, preventing manifest-profile desync on crash or install failure
 - `home/system packages import` removes packages from the nix profile that are absent from the new manifest
 - `env reload` resets the profile before rebuilding so packages removed from the manifest don't accumulate
 - `build`, `log`, and `store gc` now return proper errors instead of calling `process::exit()` directly
 
+- `wtf` command to find and run commands you don't have installed
+  - Searches nixpkgs via `nix-locate` with fallback to the `nix-index-database` flake
+  - Interactive package selection when multiple matches exist (auto-picks first in non-terminal)
+- `closure docker` subcommand building layered Docker images from nix closures
+  - Uses `dockerTools.streamLayeredImage` for efficient layered images
+  - Auto-detects entrypoint from `meta.mainProgram`
+  - Pipes into `docker load` by default or writes tarball with `--output`
+  - Supports `--name`, `--tag`, `--entrypoint`, `--cmd` overrides
 - `completions` command generating shell completions for bash, zsh, fish, elvish, powershell
 - `registry list/add/remove/pin/unpin/resolve` commands for managing flake registries
 - `closure sbom-diff` command comparing closures by package with CVE, license, and provenance change tracking
