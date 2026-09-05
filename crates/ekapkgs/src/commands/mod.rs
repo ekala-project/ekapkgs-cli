@@ -3,6 +3,7 @@ mod cache;
 mod closure;
 mod deploy;
 mod develop;
+mod docker;
 mod doctor;
 mod dry_run;
 mod env;
@@ -17,6 +18,7 @@ mod shell;
 mod store;
 mod substituter;
 mod system;
+mod wtf;
 
 use crate::cli::Command;
 
@@ -52,6 +54,11 @@ pub fn run(command: Command) -> color_eyre::Result<()> {
         Command::Env { command } => env::execute(command),
         Command::Doctor => doctor::execute(),
         Command::Substituter { port, upstream } => substituter::execute(port, upstream),
+        Command::Wtf {
+            command_name,
+            args,
+            flake,
+        } => wtf::execute(&command_name, &args, &flake),
         Command::Completions { .. } => unreachable!("handled in main"),
     }
 }
