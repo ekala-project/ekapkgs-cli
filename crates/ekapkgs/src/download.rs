@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use ekapkgs_protocol::ekapkgs::v1::{ChunkNegotiateResponse, NegotiateResponse, PathManifestEntry};
+use ekapkgs_protocol::ekapkgs::v1::{NegotiateResponse, PathManifestEntry};
 use futures::StreamExt;
 
 /// Download NARs according to the negotiate response and import into the nix store.
@@ -191,95 +191,6 @@ async fn download_full_nar(
     Ok(resp.bytes().await?.to_vec())
 }
 
-/// Download individual chunks from a CAS-aware server and reassemble NARs
-/// for import into the nix store.
-///
-/// This is the CAS counterpart to `download_and_import`. The server has already
-/// told us which chunks are missing via `ChunkNegotiateResponse`. We download
-/// them, then rely on the standard NAR download path for actual store import
-/// since nix requires NARs for `nix copy`.
-#[allow(dead_code)]
-pub async fn download_chunks(
-    server_url: &str,
-    response: &ChunkNegotiateResponse,
-    max_parallel: usize,
-) -> color_eyre::Result<()> {
-    if response.missing_chunks.is_empty() {
-        tracing::info!("All chunks already available locally");
-        return Ok(());
-    }
-
-    let total_chunks = response.missing_chunks.len() as u64;
-    let bar = ekapkgs_ui::progress::item_bar(total_chunks, "chunks");
-
-    let http_client = reqwest::Client::new();
-    let base_url = server_url.trim_end_matches('/');
-
-    // Download all missing chunks in parallel.
-    let chunk_dir = tempfile::tempdir()?;
-
-    let results = futures::stream::iter(response.missing_chunks.iter())
-        .map(|chunk| {
-            let client = http_client.clone();
-            let base = base_url.to_owned();
-            let chunk_dir = chunk_dir.path().to_path_buf();
-            let url = chunk.url.clone();
-            let expected_digest = chunk
-                .digest
-                .as_ref()
-                .map(|d| d.digest.clone())
-                .unwrap_or_default();
-            async move {
-                let chunk_url = format!("{base}/{url}");
-                let resp = client.get(&chunk_url).send().await?;
-
-                if !resp.status().is_success() {
-                    return Err(color_eyre::eyre::eyre!(
-                        "chunk download failed: {} {}",
-                        resp.status(),
-                        chunk_url
-                    ));
-                }
-
-                let data = resp.bytes().await?;
-
-                // Verify blake3 digest.
-                let actual_hash = blake3::hash(&data);
-                if actual_hash.as_bytes() != expected_digest.as_slice() {
-                    return Err(color_eyre::eyre::eyre!("chunk digest mismatch for {url}"));
-                }
-
-                // Store locally using hex digest as filename.
-                let hex: String = expected_digest.iter().map(|b| format!("{b:02x}")).collect();
-                let path = chunk_dir.join(format!("{hex}.chunk"));
-                std::fs::write(&path, &data)?;
-
-                Ok::<(), color_eyre::Report>(())
-            }
-        })
-        .buffer_unordered(max_parallel)
-        .collect::<Vec<_>>()
-        .await;
-
-    for result in results {
-        match result {
-            Ok(()) => bar.inc(1),
-            Err(e) => {
-                tracing::warn!("Chunk download failed: {e}");
-            },
-        }
-    }
-
-    bar.finish_and_clear();
-    tracing::info!(
-        "Downloaded {} chunks ({} bytes)",
-        total_chunks,
-        response.total_chunk_size,
-    );
-
-    Ok(())
-}
-
 /// Stream NARs over gRPC and import into the nix store.
 ///
 /// Uses a single gRPC server-side stream instead of individual HTTP downloads.
@@ -412,7 +323,7 @@ pub async fn stream_and_import(
 }
 
 /// Build a narinfo text string from a PathManifestEntry.
-fn build_narinfo_text(entry: &PathManifestEntry) -> String {
+pub(crate) fn build_narinfo_text(entry: &PathManifestEntry) -> String {
     let refs: Vec<String> = entry
         .references
         .iter()

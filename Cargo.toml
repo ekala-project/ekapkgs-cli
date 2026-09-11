@@ -51,6 +51,7 @@ tower-http = { version = "0.6", features = ["compression-zstd", "cors", "timeout
 
 prost = "0.13"
 tonic = "0.12"
+rusqlite = { version = "0.32", features = ["bundled"] }
 
 prometheus = "0.13"
 

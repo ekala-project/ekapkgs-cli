@@ -31,7 +31,10 @@ pub async fn negotiate_chunks(
     have: Vec<String>,
     have_chunks: Vec<[u8; 32]>,
 ) -> color_eyre::Result<ChunkNegotiateResponse> {
-    let mut client = CacheServiceClient::connect(server_url.to_owned()).await?;
+    let mut client = CacheServiceClient::connect(server_url.to_owned())
+        .await?
+        .max_decoding_message_size(64 * 1024 * 1024)
+        .max_encoding_message_size(64 * 1024 * 1024);
 
     let request = tonic::Request::new(ChunkNegotiateRequest {
         want,

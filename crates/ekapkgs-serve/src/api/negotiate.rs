@@ -3,9 +3,9 @@ use std::sync::Arc;
 
 use ekapkgs_protocol::ekapkgs::v1::cache_service_server::CacheService;
 use ekapkgs_protocol::ekapkgs::v1::{
-    CaPathMapping, ChunkDownload, ChunkNegotiateRequest, ChunkNegotiateResponse, Compression,
-    DownloadBatch, DownloadPlan, NarChunk, NegotiateRequest, NegotiateResponse, PathManifestEntry,
-    StreamNarsRequest,
+    B3Digest, CaDirectoryData, CaPathMapping, ChunkDownload, ChunkMeta, ChunkNegotiateRequest,
+    ChunkNegotiateResponse, Compression, DownloadBatch, DownloadPlan, FileChunkMapping, NarChunk,
+    NegotiateRequest, NegotiateResponse, PathManifestEntry, StreamNarsRequest,
 };
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
@@ -228,19 +228,19 @@ impl CacheService for NegotiateService {
             }
         }
 
-        // Walk the Merkle trees to find missing chunks. We need to downcast to
-        // CastoreBackend for the walk_missing_chunks method.
-        let missing_chunks = if let Some(castore) =
-            self.state
-                .storage
-                .as_any()
-                .downcast_ref::<crate::storage::castore::CastoreBackend>()
+        // Walk the Merkle trees to find missing chunks and collect directory/file
+        // metadata needed for client-side NAR reassembly.
+        let (missing_chunks, directories, file_chunk_mappings) = if let Some(castore) = self
+            .state
+            .storage
+            .as_any()
+            .downcast_ref::<crate::storage::castore::CastoreBackend>()
         {
             let chunks = castore
                 .walk_missing_chunks(&want_hashes, &have_digests)
                 .map_err(|e| Status::internal(format!("chunk walk failed: {e}")))?;
 
-            chunks
+            let missing: Vec<ChunkDownload> = chunks
                 .into_iter()
                 .map(|cm| {
                     let hex = cm
@@ -259,9 +259,47 @@ impl CacheService for NegotiateService {
                         url: format!("cas/chunk/{hex}"),
                     }
                 })
-                .collect()
+                .collect();
+
+            // Collect directory data for client-side NAR reassembly.
+            let dirs = castore
+                .collect_directories(&want_hashes)
+                .map_err(|e| Status::internal(format!("directory collection failed: {e}")))?
+                .into_iter()
+                .map(|(digest, dir)| CaDirectoryData {
+                    digest: Some(B3Digest {
+                        digest: digest.to_vec(),
+                    }),
+                    directory: Some(dir),
+                })
+                .collect();
+
+            // Collect file-to-chunk mappings.
+            let mappings = castore
+                .collect_file_chunk_mappings(&want_hashes)
+                .map_err(|e| {
+                    Status::internal(format!("file chunk mapping collection failed: {e}"))
+                })?
+                .into_iter()
+                .map(|(file_digest, chunks)| FileChunkMapping {
+                    file_digest: Some(B3Digest {
+                        digest: file_digest.to_vec(),
+                    }),
+                    chunks: chunks
+                        .into_iter()
+                        .map(|(chunk_digest, chunk_size)| ChunkMeta {
+                            digest: Some(B3Digest {
+                                digest: chunk_digest.to_vec(),
+                            }),
+                            size: chunk_size,
+                        })
+                        .collect(),
+                })
+                .collect();
+
+            (missing, dirs, mappings)
         } else {
-            Vec::new()
+            (Vec::new(), Vec::new(), Vec::new())
         };
 
         let total_chunk_size: u64 = missing_chunks.iter().map(|c| c.size).sum();
@@ -271,6 +309,8 @@ impl CacheService for NegotiateService {
             missing_chunks,
             unavailable,
             total_chunk_size,
+            directories,
+            file_chunk_mappings,
         }))
     }
 

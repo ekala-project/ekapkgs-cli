@@ -1,6 +1,5 @@
 pub mod castore;
 pub mod filesystem;
-pub mod nar;
 pub mod nix_store;
 
 /// Parsed narinfo metadata.
