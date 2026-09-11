@@ -1,3 +1,5 @@
+mod cas_pull;
+mod chunk_store;
 mod cli;
 mod commands;
 mod config;

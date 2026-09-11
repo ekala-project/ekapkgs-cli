@@ -13,6 +13,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
+use ekapkgs_nix::nar::{NarDirectoryEntry, NarNode, parse_nar, write_nar};
 use ekapkgs_protocol::ekapkgs::v1::{
     B3Digest, CaDirectory, CaDirectoryEntry, CaDirectoryNode, CaFileNode, CaNode, CaSymlinkNode,
     ChunkMeta,
@@ -20,8 +21,10 @@ use ekapkgs_protocol::ekapkgs::v1::{
 use prost::Message;
 use rusqlite::{Connection, params};
 
-use super::nar::{NarDirectoryEntry, NarNode, parse_nar, write_nar};
 use super::{NarInfo, StorageBackend};
+
+/// A file digest and its ordered list of (chunk_digest, chunk_size) pairs.
+type FileChunkMap = Vec<([u8; 32], Vec<([u8; 32], u64)>)>;
 
 /// FastCDC chunking parameters.
 const CHUNK_MIN: u32 = 16 * 1024; // 16 KiB
@@ -435,6 +438,154 @@ impl CastoreBackend {
             ekapkgs_protocol::ekapkgs::v1::ca_node::Node::Symlink(_) => {
                 // Symlinks have no chunks.
             },
+        }
+
+        Ok(())
+    }
+
+    /// Collect all CaDirectory data referenced by the given store path hashes.
+    ///
+    /// Walks each path's CaNode tree recursively. For every `CaDirectoryNode`,
+    /// loads the `CaDirectory` from disk and includes it (with its digest) in
+    /// the result. Deduplicates by digest.
+    pub fn collect_directories(
+        &self,
+        want_hashes: &[&str],
+    ) -> color_eyre::Result<Vec<([u8; 32], CaDirectory)>> {
+        let mut result = Vec::new();
+        let mut seen = HashSet::new();
+
+        for hash in want_hashes {
+            if let Some(root) = self.get_root_node(hash)? {
+                self.collect_dirs_recursive(&root, &mut seen, &mut result)?;
+            }
+        }
+
+        Ok(result)
+    }
+
+    /// Collect all file-to-chunk mappings referenced by the given store path hashes.
+    ///
+    /// Walks each path's CaNode tree. For each `CaFileNode`, queries the
+    /// `file_chunks` table and returns `file_digest → [(chunk_digest, chunk_size)]`.
+    pub fn collect_file_chunk_mappings(
+        &self,
+        want_hashes: &[&str],
+    ) -> color_eyre::Result<FileChunkMap> {
+        let mut result = Vec::new();
+        let mut seen = HashSet::new();
+
+        for hash in want_hashes {
+            if let Some(root) = self.get_root_node(hash)? {
+                self.collect_files_recursive(&root, &mut seen, &mut result)?;
+            }
+        }
+
+        Ok(result)
+    }
+
+    /// Recursively collect CaDirectory data from a CaNode tree.
+    fn collect_dirs_recursive(
+        &self,
+        ca_node: &CaNode,
+        seen: &mut HashSet<[u8; 32]>,
+        result: &mut Vec<([u8; 32], CaDirectory)>,
+    ) -> color_eyre::Result<()> {
+        let Some(node) = ca_node.node.as_ref() else {
+            return Ok(());
+        };
+
+        if let ekapkgs_protocol::ekapkgs::v1::ca_node::Node::Directory(dir) = node {
+            let Some(digest) = dir.digest.as_ref() else {
+                return Ok(());
+            };
+            let Ok(dir_digest): Result<[u8; 32], _> = digest.digest.as_slice().try_into() else {
+                return Ok(());
+            };
+
+            if seen.insert(dir_digest) {
+                if let Ok(ca_dir) = self.load_directory(&dir_digest) {
+                    // Recurse into children before adding this directory.
+                    for entry in &ca_dir.entries {
+                        if let Some(child) = &entry.node {
+                            self.collect_dirs_recursive(child, seen, result)?;
+                        }
+                    }
+                    result.push((dir_digest, ca_dir));
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Recursively collect file-to-chunk mappings from a CaNode tree.
+    fn collect_files_recursive(
+        &self,
+        ca_node: &CaNode,
+        seen: &mut HashSet<[u8; 32]>,
+        result: &mut FileChunkMap,
+    ) -> color_eyre::Result<()> {
+        let Some(node) = ca_node.node.as_ref() else {
+            return Ok(());
+        };
+
+        match node {
+            ekapkgs_protocol::ekapkgs::v1::ca_node::Node::File(file) => {
+                let Some(digest) = file.digest.as_ref() else {
+                    return Ok(());
+                };
+                let Ok(file_digest): Result<[u8; 32], _> = digest.digest.as_slice().try_into()
+                else {
+                    return Ok(());
+                };
+
+                if seen.insert(file_digest) {
+                    let db = self.db.lock().expect("db lock");
+                    let mut stmt = db.prepare(
+                        "SELECT chunk_digest, chunk_size FROM file_chunks WHERE file_digest = ?1 \
+                         ORDER BY chunk_index",
+                    )?;
+                    let chunks: Vec<([u8; 32], u64)> = stmt
+                        .query_map(params![file_digest.as_slice()], |row| {
+                            let digest_vec: Vec<u8> = row.get(0)?;
+                            let size: i64 = row.get(1)?;
+                            Ok((digest_vec, size as u64))
+                        })?
+                        .filter_map(|r| {
+                            let (dv, sz) = r.ok()?;
+                            let d: [u8; 32] = dv.as_slice().try_into().ok()?;
+                            Some((d, sz))
+                        })
+                        .collect();
+                    drop(stmt);
+                    drop(db);
+
+                    if !chunks.is_empty() {
+                        result.push((file_digest, chunks));
+                    }
+                }
+            },
+
+            ekapkgs_protocol::ekapkgs::v1::ca_node::Node::Directory(dir) => {
+                let Some(digest) = dir.digest.as_ref() else {
+                    return Ok(());
+                };
+                let Ok(dir_digest): Result<[u8; 32], _> = digest.digest.as_slice().try_into()
+                else {
+                    return Ok(());
+                };
+
+                if let Ok(ca_dir) = self.load_directory(&dir_digest) {
+                    for entry in &ca_dir.entries {
+                        if let Some(child) = &entry.node {
+                            self.collect_files_recursive(child, seen, result)?;
+                        }
+                    }
+                }
+            },
+
+            ekapkgs_protocol::ekapkgs::v1::ca_node::Node::Symlink(_) => {},
         }
 
         Ok(())

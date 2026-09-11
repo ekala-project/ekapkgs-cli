@@ -1343,7 +1343,9 @@ dependencies = [
  "fs2",
  "futures",
  "indicatif",
+ "prost",
  "reqwest",
+ "rusqlite",
  "serde",
  "serde_json",
  "tempfile",
@@ -1378,6 +1380,7 @@ dependencies = [
 name = "ekapkgs-nix"
 version = "0.1.0"
 dependencies = [
+ "color-eyre",
  "ekapkgs-ui",
  "serde",
  "serde_json",

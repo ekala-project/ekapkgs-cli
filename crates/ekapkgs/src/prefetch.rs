@@ -46,7 +46,9 @@ pub fn prefetch_closure(
     let fetched = rt.block_on(async {
         let spinner = ekapkgs_ui::progress::spinner("Negotiating with cache...");
 
-        let response = crate::negotiate::negotiate(&server_url, want_hashes, have_hashes).await?;
+        let response =
+            crate::negotiate::negotiate(&server_url, want_hashes.clone(), have_hashes.clone())
+                .await?;
 
         spinner.finish_and_clear();
 
@@ -60,9 +62,16 @@ pub fn prefetch_closure(
                 ekapkgs_ui::format::format_bytes(response.total_nar_size),
             );
 
-            crate::download::download_and_import(&server_url, &response, max_parallel).await?;
+            let imported = import_with_fallback(
+                &server_url,
+                &response,
+                want_hashes,
+                have_hashes,
+                max_parallel,
+            )
+            .await?;
 
-            tracing::info!("Imported {avail} paths from cache");
+            tracing::info!("Imported {imported} paths from cache");
         }
 
         if unavail > 0 {
@@ -120,8 +129,8 @@ pub fn prefetch_closure_with_target(
 
         let response = crate::negotiate::negotiate_with_target(
             &server_url,
-            want_hashes,
-            have_hashes,
+            want_hashes.clone(),
+            have_hashes.clone(),
             target_hash,
         )
         .await?;
@@ -132,11 +141,79 @@ pub fn prefetch_closure_with_target(
 
         if avail > 0 {
             tracing::info!("{avail} paths to download");
-            crate::download::download_and_import(&server_url, &response, max_parallel).await?;
+            import_with_fallback(
+                &server_url,
+                &response,
+                want_hashes,
+                have_hashes,
+                max_parallel,
+            )
+            .await?;
         }
 
         Ok::<usize, color_eyre::Report>(avail)
     })?;
 
     Ok(fetched)
+}
+
+/// Three-tier import: CAS chunks → gRPC streaming → HTTP batch.
+///
+/// Returns the number of paths imported.
+async fn import_with_fallback(
+    server_url: &str,
+    response: &ekapkgs_protocol::ekapkgs::v1::NegotiateResponse,
+    want_hashes: Vec<String>,
+    have_hashes: Vec<String>,
+    max_parallel: usize,
+) -> color_eyre::Result<usize> {
+    let avail = response.available.len();
+    let mut imported = false;
+
+    // Tier 1: CAS chunk-based pull.
+    if !response.ca_path_mappings.is_empty() {
+        match crate::cas_pull::cas_pull(
+            server_url,
+            want_hashes,
+            have_hashes,
+            &response.available,
+            max_parallel,
+        )
+        .await
+        {
+            Ok(true) => {
+                imported = true;
+            },
+            Ok(false) => {
+                tracing::debug!("CAS pull not available, falling back");
+            },
+            Err(e) => {
+                tracing::warn!("CAS pull failed: {e}, falling back");
+            },
+        }
+    }
+
+    // Tier 2: gRPC streaming.
+    if !imported {
+        match crate::download::stream_and_import(server_url, response).await {
+            Ok(()) => {
+                imported = true;
+            },
+            Err(e) => {
+                let is_unimplemented = e
+                    .downcast_ref::<tonic::Status>()
+                    .is_some_and(|s| s.code() == tonic::Code::Unimplemented);
+                if !is_unimplemented {
+                    return Err(e);
+                }
+            },
+        }
+    }
+
+    // Tier 3: HTTP batch download.
+    if !imported {
+        crate::download::download_and_import(server_url, response, max_parallel).await?;
+    }
+
+    Ok(avail)
 }

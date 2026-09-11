@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 ekapkgs-ui.workspace = true
+color-eyre.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
