@@ -73,6 +73,22 @@ message ChunkNegotiateResponse {
   repeated string unavailable = 3;
   // Total size of missing chunks for progress display.
   uint64 total_chunk_size = 4;
+  // All CaDirectory data needed to reconstruct the requested paths' NARs.
+  repeated CaDirectoryData directories = 5;
+  // File-to-chunk mappings for all files in the requested paths.
+  repeated FileChunkMapping file_chunk_mappings = 6;
+}
+
+// A serialized directory needed for client-side NAR reassembly.
+message CaDirectoryData {
+  B3Digest digest = 1;
+  CaDirectory directory = 2;
+}
+
+// Maps a file's content digest to its ordered list of chunks.
+message FileChunkMapping {
+  B3Digest file_digest = 1;
+  repeated ChunkMeta chunks = 2;
 }
 
 // A single chunk to download.

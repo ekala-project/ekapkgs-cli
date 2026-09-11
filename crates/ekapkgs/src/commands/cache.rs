@@ -506,33 +506,64 @@ fn cmd_pull(paths: &[String], cache_url: Option<&str>) -> color_eyre::Result<()>
         if avail > 0 {
             tracing::info!("{avail} paths available from cache");
 
-            // Try gRPC streaming first for a single-connection transfer.
-            // Fall back to individual HTTP downloads if the server doesn't
-            // support the StreamNars RPC.
-            match crate::download::stream_and_import(&server_url, &response).await {
-                Ok(()) => {
-                    tracing::info!("Imported {avail} paths (streamed)");
-                },
-                Err(e) => {
-                    // Check if this is an UNIMPLEMENTED gRPC status, meaning
-                    // the server doesn't support streaming.
-                    let is_unimplemented = e
-                        .downcast_ref::<tonic::Status>()
-                        .is_some_and(|s| s.code() == tonic::Code::Unimplemented);
+            let mut imported = false;
 
-                    if is_unimplemented {
-                        tracing::info!("Server does not support streaming, using HTTP downloads");
-                        crate::download::download_and_import(
-                            &server_url,
-                            &response,
-                            config.defaults.max_parallel_downloads,
-                        )
-                        .await?;
-                        tracing::info!("Imported {avail} paths");
-                    } else {
-                        return Err(e);
-                    }
-                },
+            // Tier 1: CAS chunk-based pull (if server has CAS data).
+            if !response.ca_path_mappings.is_empty() {
+                match crate::cas_pull::cas_pull(
+                    &server_url,
+                    want_hashes.clone(),
+                    have_hashes.clone(),
+                    &response.available,
+                    config.defaults.max_parallel_downloads,
+                )
+                .await
+                {
+                    Ok(true) => {
+                        tracing::info!("Imported {avail} paths (CAS)");
+                        imported = true;
+                    },
+                    Ok(false) => {
+                        tracing::debug!("CAS pull not available, falling back");
+                    },
+                    Err(e) => {
+                        tracing::warn!("CAS pull failed: {e}, falling back");
+                    },
+                }
+            }
+
+            // Tier 2: gRPC streaming.
+            if !imported {
+                match crate::download::stream_and_import(&server_url, &response).await {
+                    Ok(()) => {
+                        tracing::info!("Imported {avail} paths (streamed)");
+                        imported = true;
+                    },
+                    Err(e) => {
+                        let is_unimplemented = e
+                            .downcast_ref::<tonic::Status>()
+                            .is_some_and(|s| s.code() == tonic::Code::Unimplemented);
+
+                        if is_unimplemented {
+                            tracing::info!(
+                                "Server does not support streaming, using HTTP downloads"
+                            );
+                        } else {
+                            return Err(e);
+                        }
+                    },
+                }
+            }
+
+            // Tier 3: HTTP batch download.
+            if !imported {
+                crate::download::download_and_import(
+                    &server_url,
+                    &response,
+                    config.defaults.max_parallel_downloads,
+                )
+                .await?;
+                tracing::info!("Imported {avail} paths");
             }
         }
 
@@ -653,7 +684,9 @@ fn cmd_warm(
     rt.block_on(async {
         let spinner = ekapkgs_ui::progress::spinner("Negotiating with cache...");
 
-        let response = crate::negotiate::negotiate(&server_url, want_hashes, have_hashes).await?;
+        let response =
+            crate::negotiate::negotiate(&server_url, want_hashes.clone(), have_hashes.clone())
+                .await?;
 
         spinner.finish_and_clear();
 
@@ -662,26 +695,58 @@ fn cmd_warm(
 
         if avail > 0 {
             tracing::info!("{avail} paths available from cache");
-            match crate::download::stream_and_import(&server_url, &response).await {
-                Ok(()) => {
-                    tracing::info!("Warmed {avail} paths (streamed)");
-                },
-                Err(e) => {
-                    let is_unimplemented = e
-                        .downcast_ref::<tonic::Status>()
-                        .is_some_and(|s| s.code() == tonic::Code::Unimplemented);
-                    if is_unimplemented {
-                        crate::download::download_and_import(
-                            &server_url,
-                            &response,
-                            config.defaults.max_parallel_downloads,
-                        )
-                        .await?;
-                        tracing::info!("Warmed {avail} paths");
-                    } else {
-                        return Err(e);
-                    }
-                },
+
+            let mut imported = false;
+
+            // Tier 1: CAS chunk-based pull.
+            if !response.ca_path_mappings.is_empty() {
+                match crate::cas_pull::cas_pull(
+                    &server_url,
+                    want_hashes,
+                    have_hashes,
+                    &response.available,
+                    config.defaults.max_parallel_downloads,
+                )
+                .await
+                {
+                    Ok(true) => {
+                        tracing::info!("Warmed {avail} paths (CAS)");
+                        imported = true;
+                    },
+                    Ok(false) => {},
+                    Err(e) => {
+                        tracing::warn!("CAS warm failed: {e}, falling back");
+                    },
+                }
+            }
+
+            // Tier 2: gRPC streaming.
+            if !imported {
+                match crate::download::stream_and_import(&server_url, &response).await {
+                    Ok(()) => {
+                        tracing::info!("Warmed {avail} paths (streamed)");
+                        imported = true;
+                    },
+                    Err(e) => {
+                        let is_unimplemented = e
+                            .downcast_ref::<tonic::Status>()
+                            .is_some_and(|s| s.code() == tonic::Code::Unimplemented);
+                        if !is_unimplemented {
+                            return Err(e);
+                        }
+                    },
+                }
+            }
+
+            // Tier 3: HTTP batch download.
+            if !imported {
+                crate::download::download_and_import(
+                    &server_url,
+                    &response,
+                    config.defaults.max_parallel_downloads,
+                )
+                .await?;
+                tracing::info!("Warmed {avail} paths");
             }
         }
 

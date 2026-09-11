@@ -1,6 +1,5 @@
 pub mod castore;
 pub mod filesystem;
-pub mod nar;
 pub mod nix_store;
 #[cfg(feature = "s3")]
 pub mod s3;
