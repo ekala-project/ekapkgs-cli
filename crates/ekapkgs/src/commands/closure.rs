@@ -2,7 +2,7 @@ use ekapkgs_nix::installable::Installable;
 use ekapkgs_nix::{NixCommand, store};
 
 use crate::cli::ClosureCommand;
-use crate::commands::{docker, sbom};
+use crate::commands::{docker, drv_diff, sbom};
 
 pub fn execute(command: ClosureCommand) -> color_eyre::Result<()> {
     match command {
@@ -11,7 +11,13 @@ pub fn execute(command: ClosureCommand) -> color_eyre::Result<()> {
             installable,
             dependency,
         } => cmd_why_depends(&installable, &dependency),
-        ClosureCommand::Diff { a, b } => cmd_diff(&a, &b),
+        ClosureCommand::Diff { a, b, depth } => {
+            if a.ends_with(".drv") && b.ends_with(".drv") {
+                drv_diff::execute(&a, &b, depth)
+            } else {
+                cmd_diff(&a, &b)
+            }
+        },
         ClosureCommand::Sbom {
             installable,
             format,

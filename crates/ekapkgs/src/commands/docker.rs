@@ -148,12 +148,12 @@ fn installable_to_nix_expr(installable: &str) -> (String, String) {
         .unwrap_or(("nixpkgs", installable));
 
     // Resolve the flake reference to a nix expression.
-    let flake_expr = if flake_ref == "." || flake_ref.starts_with("./") || flake_ref.starts_with('/')
-    {
-        format!("builtins.getFlake \"path:{}\"", flake_ref)
-    } else {
-        format!("builtins.getFlake \"{flake_ref}\"")
-    };
+    let flake_expr =
+        if flake_ref == "." || flake_ref.starts_with("./") || flake_ref.starts_with('/') {
+            format!("builtins.getFlake \"path:{}\"", flake_ref)
+        } else {
+            format!("builtins.getFlake \"{flake_ref}\"")
+        };
 
     // Build the package expression.  Installables can be either a plain attribute
     // name (resolved under legacyPackages) or a full dotted path.
@@ -162,17 +162,13 @@ fn installable_to_nix_expr(installable: &str) -> (String, String) {
         format!("({flake_expr}).{attr}")
     } else {
         // Short name like `hello` — resolve under legacyPackages.<system>.
-        format!(
-            "({flake_expr}).legacyPackages.${{builtins.currentSystem}}.{attr}"
-        )
+        format!("({flake_expr}).legacyPackages.${{builtins.currentSystem}}.{attr}")
     };
 
     // For dockerTools we need a nixpkgs.  If the flake IS nixpkgs, reuse it;
     // otherwise pull nixpkgs separately.
     let nixpkgs_expr = if flake_ref == "nixpkgs" {
-        format!(
-            "({flake_expr}).legacyPackages.${{builtins.currentSystem}}"
-        )
+        format!("({flake_expr}).legacyPackages.${{builtins.currentSystem}}")
     } else {
         "(builtins.getFlake \"nixpkgs\").legacyPackages.${builtins.currentSystem}".to_owned()
     };
