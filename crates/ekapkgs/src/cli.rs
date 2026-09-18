@@ -1153,6 +1153,10 @@ pub enum SearchCommand {
         #[arg(long)]
         json: bool,
 
+        /// Print only package names, one per line (useful for scripting).
+        #[arg(long)]
+        names_only: bool,
+
         /// Maximum number of results.
         #[arg(long, default_value = "20")]
         limit: usize,
