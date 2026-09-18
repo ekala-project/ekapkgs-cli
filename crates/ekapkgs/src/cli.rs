@@ -855,7 +855,11 @@ pub enum SystemCommand {
     },
 
     /// List system generations.
-    ListGenerations,
+    ListGenerations {
+        /// Output as JSON.
+        #[arg(long)]
+        json: bool,
+    },
 
     /// Roll back to the previous system generation.
     Rollback {
