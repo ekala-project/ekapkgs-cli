@@ -1,15 +1,47 @@
 use std::collections::HashSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use ekapkgs_nix::installable::Installable;
 use ekapkgs_nix::{NixCommand, eval};
+use jiff::Timestamp;
 use yansi::Paint;
 
 use crate::cli::{SystemCommand, SystemPackagesCommand};
 use crate::config::{ClientConfig, SystemPackageEntry, SystemPackages};
 
 const SYSTEM_PROFILE: &str = "/nix/var/nix/profiles/system";
+
+struct Generation {
+    number: u64,
+    path: PathBuf,
+    created: Timestamp,
+}
+
+fn discover_generations() -> color_eyre::Result<Vec<Generation>> {
+    let profile_dir = Path::new(SYSTEM_PROFILE).parent().unwrap_or(Path::new("/"));
+    let mut generations: Vec<Generation> = std::fs::read_dir(profile_dir)?
+        .filter_map(std::result::Result::ok)
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let number: u64 = name
+                .strip_prefix("system-")?
+                .strip_suffix("-link")?
+                .parse()
+                .ok()?;
+            let path = std::fs::read_link(e.path()).ok()?;
+            let modified = e.metadata().ok()?.modified().ok()?;
+            let created = Timestamp::try_from(modified).ok()?;
+            Some(Generation {
+                number,
+                path,
+                created,
+            })
+        })
+        .collect();
+    generations.sort_by_key(|g| g.number);
+    Ok(generations)
+}
 
 /// Nix profile for imperatively-installed system packages.
 const PACKAGES_PROFILE: &str = "/nix/var/nix/profiles/ekapkgs-system-packages";
@@ -28,7 +60,7 @@ pub fn execute(command: SystemCommand) -> color_eyre::Result<()> {
             cmd_activate(&installable, "test", false, &extra)
         },
         SystemCommand::Build { installable, extra } => cmd_build(&installable, &extra),
-        SystemCommand::ListGenerations => cmd_list_generations(),
+        SystemCommand::ListGenerations { json } => cmd_list_generations(json),
         SystemCommand::Rollback { dry_run } => cmd_rollback(dry_run),
         SystemCommand::PruneBootEntries {
             boot_mount,
@@ -189,41 +221,43 @@ fn build_system(installable: &str, extra: &[String]) -> color_eyre::Result<Strin
     Ok(path)
 }
 
-fn cmd_list_generations() -> color_eyre::Result<()> {
-    let profile_dir = Path::new(SYSTEM_PROFILE).parent().unwrap_or(Path::new("/"));
-
-    let mut generations: Vec<(u64, std::path::PathBuf)> = std::fs::read_dir(profile_dir)?
-        .filter_map(std::result::Result::ok)
-        .filter_map(|e| {
-            let name = e.file_name().to_string_lossy().into_owned();
-            // System generations are named system-N-link
-            let num: u64 = name
-                .strip_prefix("system-")?
-                .strip_suffix("-link")?
-                .parse()
-                .ok()?;
-            let target = std::fs::read_link(e.path()).ok()?;
-            Some((num, target))
-        })
-        .collect();
-
-    generations.sort_by_key(|(num, _)| *num);
+fn cmd_list_generations(json_output: bool) -> color_eyre::Result<()> {
+    let generations = discover_generations()?;
 
     if generations.is_empty() {
-        println!("No system generations found.");
+        if json_output {
+            println!("[]");
+        } else {
+            println!("No system generations found.");
+        }
         return Ok(());
     }
 
     // Find current generation.
     let current_target = std::fs::read_link(SYSTEM_PROFILE).ok();
 
-    for (num, target) in &generations {
-        let marker = if current_target.as_ref() == Some(target) {
-            " (current)"
-        } else {
-            ""
-        };
-        println!("{num:>4}  {}{marker}", target.display());
+    if json_output {
+        let entries: Vec<serde_json::Value> = generations
+            .iter()
+            .map(|g| {
+                serde_json::json!({
+                    "number": g.number,
+                    "path": g.path.to_string_lossy(),
+                    "created_at": g.created.to_string(),
+                    "current": current_target.as_ref() == Some(&g.path),
+                })
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&entries)?);
+    } else {
+        for g in &generations {
+            let marker = if current_target.as_ref() == Some(&g.path) {
+                " (current)"
+            } else {
+                ""
+            };
+            println!("{:>4}  {}{marker}", g.number, g.path.display());
+        }
     }
 
     Ok(())
@@ -234,28 +268,10 @@ fn cmd_rollback(dry_run: bool) -> color_eyre::Result<()> {
     let current_target = std::fs::read_link(SYSTEM_PROFILE)
         .map_err(|e| color_eyre::eyre::eyre!("failed to read system profile: {e}"))?;
 
-    let profile_dir = Path::new(SYSTEM_PROFILE).parent().unwrap_or(Path::new("/"));
-
-    let mut generations: Vec<(u64, std::path::PathBuf)> = std::fs::read_dir(profile_dir)?
-        .filter_map(std::result::Result::ok)
-        .filter_map(|e| {
-            let name = e.file_name().to_string_lossy().into_owned();
-            let num: u64 = name
-                .strip_prefix("system-")?
-                .strip_suffix("-link")?
-                .parse()
-                .ok()?;
-            let target = std::fs::read_link(e.path()).ok()?;
-            Some((num, target))
-        })
-        .collect();
-
-    generations.sort_by_key(|(num, _)| *num);
+    let generations = discover_generations()?;
 
     // Find the generation before the current one.
-    let current_idx = generations
-        .iter()
-        .position(|(_, target)| *target == current_target);
+    let current_idx = generations.iter().position(|g| g.path == current_target);
 
     let prev = match current_idx {
         Some(idx) if idx > 0 => &generations[idx - 1],
@@ -272,7 +288,7 @@ fn cmd_rollback(dry_run: bool) -> color_eyre::Result<()> {
         },
     };
 
-    let (prev_num, prev_path) = prev;
+    let (prev_num, prev_path) = (prev.number, &prev.path);
     tracing::info!(
         "Rolling back to generation {prev_num}: {}",
         prev_path.display()
@@ -397,26 +413,10 @@ fn cmd_prune_boot_entries(boot_mount: &str, gc: bool, dry_run: bool) -> color_ey
 
 /// Collect the set of generation numbers that have profile links.
 fn collect_active_generations() -> color_eyre::Result<HashSet<u64>> {
-    let profile_dir = Path::new(SYSTEM_PROFILE).parent().unwrap_or(Path::new("/"));
-    let mut gens = HashSet::new();
-
-    if !profile_dir.is_dir() {
-        return Ok(gens);
-    }
-
-    for entry in std::fs::read_dir(profile_dir)?.filter_map(std::result::Result::ok) {
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if let Some(num_str) = name
-            .strip_prefix("system-")
-            .and_then(|s| s.strip_suffix("-link"))
-        {
-            if let Ok(num) = num_str.parse::<u64>() {
-                gens.insert(num);
-            }
-        }
-    }
-
-    Ok(gens)
+    Ok(discover_generations()?
+        .into_iter()
+        .map(|g| g.number)
+        .collect())
 }
 
 /// Parse a generation number from a boot entry filename.
