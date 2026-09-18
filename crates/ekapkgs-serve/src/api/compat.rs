@@ -175,14 +175,20 @@ fn is_valid_nar_filename(s: &str) -> bool {
     is_valid_nix_hash(hash)
 }
 
-/// GET /{hash}.narinfo
+/// GET /{hash}.narinfo or GET /{hash}.ls
 ///
 /// Supports `?json` query parameter to return NarInfo JSON v3 format.
+/// Dispatches to the listing handler for `.ls` suffix.
 pub async fn get_narinfo(
     State(state): State<Arc<AppState>>,
     Path(hash_narinfo): Path<String>,
     Query(query): Query<NarInfoQuery>,
 ) -> Response {
+    // Dispatch .ls requests to the listing handler.
+    if let Some(hash) = hash_narinfo.strip_suffix(".ls") {
+        return super::listing::get_listing_inner(&state, hash).await;
+    }
+
     // Strip the .narinfo suffix.
     let hash = hash_narinfo
         .strip_suffix(".narinfo")
