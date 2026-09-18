@@ -176,6 +176,7 @@ async fn metrics_handler(
 fn build_http_router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/health", get(api::compat::health))
+        .route("/version", get(api::compat::version))
         .route("/nix-cache-info", get(api::compat::nix_cache_info))
         .route(
             "/{hash_narinfo}",

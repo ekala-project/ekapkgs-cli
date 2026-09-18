@@ -11,6 +11,12 @@ pub async fn health() -> impl IntoResponse {
     (StatusCode::OK, "OK\n")
 }
 
+/// GET /version
+pub async fn version() -> impl IntoResponse {
+    let body = format!("{} {}\n", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
+    (StatusCode::OK, body)
+}
+
 /// GET /nix-cache-info
 pub async fn nix_cache_info(State(_state): State<Arc<AppState>>) -> impl IntoResponse {
     let body = "StoreDir: /nix/store\nWantMassQuery: 1\nPriority: 30\n".to_owned();
