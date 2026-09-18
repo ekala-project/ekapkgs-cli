@@ -288,13 +288,21 @@ pub enum ClosureCommand {
         dependency: String,
     },
 
-    /// Diff two closures.
+    /// Diff two closures or derivations.
+    ///
+    /// When both arguments are `.drv` paths, performs a recursive derivation
+    /// diff (similar to nix-diff) showing exactly why the builds differ.
+    /// Otherwise delegates to `nix store diff-closures`.
     Diff {
-        /// First installable or store path.
+        /// First installable, store path, or derivation (.drv) path.
         a: String,
 
-        /// Second installable or store path.
+        /// Second installable, store path, or derivation (.drv) path.
         b: String,
+
+        /// Maximum recursion depth for derivation diffs.
+        #[arg(long)]
+        depth: Option<usize>,
     },
 
     /// Generate a Software Bill of Materials (SBOM) for a closure.

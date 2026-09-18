@@ -23,6 +23,21 @@ pub struct DerivationShowOutput {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DerivationInfo {
+    /// Derivation name (e.g., `hello-2.12.3`).
+    #[serde(default)]
+    pub name: Option<String>,
+    /// Target system (e.g., `x86_64-linux`).
+    #[serde(default)]
+    pub system: Option<String>,
+    /// Builder executable path.
+    #[serde(default)]
+    pub builder: Option<String>,
+    /// Builder command-line arguments.
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// Build environment variables.
+    #[serde(default)]
+    pub env: std::collections::HashMap<String, String>,
     pub inputs: Option<DerivationInputs>,
     pub outputs: std::collections::HashMap<String, DerivationOutput>,
 }
@@ -30,8 +45,34 @@ pub struct DerivationInfo {
 /// Input derivations and sources for a derivation.
 #[derive(Debug, Deserialize)]
 pub struct DerivationInputs {
+    /// Input derivations: drv path → list of output names used.
     #[serde(default)]
-    pub drvs: std::collections::HashMap<String, serde_json::Value>,
+    pub drvs: std::collections::HashMap<String, DerivationInputDrv>,
+    /// Input source store paths.
+    #[serde(default)]
+    pub srcs: Vec<String>,
+}
+
+/// An input derivation entry from `nix derivation show`.
+///
+/// In format version 4+, each input drv maps to an object with an `outputs`
+/// list. We also accept a bare list of strings for compatibility.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum DerivationInputDrv {
+    /// Format v4+: `{ "outputs": ["out", "dev"] }`
+    Structured { outputs: Vec<String> },
+    /// Bare list: `["out", "dev"]`
+    Bare(Vec<String>),
+}
+
+impl DerivationInputDrv {
+    /// Get the output names regardless of format.
+    pub fn outputs(&self) -> &[String] {
+        match self {
+            Self::Structured { outputs } | Self::Bare(outputs) => outputs,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -122,4 +163,21 @@ pub fn extract_fod_paths(installable: &Installable) -> Result<Vec<String>, NixEr
     fod_paths.sort();
     fod_paths.dedup();
     Ok(fod_paths)
+}
+
+/// Load a single derivation's metadata via `nix derivation show <drv_path>`.
+///
+/// Returns the `DerivationInfo` for the requested derivation. The drv_path
+/// should be a `/nix/store/…*.drv` path.
+pub fn show_derivation(drv_path: &str) -> Result<DerivationInfo, NixError> {
+    let show: DerivationShowOutput = NixCommand::new(&["derivation", "show"])
+        .arg(drv_path)
+        .json()?;
+
+    show.derivations
+        .into_values()
+        .next()
+        .ok_or(NixError::Empty {
+            context: format!("nix derivation show returned no derivations for {drv_path}"),
+        })
 }

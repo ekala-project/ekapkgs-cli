@@ -5,6 +5,7 @@ mod deploy;
 mod develop;
 mod docker;
 mod doctor;
+mod drv_diff;
 mod dry_run;
 mod env;
 mod flake;
