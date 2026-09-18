@@ -238,6 +238,10 @@ fn build_http_router(state: Arc<AppState>) -> Router {
                 .layer(DefaultBodyLimit::max(NAR_BODY_LIMIT)),
         )
         .route(
+            "/nar/{outhash}-{narhash}.nar",
+            get(api::compat::get_nar_compat).layer(DefaultBodyLimit::max(NAR_BODY_LIMIT)),
+        )
+        .route(
             "/cas/chunk/{b3hex}",
             get(api::chunks::get_chunk)
                 .put(api::chunks::put_chunk)
