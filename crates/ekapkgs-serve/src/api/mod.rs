@@ -2,6 +2,7 @@ pub mod chunks;
 pub mod compat;
 pub mod delta;
 pub mod listing;
+pub mod logs;
 pub mod negotiate;
 pub mod serve;
 pub mod upload;
