@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use axum::extract::{Path, State};
-use axum::http::{HeaderMap, StatusCode, header};
+use axum::http::{HeaderMap, HeaderName, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 
 use crate::AppState;
@@ -120,12 +120,14 @@ pub async fn get_narinfo(
         .with_label_values(&["hit"])
         .inc();
 
+    let nar_link = &narinfo.url;
     let body = narinfo.to_narinfo_string();
     (
         StatusCode::OK,
         [
             (header::CONTENT_TYPE, "text/x-nix-narinfo".to_owned()),
             (header::CACHE_CONTROL, "max-age=86400".to_owned()),
+            (HeaderName::from_static("nix-link"), nar_link.to_owned()),
         ],
         body,
     )
