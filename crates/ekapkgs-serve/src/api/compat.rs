@@ -71,7 +71,7 @@ pub async fn get_narinfo(
         .unwrap_or(&hash_narinfo);
 
     if !is_valid_store_hash(hash) {
-        return (StatusCode::NOT_FOUND, "not found").into_response();
+        return not_found_response();
     }
 
     state
@@ -101,7 +101,7 @@ pub async fn get_narinfo(
                 .narinfo_requests_total
                 .with_label_values(&["miss"])
                 .inc();
-            return (StatusCode::NOT_FOUND, "not found").into_response();
+            return not_found_response();
         },
         Err(e) => {
             tracing::error!("narinfo lookup failed: {e}");
@@ -123,8 +123,21 @@ pub async fn get_narinfo(
     let body = narinfo.to_narinfo_string();
     (
         StatusCode::OK,
-        [(header::CONTENT_TYPE, "text/x-nix-narinfo")],
+        [
+            (header::CONTENT_TYPE, "text/x-nix-narinfo".to_owned()),
+            (header::CACHE_CONTROL, "max-age=86400".to_owned()),
+        ],
         body,
+    )
+        .into_response()
+}
+
+/// Standard 404 response with `Cache-Control: no-store`.
+fn not_found_response() -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        [(header::CACHE_CONTROL, "no-store")],
+        "not found",
     )
         .into_response()
 }
@@ -139,7 +152,7 @@ pub async fn get_nar(
     Path(file): Path<String>,
 ) -> Response {
     if !is_valid_nar_filename(&file) {
-        return (StatusCode::NOT_FOUND, "not found").into_response();
+        return not_found_response();
     }
 
     let nar_path = format!("nar/{file}");
@@ -186,6 +199,7 @@ pub async fn get_nar(
                         (header::CONTENT_LENGTH, slice.len().to_string()),
                         (header::CONTENT_RANGE, content_range),
                         (header::ACCEPT_RANGES, "bytes".to_owned()),
+                        (header::CACHE_CONTROL, "max-age=31536000".to_owned()),
                     ],
                     slice,
                 )
@@ -202,13 +216,14 @@ pub async fn get_nar(
                         (header::CONTENT_TYPE, content_type.to_owned()),
                         (header::CONTENT_LENGTH, total_len.to_string()),
                         (header::ACCEPT_RANGES, "bytes".to_owned()),
+                        (header::CACHE_CONTROL, "max-age=31536000".to_owned()),
                     ],
                     data,
                 )
                     .into_response()
             }
         },
-        Ok(None) => (StatusCode::NOT_FOUND, "not found").into_response(),
+        Ok(None) => not_found_response(),
         Err(e) => {
             tracing::error!("NAR fetch failed: {e}");
             (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
