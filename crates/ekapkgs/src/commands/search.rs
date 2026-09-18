@@ -20,7 +20,12 @@ pub fn execute(command: SearchCommand) -> color_eyre::Result<()> {
             json,
             limit,
         } => cmd_options(&query, &flake, json, limit),
-        SearchCommand::Files { query, json, limit } => cmd_files(&query, json, limit),
+        SearchCommand::Files {
+            query,
+            json,
+            names_only,
+            limit,
+        } => cmd_files(&query, json, names_only, limit),
         SearchCommand::Update { flake, remote } => cmd_update(&flake, remote.as_deref()),
     }
 }
@@ -351,45 +356,51 @@ struct FileSearchEntry {
     package: String,
 }
 
-fn cmd_files(query: &str, json_output: bool, limit: usize) -> color_eyre::Result<()> {
+fn print_file_results(
+    results: &[FileSearchEntry],
+    query: &str,
+    json_output: bool,
+    names_only: bool,
+) -> color_eyre::Result<()> {
+    if json_output {
+        println!("{}", serde_json::to_string_pretty(results)?);
+    } else if names_only {
+        for entry in results {
+            println!("{}", entry.package);
+        }
+    } else if results.is_empty() {
+        println!("No files matching '{query}'.");
+    } else {
+        for entry in results {
+            println!("{}  {}", entry.file, format!("({})", entry.package).dim());
+        }
+        println!();
+        println!("{} result(s)", results.len());
+    }
+    Ok(())
+}
+
+fn cmd_files(
+    query: &str,
+    json_output: bool,
+    names_only: bool,
+    limit: usize,
+) -> color_eyre::Result<()> {
     // Try nix-locate first (from nix-index).
     if let Ok(results) = search_via_nix_locate(query, limit) {
-        if json_output {
-            println!("{}", serde_json::to_string_pretty(&results)?);
-        } else if results.is_empty() {
-            println!("No files matching '{query}'.");
-        } else {
-            for entry in &results {
-                println!("{}  {}", entry.file, format!("({})", entry.package).dim());
-            }
-            println!();
-            println!("{} result(s)", results.len());
-        }
-        return Ok(());
+        return print_file_results(&results, query, json_output, names_only);
     }
 
     // Fallback: try loading a cached file index.
     if let Some(data) = read_index("files")? {
         let entries: Vec<FileSearchEntry> = serde_json::from_slice(&data)?;
         let query_lower = query.to_lowercase();
-        let results: Vec<&FileSearchEntry> = entries
-            .iter()
+        let results: Vec<FileSearchEntry> = entries
+            .into_iter()
             .filter(|e| e.file.to_lowercase().contains(&query_lower))
             .take(limit)
             .collect();
-
-        if json_output {
-            println!("{}", serde_json::to_string_pretty(&results)?);
-        } else if results.is_empty() {
-            println!("No files matching '{query}'.");
-        } else {
-            for entry in &results {
-                println!("{}  {}", entry.file, format!("({})", entry.package).dim());
-            }
-            println!();
-            println!("{} result(s)", results.len());
-        }
-        return Ok(());
+        return print_file_results(&results, query, json_output, names_only);
     }
 
     Err(color_eyre::eyre::eyre!(
@@ -425,11 +436,16 @@ fn search_via_nix_locate(query: &str, limit: usize) -> color_eyre::Result<Vec<Fi
     let stdout = String::from_utf8_lossy(&output.stdout);
     let results: Vec<FileSearchEntry> = stdout
         .lines()
+        .map(str::trim)
         .filter(|l| !l.is_empty())
         .take(limit)
         .map(|line| {
-            // nix-locate --minimal outputs lines like "package.attr"
-            let package = line.trim().to_owned();
+            // nix-locate --minimal outputs "attr.output" (e.g. "cowsay.out").
+            // Strip the output suffix to get the attribute name.
+            let package = line
+                .rsplit_once('.')
+                .map_or(line, |(attr, _output)| attr)
+                .to_owned();
             FileSearchEntry {
                 file: query.to_owned(),
                 package,
