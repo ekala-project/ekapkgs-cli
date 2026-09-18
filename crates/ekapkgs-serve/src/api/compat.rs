@@ -1,7 +1,8 @@
 use std::sync::Arc;
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, HeaderName, StatusCode, header};
+use serde::Deserialize;
 use axum::response::{IntoResponse, Response};
 
 use crate::AppState;
@@ -41,6 +42,13 @@ fn is_valid_nix_hash(s: &str) -> bool {
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
 }
 
+/// Query parameters for narinfo endpoint.
+#[derive(Deserialize)]
+pub struct NarInfoQuery {
+    /// When present (any value), return JSON v3 format.
+    json: Option<String>,
+}
+
 /// Validate that a NAR filename is safe: `{hash}.nar` or `{hash}.nar.{compression}`.
 fn is_valid_nar_filename(s: &str) -> bool {
     if s.contains('/') || s.contains('\\') || s.contains("..") {
@@ -61,9 +69,12 @@ fn is_valid_nar_filename(s: &str) -> bool {
 }
 
 /// GET /{hash}.narinfo
+///
+/// Supports `?json` query parameter to return NarInfo JSON v3 format.
 pub async fn get_narinfo(
     State(state): State<Arc<AppState>>,
     Path(hash_narinfo): Path<String>,
+    Query(query): Query<NarInfoQuery>,
 ) -> Response {
     // Strip the .narinfo suffix.
     let hash = hash_narinfo
@@ -120,6 +131,20 @@ pub async fn get_narinfo(
         .with_label_values(&["hit"])
         .inc();
 
+    // JSON v3 format requested via ?json query parameter.
+    if query.json.is_some() {
+        let json = narinfo_to_json(&narinfo);
+        return (
+            StatusCode::OK,
+            [
+                (header::CONTENT_TYPE, "application/json".to_owned()),
+                (header::CACHE_CONTROL, "max-age=86400".to_owned()),
+            ],
+            json,
+        )
+            .into_response();
+    }
+
     let nar_link = &narinfo.url;
     let body = narinfo.to_narinfo_string();
     (
@@ -132,6 +157,54 @@ pub async fn get_narinfo(
         body,
     )
         .into_response()
+}
+
+/// Serialize a NarInfo to JSON v3 format.
+fn narinfo_to_json(ni: &crate::storage::NarInfo) -> String {
+    let references: Vec<&str> = ni
+        .references
+        .iter()
+        .map(|r| r.rsplit('/').next().unwrap_or(r.as_str()))
+        .collect();
+
+    let signatures: Vec<serde_json::Value> = ni
+        .signatures
+        .iter()
+        .filter_map(|s| {
+            let (key_name, sig) = s.split_once(':')?;
+            Some(serde_json::json!({
+                "keyName": key_name,
+                "sig": sig,
+            }))
+        })
+        .collect();
+
+    let deriver = ni
+        .deriver
+        .as_ref()
+        .map(|d| serde_json::Value::String(d.clone()));
+
+    let json = serde_json::json!({
+        "version": 3,
+        "storeDir": "/nix/store",
+        "storePath": ni.store_path,
+        "url": ni.url,
+        "compression": ni.compression,
+        "narHash": ni.nar_hash,
+        "narSize": ni.nar_size,
+        "fileHash": if ni.file_hash.is_empty() { None } else { Some(&ni.file_hash) },
+        "fileSize": if ni.file_size == 0 { None } else { Some(ni.file_size) },
+        "downloadHash": serde_json::Value::Null,
+        "downloadSize": serde_json::Value::Null,
+        "references": references,
+        "deriver": deriver,
+        "registrationTime": serde_json::Value::Null,
+        "signatures": signatures,
+        "ca": ni.ca,
+        "ultimate": false,
+    });
+
+    serde_json::to_string_pretty(&json).unwrap_or_default()
 }
 
 /// Standard 404 response with `Cache-Control: no-store`.
@@ -287,6 +360,36 @@ mod tests {
     #[test]
     fn parse_range_not_bytes() {
         assert_eq!(parse_range_header("items=0-10", 1000), None);
+    }
+
+    #[test]
+    fn narinfo_json_format() {
+        let ni = crate::storage::NarInfo {
+            store_path: "/nix/store/abc123-hello-2.12.1".to_owned(),
+            url: "nar/abc123.nar".to_owned(),
+            compression: "none".to_owned(),
+            file_hash: String::new(),
+            file_size: 0,
+            nar_hash: "sha256:deadbeef".to_owned(),
+            nar_size: 196040,
+            references: vec!["abc123-hello-2.12.1".to_owned()],
+            deriver: Some("xyz-hello.drv".to_owned()),
+            signatures: vec!["cache-1:base64sig==".to_owned()],
+            ca: None,
+        };
+
+        let json_str = narinfo_to_json(&ni);
+        let parsed: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+
+        assert_eq!(parsed["version"], 3);
+        assert_eq!(parsed["storeDir"], "/nix/store");
+        assert_eq!(parsed["storePath"], "/nix/store/abc123-hello-2.12.1");
+        assert_eq!(parsed["narSize"], 196040);
+        assert_eq!(parsed["signatures"][0]["keyName"], "cache-1");
+        assert_eq!(parsed["signatures"][0]["sig"], "base64sig==");
+        assert_eq!(parsed["ultimate"], false);
+        assert!(parsed["fileHash"].is_null());
+        assert!(parsed["ca"].is_null());
     }
 
     #[test]
