@@ -213,4 +213,7 @@ pub enum NixError {
         source: serde_json::Error,
         output: String,
     },
+
+    #[error("nix returned empty result: {context}")]
+    Empty { context: String },
 }
