@@ -61,6 +61,13 @@ impl NarInfoSigner {
     pub fn key_name(&self) -> &str {
         &self.key_name
     }
+
+    /// Return the public key in nix format: `key-name:base64-public-key`.
+    pub fn public_key(&self) -> String {
+        let pub_b64 =
+            data_encoding::BASE64.encode(self.signing_key.verifying_key().as_bytes().as_ref());
+        format!("{}:{pub_b64}", self.key_name)
+    }
 }
 
 /// Certificate-based signer that produces CertSignature alongside standard sigs.

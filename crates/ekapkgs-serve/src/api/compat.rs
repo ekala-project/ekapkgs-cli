@@ -28,6 +28,113 @@ pub async fn nix_cache_info(State(_state): State<Arc<AppState>>) -> impl IntoRes
     )
 }
 
+/// GET / — Root landing page with cache info, public keys, and nix.conf snippets.
+pub async fn root(State(state): State<Arc<AppState>>, headers: HeaderMap) -> impl IntoResponse {
+    let scheme = headers
+        .get("x-forwarded-proto")
+        .and_then(|v| v.to_str().ok())
+        .filter(|s| *s == "http" || *s == "https")
+        .unwrap_or("http");
+
+    let host = headers
+        .get(header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("localhost");
+
+    let url = format!("{scheme}://{}", html_escape(host));
+    let public_key = state.signer.public_key();
+
+    let mut vars = std::collections::HashMap::new();
+    vars.insert("url", url.as_str());
+    vars.insert("public_key", public_key.as_str());
+    vars.insert("key_name", state.signer.key_name());
+
+    let body = render_template(ROOT_TEMPLATE_WITH_KEY, &vars);
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        body,
+    )
+}
+
+/// Single-pass `[[key]]` template renderer.
+///
+/// Inserted values are HTML-escaped. Unknown keys are left as `[[key]]`.
+/// Values are never re-scanned (prevents injection).
+fn render_template(template: &str, vars: &std::collections::HashMap<&str, &str>) -> String {
+    let mut result = String::with_capacity(template.len());
+    let mut rest = template;
+
+    while let Some(start) = rest.find("[[") {
+        result.push_str(&rest[..start]);
+        let after_open = &rest[start + 2..];
+        if let Some(end) = after_open.find("]]") {
+            let key = &after_open[..end];
+            if let Some(value) = vars.get(key) {
+                result.push_str(value);
+            } else {
+                // Unknown key — leave as-is.
+                result.push_str("[[");
+                result.push_str(key);
+                result.push_str("]]");
+            }
+            rest = &after_open[end + 2..];
+        } else {
+            // No closing brackets — emit literally.
+            result.push_str("[[");
+            rest = after_open;
+        }
+    }
+    result.push_str(rest);
+    result
+}
+
+/// HTML-escape a string to prevent XSS.
+fn html_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#x27;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+const ROOT_TEMPLATE_WITH_KEY: &str = r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Nix Binary Cache</title>
+<style>
+body { font-family: system-ui, sans-serif; max-width: 700px; margin: 2em auto; padding: 0 1em; color: #333; }
+h1 { font-size: 1.4em; }
+pre { background: #f4f4f4; padding: 1em; border-radius: 4px; overflow-x: auto; }
+code { font-size: 0.9em; }
+</style>
+</head>
+<body>
+<h1>Nix Binary Cache</h1>
+<p>This server provides a <a href="/nix-cache-info">Nix binary cache</a>.</p>
+
+<h2>Public Key</h2>
+<pre><code>[[public_key]]</code></pre>
+
+<h2>Usage</h2>
+<p>Add to <code>/etc/nix/nix.conf</code>:</p>
+<pre><code>extra-substituters = [[url]]
+extra-trusted-public-keys = [[public_key]]</code></pre>
+
+<p>Or use with a single command:</p>
+<pre><code>nix build --extra-substituters '[[url]]' --extra-trusted-public-keys '[[public_key]]' ...</code></pre>
+</body>
+</html>
+"#;
+
 /// Nix base32 alphabet: `0123456789abcdfghijklmnpqrsvwxyz` (no e, o, t, u).
 /// Store path hashes are exactly 32 characters in this alphabet.
 pub(crate) fn is_valid_store_hash(s: &str) -> bool {
