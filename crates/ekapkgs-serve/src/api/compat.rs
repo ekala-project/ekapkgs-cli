@@ -27,7 +27,14 @@ pub async fn nix_cache_info(State(_state): State<Arc<AppState>>) -> impl IntoRes
     )
 }
 
-/// Validate that a string looks like a nix store hash: only lowercase alphanumeric.
+/// Nix base32 alphabet: `0123456789abcdfghijklmnpqrsvwxyz` (no e, o, t, u).
+/// Store path hashes are exactly 32 characters in this alphabet.
+pub(crate) fn is_valid_store_hash(s: &str) -> bool {
+    const NIX_BASE32: &[u8; 32] = b"0123456789abcdfghijklmnpqrsvwxyz";
+    s.len() == 32 && s.bytes().all(|b| NIX_BASE32.contains(&b))
+}
+
+/// Loose hash validation for non-store-path contexts (NAR filenames, etc.).
 fn is_valid_nix_hash(s: &str) -> bool {
     !s.is_empty()
         && s.bytes()
@@ -63,7 +70,7 @@ pub async fn get_narinfo(
         .strip_suffix(".narinfo")
         .unwrap_or(&hash_narinfo);
 
-    if !is_valid_nix_hash(hash) {
+    if !is_valid_store_hash(hash) {
         return (StatusCode::NOT_FOUND, "not found").into_response();
     }
 
@@ -263,5 +270,31 @@ mod tests {
     #[test]
     fn parse_range_not_bytes() {
         assert_eq!(parse_range_header("items=0-10", 1000), None);
+    }
+
+    #[test]
+    fn valid_store_hash() {
+        // 32-char nix base32 hash (no e, o, t, u)
+        assert!(is_valid_store_hash("0123456789abcdfghijklmnpqrsvwxyz"));
+        assert!(is_valid_store_hash("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
+    }
+
+    #[test]
+    fn invalid_store_hash_wrong_length() {
+        assert!(!is_valid_store_hash("abc"));
+        assert!(!is_valid_store_hash(""));
+        assert!(!is_valid_store_hash("0123456789abcdfghijklmnpqrsvwxyza")); // 33 chars
+    }
+
+    #[test]
+    fn invalid_store_hash_forbidden_chars() {
+        // 'e' is not in nix base32
+        assert!(!is_valid_store_hash("e123456789abcdfghijklmnpqrsvwxy"));
+        // 'o' is not in nix base32
+        assert!(!is_valid_store_hash("o123456789abcdfghijklmnpqrsvwxy"));
+        // 't' is not in nix base32
+        assert!(!is_valid_store_hash("t123456789abcdfghijklmnpqrsvwxy"));
+        // 'u' is not in nix base32
+        assert!(!is_valid_store_hash("u123456789abcdfghijklmnpqrsvwxy"));
     }
 }
