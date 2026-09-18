@@ -35,6 +35,7 @@ zstd.workspace = true
 yansi.workspace = true
 dialoguer.workspace = true
 axum.workspace = true
+jiff.workspace = true
 
 [lints]
 workspace = true
