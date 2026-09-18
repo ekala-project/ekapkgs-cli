@@ -222,6 +222,7 @@ fn build_http_router(state: Arc<AppState>) -> Router {
     const CHUNK_BODY_LIMIT: usize = 16 * 1024 * 1024;
 
     Router::new()
+        .route("/health", get(api::compat::health))
         .route("/nix-cache-info", get(api::compat::nix_cache_info))
         .route(
             "/{hash_narinfo}",

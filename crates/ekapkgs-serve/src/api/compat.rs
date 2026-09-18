@@ -6,6 +6,11 @@ use axum::response::{IntoResponse, Response};
 
 use crate::AppState;
 
+/// GET /health
+pub async fn health() -> impl IntoResponse {
+    (StatusCode::OK, "OK\n")
+}
+
 /// GET /nix-cache-info
 pub async fn nix_cache_info(State(_state): State<Arc<AppState>>) -> impl IntoResponse {
     let body = "StoreDir: /nix/store\nWantMassQuery: 1\nPriority: 30\n".to_owned();
