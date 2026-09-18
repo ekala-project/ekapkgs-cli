@@ -32,6 +32,7 @@ rusqlite.workspace = true
 blake3.workspace = true
 fastcdc.workspace = true
 zstd.workspace = true
+bzip2.workspace = true
 prometheus.workspace = true
 
 [dev-dependencies]
