@@ -51,11 +51,7 @@ impl TokenStore {
 
     /// Create a new token with the given name and permissions.
     /// Returns the generated token value.
-    pub fn create(
-        &mut self,
-        name: &str,
-        permissions: Permissions,
-    ) -> color_eyre::Result<String> {
+    pub fn create(&mut self, name: &str, permissions: Permissions) -> color_eyre::Result<String> {
         // Check for duplicate names.
         if self.tokens.iter().any(|t| t.name == name) {
             return Err(color_eyre::eyre::eyre!(
@@ -116,14 +112,12 @@ fn generate_token() -> String {
     } else {
         // Fallback: use a less ideal but functional source.
         for (i, b) in bytes.iter_mut().enumerate() {
-            *b = (i as u8)
-                .wrapping_mul(0x9E)
-                .wrapping_add(
-                    SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .subsec_nanos() as u8,
-                );
+            *b = (i as u8).wrapping_mul(0x9E).wrapping_add(
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .subsec_nanos() as u8,
+            );
         }
     }
 

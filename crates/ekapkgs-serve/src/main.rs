@@ -211,13 +211,12 @@ async fn security_headers(mut response: axum::response::Response) -> axum::respo
         axum::http::header::X_CONTENT_TYPE_OPTIONS,
         "nosniff".parse().unwrap(),
     );
-    headers.insert(
-        axum::http::header::X_FRAME_OPTIONS,
-        "DENY".parse().unwrap(),
-    );
+    headers.insert(axum::http::header::X_FRAME_OPTIONS, "DENY".parse().unwrap());
     headers.insert(
         axum::http::header::CONTENT_SECURITY_POLICY,
-        "default-src 'none'; style-src 'unsafe-inline'".parse().unwrap(),
+        "default-src 'none'; style-src 'unsafe-inline'"
+            .parse()
+            .unwrap(),
     );
     response
 }
