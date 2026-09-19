@@ -865,6 +865,22 @@ pub enum SystemCommand {
         extra: Vec<String>,
     },
 
+    /// Show what would change if the system were rebuilt.
+    ///
+    /// Builds the system configuration and diffs its closure against
+    /// the currently running system (`/run/current-system`). Exits
+    /// with code 0 if there are differences, 1 if the system is
+    /// already up to date.
+    Diff {
+        /// The system configuration installable.
+        #[arg(default_value = ".#config.system.build.toplevel")]
+        installable: String,
+
+        /// Extra arguments passed through to nix build.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        extra: Vec<String>,
+    },
+
     /// List system generations.
     ListGenerations {
         /// Output as JSON.
