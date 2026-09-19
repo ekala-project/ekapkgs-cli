@@ -511,7 +511,7 @@ async fn cmd_serve(cli: Cli) -> color_eyre::Result<()> {
     let mut enable_metrics: bool = true;
     let mut request_timeout_secs: u64 = 30;
     let mut priority: u32 = 30;
-    let store_dir: String = "/nix/store".to_owned();
+    let mut store_dir: String = "/nix/store".to_owned();
     let server_metrics = metrics::Metrics::new();
 
     let gc_metrics = gc::GcMetrics {
@@ -669,6 +669,11 @@ async fn cmd_serve(cli: Cli) -> color_eyre::Result<()> {
                 storage_str,
             )))
         };
+    }
+
+    // Environment variable overlays.
+    if let Ok(nix_store) = std::env::var("NIX_STORE_DIR") {
+        store_dir = nix_store;
     }
 
     let state = Arc::new(AppState {
