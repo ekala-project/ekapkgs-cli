@@ -142,9 +142,18 @@ in
         PrivateDevices = true;
         ProtectKernelTunables = true;
         ProtectKernelModules = true;
+        ProtectKernelLogs = true;
+        ProtectClock = true;
         ProtectControlGroups = true;
         RestrictSUIDSGID = true;
+        RestrictAddressFamilies = [ "AF_UNIX" "AF_INET" "AF_INET6" ];
         LockPersonality = true;
+        MemoryDenyWriteExecute = true;
+        SystemCallFilter = [ "@system-service" "~@privileged" "~@resources" ];
+        CapabilityBoundingSet = "";
+        LimitNOFILE = 65536;
+        ProcSubset = "pid";
+        ProtectProc = "invisible";
 
         ReadWritePaths = [
           "/nix/var/nix/daemon-socket"
