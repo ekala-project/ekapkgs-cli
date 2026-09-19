@@ -1477,6 +1477,7 @@ dependencies = [
  "ekapkgs-ui",
  "fastcdc",
  "getrandom 0.3.4",
+ "http-body-util",
  "prometheus",
  "prost",
  "rusqlite",
