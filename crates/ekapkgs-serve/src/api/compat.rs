@@ -21,8 +21,8 @@ pub async fn version() -> impl IntoResponse {
 /// GET /nix-cache-info
 pub async fn nix_cache_info(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let body = format!(
-        "StoreDir: /nix/store\nWantMassQuery: 1\nPriority: {}\n",
-        state.priority
+        "StoreDir: {}\nWantMassQuery: 1\nPriority: {}\n",
+        state.store_dir, state.priority
     );
     (
         StatusCode::OK,
@@ -249,7 +249,7 @@ pub async fn get_narinfo(
 
     // JSON v3 format requested via ?json query parameter.
     if query.json.is_some() {
-        let json = narinfo_to_json(&narinfo);
+        let json = narinfo_to_json(&narinfo, &state.store_dir);
         return (
             StatusCode::OK,
             [
@@ -276,7 +276,7 @@ pub async fn get_narinfo(
 }
 
 /// Serialize a NarInfo to JSON v3 format.
-fn narinfo_to_json(ni: &crate::storage::NarInfo) -> String {
+fn narinfo_to_json(ni: &crate::storage::NarInfo, store_dir: &str) -> String {
     let references: Vec<&str> = ni
         .references
         .iter()
@@ -302,7 +302,7 @@ fn narinfo_to_json(ni: &crate::storage::NarInfo) -> String {
 
     let json = serde_json::json!({
         "version": 3,
-        "storeDir": "/nix/store",
+        "storeDir": store_dir,
         "storePath": ni.store_path,
         "url": ni.url,
         "compression": ni.compression,
@@ -509,7 +509,7 @@ mod tests {
             ca: None,
         };
 
-        let json_str = narinfo_to_json(&ni);
+        let json_str = narinfo_to_json(&ni, "/nix/store");
         let parsed: serde_json::Value = serde_json::from_str(&json_str).unwrap();
 
         assert_eq!(parsed["version"], 3);

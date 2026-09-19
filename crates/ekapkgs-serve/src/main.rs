@@ -120,6 +120,8 @@ pub struct AppState {
     pub metrics: metrics::Metrics,
     /// Cache priority advertised in nix-cache-info.
     pub priority: u32,
+    /// Virtual store directory advertised to clients.
+    pub store_dir: String,
 }
 
 /// Cache for computed delta NARs, keyed by (base_hash, target_hash).
@@ -477,6 +479,7 @@ async fn cmd_serve(cli: Cli) -> color_eyre::Result<()> {
     let tls_cert_path: Option<PathBuf>;
     let tls_key_path: Option<PathBuf>;
     let mut priority: u32 = 30;
+    let store_dir: String = "/nix/store".to_owned();
     let server_metrics = metrics::Metrics::new();
 
     let gc_metrics = gc::GcMetrics {
@@ -642,6 +645,7 @@ async fn cmd_serve(cli: Cli) -> color_eyre::Result<()> {
         delta_cache: DeltaCache::new(),
         metrics: server_metrics,
         priority,
+        store_dir,
     });
 
     // Validate TLS config consistency.
