@@ -21,10 +21,30 @@ pub struct ServerConfig {
     pub tls_cert_path: Option<PathBuf>,
     /// Path to TLS private key file (PEM).
     pub tls_key_path: Option<PathBuf>,
+    /// Cache priority advertised in nix-cache-info. Default: 30.
+    #[serde(default = "default_priority")]
+    pub priority: u32,
+    /// Client request timeout in seconds. Default: 30.
+    #[serde(default = "default_request_timeout")]
+    pub client_request_timeout_secs: u64,
+    /// Expose /metrics endpoint. Default: true.
+    /// Set to false to disable the metrics endpoint entirely.
+    /// Consider binding to a separate internal address or using a reverse proxy
+    /// to restrict access to metrics in production.
+    #[serde(default = "default_true")]
+    pub enable_metrics: bool,
 }
 
 fn default_bind() -> String {
     "127.0.0.1:8080".to_owned()
+}
+
+fn default_priority() -> u32 {
+    30
+}
+
+fn default_request_timeout() -> u64 {
+    30
 }
 
 #[derive(Debug, Deserialize)]

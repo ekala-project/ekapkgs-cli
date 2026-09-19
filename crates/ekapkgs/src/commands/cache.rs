@@ -7,6 +7,21 @@ use futures::StreamExt;
 use crate::cli::{AuthCommand, CacheCommand};
 use crate::config::ClientConfig;
 
+/// Warn if a bearer token will be sent over plaintext HTTP.
+fn warn_insecure_token(url: &str, token: Option<&str>) {
+    if token.is_some()
+        && !url.starts_with("https://")
+        && !url.starts_with("http://localhost")
+        && !url.starts_with("http://127.0.0.1")
+        && !url.starts_with("http://[::1]")
+    {
+        tracing::warn!(
+            "Sending bearer token over plaintext HTTP to {url}. \
+             Consider using HTTPS to protect credentials."
+        );
+    }
+}
+
 pub fn execute(command: CacheCommand) -> color_eyre::Result<()> {
     match command {
         CacheCommand::Push {
@@ -143,6 +158,7 @@ fn cmd_push_sources(paths: &[String], cache_url: Option<&str>) -> color_eyre::Re
 
     let token = config.push_token(&server_url);
     let base_url = server_url.trim_end_matches('/');
+    warn_insecure_token(base_url, token.as_deref());
 
     for input in paths {
         let inst = Installable::new(input);
