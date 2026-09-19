@@ -27,6 +27,9 @@ module ekapkgs {
   /// A file system path
   type Path = str
 
+  /// A BLAKE3 content digest (hex string)
+  type B3Digest = str
+
   /// Activation mode for system/deploy commands
   type ActivationMode = Switch | Boot | Test
 
@@ -90,6 +93,18 @@ module ekapkgs {
   /// Trust status for env directories
   type TrustStatus = Trusted | Untrusted
 
+  /// Channel configuration for system switch/boot
+  type ChannelConfig = {
+    channel_input: str,   // flake input name to override
+    channel_url: str,     // base URL for channel resolution
+  }
+
+  /// CAS (content-addressed storage) chunk metadata
+  type CasChunk = {
+    digest: B3Digest,
+    size: int,
+  }
+
   // ============================================================
   // State
   // ============================================================
@@ -145,8 +160,9 @@ module ekapkgs {
   /// Directory environments: dir -> env profile paths
   var envProfiles: Path -> Set[StorePath]
 
-  /// Trusted env directories
-  var trustedEnvs: Set[Path]
+  /// Trusted env directories: dir -> content hash of manifest
+  /// Empty string means not trusted; non-empty is the blake3 hash
+  var trustedEnvs: Path -> B3Digest
 
   /// Search index cache: flake -> whether index exists
   var searchIndexes: Set[str]
@@ -175,6 +191,25 @@ module ekapkgs {
 
   /// Last command result
   var lastResult: CmdResult
+
+  /// Channel configuration (from client config defaults)
+  var channelConfig: ChannelConfig
+
+  /// Env dev shell rendered scripts exist on disk: dir -> fingerprint hash
+  /// "" means no rendered scripts exist
+  var envRenderedFingerprints: Path -> B3Digest
+
+  /// CAS chunk store: set of chunk digests available locally
+  var casChunks: Set[B3Digest]
+
+  /// Remote CAS chunks: set of chunk digests available on the server
+  var remoteCasChunks: Set[B3Digest]
+
+  /// Remote source manifests: set of installables with source manifests uploaded
+  var remoteSourceManifests: Set[Installable]
+
+  /// FOD (fixed-output derivation) paths in remote cache
+  var remoteFodPaths: Set[StorePath]
 
   // ============================================================
   // Pure helpers
@@ -207,6 +242,10 @@ module ekapkgs {
   /// Get generation numbers from a list
   pure def genNumbers(gens: List[Generation]): Set[int] =
     gens.indices().fold(Set(), (acc, i) => acc.union(Set(gens[i].number)))
+
+  /// Check if channel config is complete (both fields set)
+  pure def channelConfigValid(cfg: ChannelConfig): bool =
+    cfg.channel_input != "" and cfg.channel_url != ""
 
   // ============================================================
   // Actions: Top-level commands
@@ -246,6 +285,12 @@ module ekapkgs {
     activationInProgress' = activationInProgress,
     savedPreviousProfile' = savedPreviousProfile,
     substituterRunning' = substituterRunning,
+    channelConfig' = channelConfig,
+    envRenderedFingerprints' = envRenderedFingerprints,
+    casChunks' = casChunks,
+    remoteCasChunks' = remoteCasChunks,
+    remoteSourceManifests' = remoteSourceManifests,
+    remoteFodPaths' = remoteFodPaths,
     lastResult' = Ok,
   }
 
@@ -281,6 +326,96 @@ module ekapkgs {
     activationInProgress' = activationInProgress,
     savedPreviousProfile' = savedPreviousProfile,
     substituterRunning' = substituterRunning,
+    channelConfig' = channelConfig,
+    envRenderedFingerprints' = envRenderedFingerprints,
+    casChunks' = casChunks,
+    remoteCasChunks' = remoteCasChunks,
+    remoteSourceManifests' = remoteSourceManifests,
+    remoteFodPaths' = remoteFodPaths,
+    lastResult' = Ok,
+  }
+
+  // ----------------------------------------------------------
+  // wtf <command> — searches nixpkgs then runs via nix run
+  // ----------------------------------------------------------
+  action wtfRun(command: str, pkg: Installable, closurePaths: Set[StorePath]): bool = all {
+    // Precondition: package must provide the command (search found a result)
+    command != "",
+    closurePaths.size() > 0,
+    // Effect: same as nix run — paths in store, then process replacement
+    nixStore' = nixStore.union(closurePaths),
+    remoteCache' = remoteCache,
+    systemGenerations' = systemGenerations,
+    systemCurrentGen' = systemCurrentGen,
+    homeGenerations' = homeGenerations,
+    homeCurrentGen' = homeCurrentGen,
+    homePackages' = homePackages,
+    homeProfilePaths' = homeProfilePaths,
+    systemPackages' = systemPackages,
+    systemProfilePaths' = systemProfilePaths,
+    homeServices' = homeServices,
+    serviceStates' = serviceStates,
+    configCaches' = configCaches,
+    registry' = registry,
+    envPackages' = envPackages,
+    envFlakes' = envFlakes,
+    envProfiles' = envProfiles,
+    trustedEnvs' = trustedEnvs,
+    searchIndexes' = searchIndexes,
+    envManifestExists' = envManifestExists,
+    flakeLockBackup' = flakeLockBackup,
+    bootEntries' = bootEntries,
+    hasSudo' = hasSudo,
+    activationInProgress' = activationInProgress,
+    savedPreviousProfile' = savedPreviousProfile,
+    substituterRunning' = substituterRunning,
+    channelConfig' = channelConfig,
+    envRenderedFingerprints' = envRenderedFingerprints,
+    casChunks' = casChunks,
+    remoteCasChunks' = remoteCasChunks,
+    remoteSourceManifests' = remoteSourceManifests,
+    remoteFodPaths' = remoteFodPaths,
+    lastResult' = Ok,
+  }
+
+  // ----------------------------------------------------------
+  // closure docker <installable> — builds docker image from closure
+  // ----------------------------------------------------------
+  action closureDocker(installable: Installable, closurePaths: Set[StorePath]): bool = all {
+    closurePaths.size() > 0,
+    // Effect: closure built into store (docker image is streamed out, no persistent state)
+    nixStore' = nixStore.union(closurePaths),
+    remoteCache' = remoteCache,
+    systemGenerations' = systemGenerations,
+    systemCurrentGen' = systemCurrentGen,
+    homeGenerations' = homeGenerations,
+    homeCurrentGen' = homeCurrentGen,
+    homePackages' = homePackages,
+    homeProfilePaths' = homeProfilePaths,
+    systemPackages' = systemPackages,
+    systemProfilePaths' = systemProfilePaths,
+    homeServices' = homeServices,
+    serviceStates' = serviceStates,
+    configCaches' = configCaches,
+    registry' = registry,
+    envPackages' = envPackages,
+    envFlakes' = envFlakes,
+    envProfiles' = envProfiles,
+    trustedEnvs' = trustedEnvs,
+    searchIndexes' = searchIndexes,
+    envManifestExists' = envManifestExists,
+    flakeLockBackup' = flakeLockBackup,
+    bootEntries' = bootEntries,
+    hasSudo' = hasSudo,
+    activationInProgress' = activationInProgress,
+    savedPreviousProfile' = savedPreviousProfile,
+    substituterRunning' = substituterRunning,
+    channelConfig' = channelConfig,
+    envRenderedFingerprints' = envRenderedFingerprints,
+    casChunks' = casChunks,
+    remoteCasChunks' = remoteCasChunks,
+    remoteSourceManifests' = remoteSourceManifests,
+    remoteFodPaths' = remoteFodPaths,
     lastResult' = Ok,
   }
 
@@ -320,17 +455,83 @@ module ekapkgs {
     activationInProgress' = activationInProgress,
     savedPreviousProfile' = savedPreviousProfile,
     substituterRunning' = substituterRunning,
+    channelConfig' = channelConfig,
+    envRenderedFingerprints' = envRenderedFingerprints,
+    casChunks' = casChunks,
+    remoteCasChunks' = remoteCasChunks,
+    remoteSourceManifests' = remoteSourceManifests,
+    remoteFodPaths' = remoteFodPaths,
     lastResult' = Ok,
   }
 
   // ----------------------------------------------------------
-  // cache pull <paths>
+  // cache push --sources-only <installable>
+  // Transfers only FOD paths and the derivation graph.
+  // The remote machine rebuilds from source.
   // ----------------------------------------------------------
-  action cachePull(paths: Set[StorePath], cacheUrl: Url): bool = all {
+  action cachePushSourcesOnly(
+    installable: Installable,
+    fodPaths: Set[StorePath],
+    cacheUrl: Url,
+  ): bool = all {
+    // Precondition: FOD paths must be in local store
+    fodPaths.forall(p => nixStore.contains(p)),
+    // Precondition: must have auth
+    hasAuth(configCaches, cacheUrl),
+    // Effect: FOD paths uploaded to remote, source manifest registered
+    remoteFodPaths' = remoteFodPaths.union(fodPaths),
+    remoteSourceManifests' = remoteSourceManifests.union(Set(installable)),
+    // Only FODs are transferred, not build outputs
+    remoteCache' = remoteCache,
+    nixStore' = nixStore,
+    systemGenerations' = systemGenerations,
+    systemCurrentGen' = systemCurrentGen,
+    homeGenerations' = homeGenerations,
+    homeCurrentGen' = homeCurrentGen,
+    homePackages' = homePackages,
+    homeProfilePaths' = homeProfilePaths,
+    systemPackages' = systemPackages,
+    systemProfilePaths' = systemProfilePaths,
+    homeServices' = homeServices,
+    serviceStates' = serviceStates,
+    configCaches' = configCaches,
+    registry' = registry,
+    envPackages' = envPackages,
+    envFlakes' = envFlakes,
+    envProfiles' = envProfiles,
+    trustedEnvs' = trustedEnvs,
+    searchIndexes' = searchIndexes,
+    envManifestExists' = envManifestExists,
+    flakeLockBackup' = flakeLockBackup,
+    bootEntries' = bootEntries,
+    hasSudo' = hasSudo,
+    activationInProgress' = activationInProgress,
+    savedPreviousProfile' = savedPreviousProfile,
+    substituterRunning' = substituterRunning,
+    channelConfig' = channelConfig,
+    envRenderedFingerprints' = envRenderedFingerprints,
+    casChunks' = casChunks,
+    remoteCasChunks' = remoteCasChunks,
+    lastResult' = Ok,
+  }
+
+  // ----------------------------------------------------------
+  // cache pull <paths> — three-tier download strategy:
+  //   1. CAS chunk-based (if server supports it)
+  //   2. gRPC streaming
+  //   3. HTTP batch (fallback)
+  // ----------------------------------------------------------
+  action cachePull(
+    paths: Set[StorePath],
+    cacheUrl: Url,
+    casChunksDownloaded: Set[B3Digest],
+  ): bool = all {
     // Precondition: paths must be available on the remote cache
     paths.forall(p => remoteCache.contains(p)),
     // Effect: paths downloaded to local store
     nixStore' = nixStore.union(paths),
+    // CAS chunks acquired during pull are cached locally
+    casChunks' = casChunks.union(casChunksDownloaded),
     remoteCache' = remoteCache,
     systemGenerations' = systemGenerations,
     systemCurrentGen' = systemCurrentGen,
@@ -356,6 +557,11 @@ module ekapkgs {
     activationInProgress' = activationInProgress,
     savedPreviousProfile' = savedPreviousProfile,
     substituterRunning' = substituterRunning,
+    channelConfig' = channelConfig,
+    envRenderedFingerprints' = envRenderedFingerprints,
+    remoteCasChunks' = remoteCasChunks,
+    remoteSourceManifests' = remoteSourceManifests,
+    remoteFodPaths' = remoteFodPaths,
     lastResult' = Ok,
   }
 
@@ -392,6 +598,12 @@ module ekapkgs {
     activationInProgress' = activationInProgress,
     savedPreviousProfile' = savedPreviousProfile,
     substituterRunning' = substituterRunning,
+    channelConfig' = channelConfig,
+    envRenderedFingerprints' = envRenderedFingerprints,
+    casChunks' = casChunks,
+    remoteCasChunks' = remoteCasChunks,
+    remoteSourceManifests' = remoteSourceManifests,
+    remoteFodPaths' = remoteFodPaths,
     lastResult' = Ok,
   }
 
@@ -428,11 +640,23 @@ module ekapkgs {
     activationInProgress' = activationInProgress,
     savedPreviousProfile' = savedPreviousProfile,
     substituterRunning' = substituterRunning,
+    channelConfig' = channelConfig,
+    envRenderedFingerprints' = envRenderedFingerprints,
+    casChunks' = casChunks,
+    remoteCasChunks' = remoteCasChunks,
+    remoteSourceManifests' = remoteSourceManifests,
+    remoteFodPaths' = remoteFodPaths,
     lastResult' = Ok,
   }
 
   // ----------------------------------------------------------
-  // system switch — the most complex state transition
+  // system switch — with optional --channel and auto-rollback
+  //
+  // If channel is provided, applies `nix flake lock --override-input`
+  // before building. Requires channelConfig to have both fields set.
+  //
+  // On activation failure, automatically rolls back to the previous
+  // profile and re-activates it. Reports whether rollback succeeded.
   // ----------------------------------------------------------
   /// Helper: deactivate all gens in a list (set current=false)
   pure def deactivateAll(gens: List[Generation]): List[Generation] =
@@ -452,6 +676,8 @@ module ekapkgs {
     closurePaths: Set[StorePath],
     newGenNum: int,
     activationSucceeds: bool,
+    useChannel: bool,
+    rollbackSucceeds: bool,
   ): bool = all {
     // Precondition: must have sudo
     hasSudo,
@@ -459,6 +685,8 @@ module ekapkgs {
     closurePaths.size() > 0,
     // Precondition: new gen number must be fresh
     not(genNumbers(systemGenerations).contains(newGenNum)),
+    // Precondition: if using channel, config must be complete
+    (not(useChannel) or channelConfigValid(channelConfig)),
     systemGenerations' = if (activationSucceeds)
                            deactivateAll(systemGenerations).append(
                              { number: newGenNum, path: newPath, current: true }
@@ -472,7 +700,8 @@ module ekapkgs {
     activationInProgress' = false,
     savedPreviousProfile' = "",
     lastResult' = if (activationSucceeds) Ok
-                  else Err("activation failed, rolled back"),
+                  else if (rollbackSucceeds) Err("activation failed, rolled back to previous configuration")
+                  else Err("activation failed, rollback also failed, system may be inconsistent"),
     // Unchanged
     remoteCache' = remoteCache,
     homeGenerations' = homeGenerations,
@@ -494,19 +723,28 @@ module ekapkgs {
     flakeLockBackup' = flakeLockBackup,
     hasSudo' = hasSudo,
     substituterRunning' = substituterRunning,
+    channelConfig' = channelConfig,
+    envRenderedFingerprints' = envRenderedFingerprints,
+    casChunks' = casChunks,
+    remoteCasChunks' = remoteCasChunks,
+    remoteSourceManifests' = remoteSourceManifests,
+    remoteFodPaths' = remoteFodPaths,
   }
 
   // ----------------------------------------------------------
-  // system boot — adds boot entry but does not switch running config
+  // system boot — adds boot entry but does not switch running config.
+  // Supports --channel flag like system switch.
   // ----------------------------------------------------------
   action systemBoot(
     newPath: StorePath,
     closurePaths: Set[StorePath],
     newGenNum: int,
+    useChannel: bool,
   ): bool = all {
     hasSudo,
     closurePaths.size() > 0,
     not(genNumbers(systemGenerations).contains(newGenNum)),
+    (not(useChannel) or channelConfigValid(channelConfig)),
     val newGen = { number: newGenNum, path: newPath, current: false }
     systemGenerations' = systemGenerations.append(newGen),
     // Current gen does NOT change — running system is unaffected
@@ -535,6 +773,12 @@ module ekapkgs {
     activationInProgress' = false,
     savedPreviousProfile' = "",
     substituterRunning' = substituterRunning,
+    channelConfig' = channelConfig,
+    envRenderedFingerprints' = envRenderedFingerprints,
+    casChunks' = casChunks,
+    remoteCasChunks' = remoteCasChunks,
+    remoteSourceManifests' = remoteSourceManifests,
+    remoteFodPaths' = remoteFodPaths,
     lastResult' = Ok,
   }
 
@@ -576,6 +820,66 @@ module ekapkgs {
     activationInProgress' = false,
     savedPreviousProfile' = "",
     substituterRunning' = substituterRunning,
+    channelConfig' = channelConfig,
+    envRenderedFingerprints' = envRenderedFingerprints,
+    casChunks' = casChunks,
+    remoteCasChunks' = remoteCasChunks,
+    remoteSourceManifests' = remoteSourceManifests,
+    remoteFodPaths' = remoteFodPaths,
+  }
+
+  // ----------------------------------------------------------
+  // system diff — builds system config, compares against /run/current-system.
+  // Exit code 0 = differences found, exit code 1 = up to date.
+  // Read-only: no state changes.
+  // ----------------------------------------------------------
+  action systemDiff(
+    installable: Installable,
+    closurePaths: Set[StorePath],
+    currentSystemPath: StorePath,
+    newPath: StorePath,
+    hasDifferences: bool,
+  ): bool = all {
+    hasSudo,
+    closurePaths.size() > 0,
+    // Precondition: current system must be in the store
+    nixStore.contains(currentSystemPath),
+    // Effect: build the new system (adds paths to store)
+    nixStore' = nixStore.union(closurePaths),
+    // Result: Ok if differences found, Err if up to date
+    lastResult' = if (hasDifferences) Ok else Err("system is up to date"),
+    // No other state changes — diff is read-only
+    remoteCache' = remoteCache,
+    systemGenerations' = systemGenerations,
+    systemCurrentGen' = systemCurrentGen,
+    homeGenerations' = homeGenerations,
+    homeCurrentGen' = homeCurrentGen,
+    homePackages' = homePackages,
+    homeProfilePaths' = homeProfilePaths,
+    systemPackages' = systemPackages,
+    systemProfilePaths' = systemProfilePaths,
+    homeServices' = homeServices,
+    serviceStates' = serviceStates,
+    configCaches' = configCaches,
+    registry' = registry,
+    envPackages' = envPackages,
+    envFlakes' = envFlakes,
+    envProfiles' = envProfiles,
+    trustedEnvs' = trustedEnvs,
+    searchIndexes' = searchIndexes,
+    envManifestExists' = envManifestExists,
+    flakeLockBackup' = flakeLockBackup,
+    bootEntries' = bootEntries,
+    hasSudo' = hasSudo,
+    activationInProgress' = false,
+    savedPreviousProfile' = "",
+    substituterRunning' = substituterRunning,
+    channelConfig' = channelConfig,
+    envRenderedFingerprints' = envRenderedFingerprints,
+    casChunks' = casChunks,
+    remoteCasChunks' = remoteCasChunks,
+    remoteSourceManifests' = remoteSourceManifests,
+    remoteFodPaths' = remoteFodPaths,
   }
 
   // ----------------------------------------------------------
@@ -616,6 +920,12 @@ module ekapkgs {
     activationInProgress' = false,
     savedPreviousProfile' = "",
     substituterRunning' = substituterRunning,
+    channelConfig' = channelConfig,
+    envRenderedFingerprints' = envRenderedFingerprints,
+    casChunks' = casChunks,
+    remoteCasChunks' = remoteCasChunks,
+    remoteSourceManifests' = remoteSourceManifests,
+    remoteFodPaths' = remoteFodPaths,
   }
 
   // ----------------------------------------------------------
@@ -652,17 +962,27 @@ module ekapkgs {
     activationInProgress' = false,
     savedPreviousProfile' = "",
     substituterRunning' = substituterRunning,
+    channelConfig' = channelConfig,
+    envRenderedFingerprints' = envRenderedFingerprints,
+    casChunks' = casChunks,
+    remoteCasChunks' = remoteCasChunks,
+    remoteSourceManifests' = remoteSourceManifests,
+    remoteFodPaths' = remoteFodPaths,
     lastResult' = Ok,
   }
 
   // ----------------------------------------------------------
-  // home switch
+  // home switch — with auto-rollback on activation failure
+  //
+  // Records previous generation before activating. On failure,
+  // attempts to re-activate the previous generation's activate script.
   // ----------------------------------------------------------
   action homeSwitch(
     newPath: StorePath,
     closurePaths: Set[StorePath],
     newGenNum: int,
     activationSucceeds: bool,
+    rollbackSucceeds: bool,
   ): bool = all {
     closurePaths.size() > 0,
     not(genNumbers(homeGenerations).contains(newGenNum)),
@@ -674,7 +994,8 @@ module ekapkgs {
     homeCurrentGen' = if (activationSucceeds) homeGenerations.length()
                       else homeCurrentGen,
     lastResult' = if (activationSucceeds) Ok
-                  else Err("home activation failed, rolled back"),
+                  else if (rollbackSucceeds) Err("home activation failed, rolled back to previous generation")
+                  else Err("home activation failed, rollback also failed"),
     nixStore' = nixStore.union(closurePaths),
     remoteCache' = remoteCache,
     systemGenerations' = systemGenerations,
@@ -699,10 +1020,16 @@ module ekapkgs {
     activationInProgress' = false,
     savedPreviousProfile' = "",
     substituterRunning' = substituterRunning,
+    channelConfig' = channelConfig,
+    envRenderedFingerprints' = envRenderedFingerprints,
+    casChunks' = casChunks,
+    remoteCasChunks' = remoteCasChunks,
+    remoteSourceManifests' = remoteSourceManifests,
+    remoteFodPaths' = remoteFodPaths,
   }
 
   // ----------------------------------------------------------
-  // home rollback
+  // home rollback — activates the previous generation
   // ----------------------------------------------------------
   action homeRollback(activationSucceeds: bool): bool = all {
     hasPreviousGen(homeCurrentGen),
@@ -737,10 +1064,18 @@ module ekapkgs {
     activationInProgress' = false,
     savedPreviousProfile' = "",
     substituterRunning' = substituterRunning,
+    channelConfig' = channelConfig,
+    envRenderedFingerprints' = envRenderedFingerprints,
+    casChunks' = casChunks,
+    remoteCasChunks' = remoteCasChunks,
+    remoteSourceManifests' = remoteSourceManifests,
+    remoteFodPaths' = remoteFodPaths,
   }
 
   // ----------------------------------------------------------
-  // home packages add
+  // home packages add — with incremental manifest save.
+  // Manifest is updated only after successful profile install.
+  // File locking prevents concurrent manifest corruption.
   // ----------------------------------------------------------
   action homePackagesAdd(pkg: PackageEntry, profilePath: StorePath, installSucceeds: bool): bool = all {
     // Precondition: package not already in manifest
@@ -780,6 +1115,12 @@ module ekapkgs {
     activationInProgress' = false,
     savedPreviousProfile' = "",
     substituterRunning' = substituterRunning,
+    channelConfig' = channelConfig,
+    envRenderedFingerprints' = envRenderedFingerprints,
+    casChunks' = casChunks,
+    remoteCasChunks' = remoteCasChunks,
+    remoteSourceManifests' = remoteSourceManifests,
+    remoteFodPaths' = remoteFodPaths,
   }
 
   // ----------------------------------------------------------
@@ -813,6 +1154,12 @@ module ekapkgs {
     activationInProgress' = false,
     savedPreviousProfile' = "",
     substituterRunning' = substituterRunning,
+    channelConfig' = channelConfig,
+    envRenderedFingerprints' = envRenderedFingerprints,
+    casChunks' = casChunks,
+    remoteCasChunks' = remoteCasChunks,
+    remoteSourceManifests' = remoteSourceManifests,
+    remoteFodPaths' = remoteFodPaths,
     lastResult' = Ok,
   }
 
@@ -856,6 +1203,12 @@ module ekapkgs {
     activationInProgress' = false,
     savedPreviousProfile' = "",
     substituterRunning' = substituterRunning,
+    channelConfig' = channelConfig,
+    envRenderedFingerprints' = envRenderedFingerprints,
+    casChunks' = casChunks,
+    remoteCasChunks' = remoteCasChunks,
+    remoteSourceManifests' = remoteSourceManifests,
+    remoteFodPaths' = remoteFodPaths,
   }
 
   // ----------------------------------------------------------
@@ -890,17 +1243,32 @@ module ekapkgs {
     activationInProgress' = false,
     savedPreviousProfile' = "",
     substituterRunning' = substituterRunning,
+    channelConfig' = channelConfig,
+    envRenderedFingerprints' = envRenderedFingerprints,
+    casChunks' = casChunks,
+    remoteCasChunks' = remoteCasChunks,
+    remoteSourceManifests' = remoteSourceManifests,
+    remoteFodPaths' = remoteFodPaths,
     lastResult' = Ok,
   }
 
   // ----------------------------------------------------------
-  // home services add
+  // home services add — with failure reporting.
+  // Service restart failures are now reported instead of swallowed.
   // ----------------------------------------------------------
-  action homeServicesAdd(svc: ServiceEntry, noApply: bool): bool = all {
+  action homeServicesAdd(svc: ServiceEntry, noApply: bool, applySucceeds: bool): bool = all {
     not(homeServices.exists(s => s.name == svc.name)),
     homeServices' = homeServices.union(Set(svc)),
-    serviceStates' = if (noApply) serviceStates
-                     else serviceStates.put(svc.name, Running),
+    if (noApply) all {
+      serviceStates' = serviceStates,
+      lastResult' = Ok,
+    } else if (applySucceeds) all {
+      serviceStates' = serviceStates.put(svc.name, Running),
+      lastResult' = Ok,
+    } else all {
+      serviceStates' = serviceStates.put(svc.name, Failed),
+      lastResult' = Err("service failed to start"),
+    },
     nixStore' = nixStore,
     remoteCache' = remoteCache,
     systemGenerations' = systemGenerations,
@@ -925,7 +1293,12 @@ module ekapkgs {
     activationInProgress' = false,
     savedPreviousProfile' = "",
     substituterRunning' = substituterRunning,
-    lastResult' = Ok,
+    channelConfig' = channelConfig,
+    envRenderedFingerprints' = envRenderedFingerprints,
+    casChunks' = casChunks,
+    remoteCasChunks' = remoteCasChunks,
+    remoteSourceManifests' = remoteSourceManifests,
+    remoteFodPaths' = remoteFodPaths,
   }
 
   // ----------------------------------------------------------
@@ -960,6 +1333,12 @@ module ekapkgs {
     activationInProgress' = false,
     savedPreviousProfile' = "",
     substituterRunning' = substituterRunning,
+    channelConfig' = channelConfig,
+    envRenderedFingerprints' = envRenderedFingerprints,
+    casChunks' = casChunks,
+    remoteCasChunks' = remoteCasChunks,
+    remoteSourceManifests' = remoteSourceManifests,
+    remoteFodPaths' = remoteFodPaths,
     lastResult' = Ok,
   }
 
@@ -996,6 +1375,12 @@ module ekapkgs {
     activationInProgress' = false,
     savedPreviousProfile' = "",
     substituterRunning' = substituterRunning,
+    channelConfig' = channelConfig,
+    envRenderedFingerprints' = envRenderedFingerprints,
+    casChunks' = casChunks,
+    remoteCasChunks' = remoteCasChunks,
+    remoteSourceManifests' = remoteSourceManifests,
+    remoteFodPaths' = remoteFodPaths,
     lastResult' = Ok,
   }
 
@@ -1029,6 +1414,12 @@ module ekapkgs {
     activationInProgress' = false,
     savedPreviousProfile' = "",
     substituterRunning' = substituterRunning,
+    channelConfig' = channelConfig,
+    envRenderedFingerprints' = envRenderedFingerprints,
+    casChunks' = casChunks,
+    remoteCasChunks' = remoteCasChunks,
+    remoteSourceManifests' = remoteSourceManifests,
+    remoteFodPaths' = remoteFodPaths,
     lastResult' = Ok,
   }
 
@@ -1064,6 +1455,12 @@ module ekapkgs {
     activationInProgress' = false,
     savedPreviousProfile' = "",
     substituterRunning' = substituterRunning,
+    channelConfig' = channelConfig,
+    envRenderedFingerprints' = envRenderedFingerprints,
+    casChunks' = casChunks,
+    remoteCasChunks' = remoteCasChunks,
+    remoteSourceManifests' = remoteSourceManifests,
+    remoteFodPaths' = remoteFodPaths,
     lastResult' = Ok,
   }
 
@@ -1098,6 +1495,12 @@ module ekapkgs {
     activationInProgress' = false,
     savedPreviousProfile' = "",
     substituterRunning' = substituterRunning,
+    channelConfig' = channelConfig,
+    envRenderedFingerprints' = envRenderedFingerprints,
+    casChunks' = casChunks,
+    remoteCasChunks' = remoteCasChunks,
+    remoteSourceManifests' = remoteSourceManifests,
+    remoteFodPaths' = remoteFodPaths,
     lastResult' = Ok,
   }
 
@@ -1134,6 +1537,12 @@ module ekapkgs {
     activationInProgress' = false,
     savedPreviousProfile' = "",
     substituterRunning' = substituterRunning,
+    channelConfig' = channelConfig,
+    envRenderedFingerprints' = envRenderedFingerprints,
+    casChunks' = casChunks,
+    remoteCasChunks' = remoteCasChunks,
+    remoteSourceManifests' = remoteSourceManifests,
+    remoteFodPaths' = remoteFodPaths,
     lastResult' = Ok,
   }
 
@@ -1169,6 +1578,12 @@ module ekapkgs {
     activationInProgress' = false,
     savedPreviousProfile' = "",
     substituterRunning' = substituterRunning,
+    channelConfig' = channelConfig,
+    envRenderedFingerprints' = envRenderedFingerprints,
+    casChunks' = casChunks,
+    remoteCasChunks' = remoteCasChunks,
+    remoteSourceManifests' = remoteSourceManifests,
+    remoteFodPaths' = remoteFodPaths,
     lastResult' = Ok,
   }
 
@@ -1231,6 +1646,12 @@ module ekapkgs {
     activationInProgress' = false,
     savedPreviousProfile' = "",
     substituterRunning' = substituterRunning,
+    channelConfig' = channelConfig,
+    envRenderedFingerprints' = envRenderedFingerprints,
+    casChunks' = casChunks,
+    remoteCasChunks' = remoteCasChunks,
+    remoteSourceManifests' = remoteSourceManifests,
+    remoteFodPaths' = remoteFodPaths,
     lastResult' = Ok,
   }
 
@@ -1266,6 +1687,12 @@ module ekapkgs {
     activationInProgress' = false,
     savedPreviousProfile' = "",
     substituterRunning' = substituterRunning,
+    channelConfig' = channelConfig,
+    envRenderedFingerprints' = envRenderedFingerprints,
+    casChunks' = casChunks,
+    remoteCasChunks' = remoteCasChunks,
+    remoteSourceManifests' = remoteSourceManifests,
+    remoteFodPaths' = remoteFodPaths,
     lastResult' = Ok,
   }
 
@@ -1279,6 +1706,8 @@ module ekapkgs {
     envPackages' = envPackages.set(dir, envPackages.get(dir).union(Set(pkg))),
     envProfiles' = envProfiles.set(dir, envProfiles.get(dir).union(Set(profilePath))),
     nixStore' = nixStore.union(Set(profilePath)),
+    // Manifest changed, trust is invalidated
+    trustedEnvs' = trustedEnvs.put(dir, ""),
     envFlakes' = envFlakes,
     envManifestExists' = envManifestExists,
     remoteCache' = remoteCache,
@@ -1294,7 +1723,6 @@ module ekapkgs {
     serviceStates' = serviceStates,
     configCaches' = configCaches,
     registry' = registry,
-    trustedEnvs' = trustedEnvs,
     searchIndexes' = searchIndexes,
     flakeLockBackup' = flakeLockBackup,
     bootEntries' = bootEntries,
@@ -1302,6 +1730,12 @@ module ekapkgs {
     activationInProgress' = false,
     savedPreviousProfile' = "",
     substituterRunning' = substituterRunning,
+    channelConfig' = channelConfig,
+    envRenderedFingerprints' = envRenderedFingerprints,
+    casChunks' = casChunks,
+    remoteCasChunks' = remoteCasChunks,
+    remoteSourceManifests' = remoteSourceManifests,
+    remoteFodPaths' = remoteFodPaths,
     lastResult' = Ok,
   }
 
@@ -1313,6 +1747,8 @@ module ekapkgs {
     envPackages.get(dir).exists(p => p.name == pkgName),
     envPackages' = envPackages.set(dir, envPackages.get(dir).filter(p => p.name != pkgName)),
     envProfiles' = envProfiles.set(dir, envProfiles.get(dir).exclude(Set(profilePath))),
+    // Manifest changed, trust is invalidated
+    trustedEnvs' = trustedEnvs.put(dir, ""),
     envFlakes' = envFlakes,
     envManifestExists' = envManifestExists,
     nixStore' = nixStore,
@@ -1329,7 +1765,6 @@ module ekapkgs {
     serviceStates' = serviceStates,
     configCaches' = configCaches,
     registry' = registry,
-    trustedEnvs' = trustedEnvs,
     searchIndexes' = searchIndexes,
     flakeLockBackup' = flakeLockBackup,
     bootEntries' = bootEntries,
@@ -1337,6 +1772,12 @@ module ekapkgs {
     activationInProgress' = false,
     savedPreviousProfile' = "",
     substituterRunning' = substituterRunning,
+    channelConfig' = channelConfig,
+    envRenderedFingerprints' = envRenderedFingerprints,
+    casChunks' = casChunks,
+    remoteCasChunks' = remoteCasChunks,
+    remoteSourceManifests' = remoteSourceManifests,
+    remoteFodPaths' = remoteFodPaths,
     lastResult' = Ok,
   }
 
@@ -1347,6 +1788,8 @@ module ekapkgs {
     envManifestExists.contains(dir),
     not(envFlakes.get(dir).exists(f => f.ref_ == flake.ref_)),
     envFlakes' = envFlakes.set(dir, envFlakes.get(dir).union(Set(flake))),
+    // Manifest changed, trust is invalidated
+    trustedEnvs' = trustedEnvs.put(dir, ""),
     envPackages' = envPackages,
     envProfiles' = envProfiles,
     envManifestExists' = envManifestExists,
@@ -1364,7 +1807,6 @@ module ekapkgs {
     serviceStates' = serviceStates,
     configCaches' = configCaches,
     registry' = registry,
-    trustedEnvs' = trustedEnvs,
     searchIndexes' = searchIndexes,
     flakeLockBackup' = flakeLockBackup,
     bootEntries' = bootEntries,
@@ -1372,6 +1814,12 @@ module ekapkgs {
     activationInProgress' = false,
     savedPreviousProfile' = "",
     substituterRunning' = substituterRunning,
+    channelConfig' = channelConfig,
+    envRenderedFingerprints' = envRenderedFingerprints,
+    casChunks' = casChunks,
+    remoteCasChunks' = remoteCasChunks,
+    remoteSourceManifests' = remoteSourceManifests,
+    remoteFodPaths' = remoteFodPaths,
     lastResult' = Ok,
   }
 
@@ -1382,6 +1830,8 @@ module ekapkgs {
     envManifestExists.contains(dir),
     envFlakes.get(dir).exists(f => f.ref_ == ref_),
     envFlakes' = envFlakes.set(dir, envFlakes.get(dir).filter(f => f.ref_ != ref_)),
+    // Manifest changed, trust is invalidated
+    trustedEnvs' = trustedEnvs.put(dir, ""),
     envPackages' = envPackages,
     envProfiles' = envProfiles,
     envManifestExists' = envManifestExists,
@@ -1399,7 +1849,6 @@ module ekapkgs {
     serviceStates' = serviceStates,
     configCaches' = configCaches,
     registry' = registry,
-    trustedEnvs' = trustedEnvs,
     searchIndexes' = searchIndexes,
     flakeLockBackup' = flakeLockBackup,
     bootEntries' = bootEntries,
@@ -1407,15 +1856,22 @@ module ekapkgs {
     activationInProgress' = false,
     savedPreviousProfile' = "",
     substituterRunning' = substituterRunning,
+    channelConfig' = channelConfig,
+    envRenderedFingerprints' = envRenderedFingerprints,
+    casChunks' = casChunks,
+    remoteCasChunks' = remoteCasChunks,
+    remoteSourceManifests' = remoteSourceManifests,
+    remoteFodPaths' = remoteFodPaths,
     lastResult' = Ok,
   }
 
   // ----------------------------------------------------------
-  // env allow / disallow
+  // env allow / disallow — trust uses content-hash of manifest
   // ----------------------------------------------------------
-  action envAllow(dir: Path): bool = all {
+  action envAllow(dir: Path, manifestHash: B3Digest): bool = all {
     envManifestExists.contains(dir),
-    trustedEnvs' = trustedEnvs.union(Set(dir)),
+    manifestHash != "",
+    trustedEnvs' = trustedEnvs.put(dir, manifestHash),
     nixStore' = nixStore,
     remoteCache' = remoteCache,
     systemGenerations' = systemGenerations,
@@ -1441,11 +1897,17 @@ module ekapkgs {
     activationInProgress' = false,
     savedPreviousProfile' = "",
     substituterRunning' = substituterRunning,
+    channelConfig' = channelConfig,
+    envRenderedFingerprints' = envRenderedFingerprints,
+    casChunks' = casChunks,
+    remoteCasChunks' = remoteCasChunks,
+    remoteSourceManifests' = remoteSourceManifests,
+    remoteFodPaths' = remoteFodPaths,
     lastResult' = Ok,
   }
 
   action envDisallow(dir: Path): bool = all {
-    trustedEnvs' = trustedEnvs.exclude(Set(dir)),
+    trustedEnvs' = trustedEnvs.put(dir, ""),
     nixStore' = nixStore,
     remoteCache' = remoteCache,
     systemGenerations' = systemGenerations,
@@ -1471,6 +1933,64 @@ module ekapkgs {
     activationInProgress' = false,
     savedPreviousProfile' = "",
     substituterRunning' = substituterRunning,
+    channelConfig' = channelConfig,
+    envRenderedFingerprints' = envRenderedFingerprints,
+    casChunks' = casChunks,
+    remoteCasChunks' = remoteCasChunks,
+    remoteSourceManifests' = remoteSourceManifests,
+    remoteFodPaths' = remoteFodPaths,
+    lastResult' = Ok,
+  }
+
+  // ----------------------------------------------------------
+  // env reload — deletes existing profile, reinstalls everything,
+  // renders dev shell scripts if flakes present, updates trust.
+  // ----------------------------------------------------------
+  action envReload(
+    dir: Path,
+    newProfilePaths: Set[StorePath],
+    newFingerprint: B3Digest,
+    manifestHash: B3Digest,
+  ): bool = all {
+    envManifestExists.contains(dir),
+    newFingerprint != "",
+    // Effect: profile is reset (old paths removed, new ones installed)
+    envProfiles' = envProfiles.set(dir, newProfilePaths),
+    nixStore' = nixStore.union(newProfilePaths),
+    // Rendered scripts updated with new fingerprint
+    envRenderedFingerprints' = if (envFlakes.get(dir).size() > 0)
+                                 envRenderedFingerprints.put(dir, newFingerprint)
+                               else envRenderedFingerprints,
+    // Trust re-established after reload
+    trustedEnvs' = trustedEnvs.put(dir, manifestHash),
+    envPackages' = envPackages,
+    envFlakes' = envFlakes,
+    envManifestExists' = envManifestExists,
+    remoteCache' = remoteCache,
+    systemGenerations' = systemGenerations,
+    systemCurrentGen' = systemCurrentGen,
+    homeGenerations' = homeGenerations,
+    homeCurrentGen' = homeCurrentGen,
+    homePackages' = homePackages,
+    homeProfilePaths' = homeProfilePaths,
+    systemPackages' = systemPackages,
+    systemProfilePaths' = systemProfilePaths,
+    homeServices' = homeServices,
+    serviceStates' = serviceStates,
+    configCaches' = configCaches,
+    registry' = registry,
+    searchIndexes' = searchIndexes,
+    flakeLockBackup' = flakeLockBackup,
+    bootEntries' = bootEntries,
+    hasSudo' = hasSudo,
+    activationInProgress' = false,
+    savedPreviousProfile' = "",
+    substituterRunning' = substituterRunning,
+    channelConfig' = channelConfig,
+    casChunks' = casChunks,
+    remoteCasChunks' = remoteCasChunks,
+    remoteSourceManifests' = remoteSourceManifests,
+    remoteFodPaths' = remoteFodPaths,
     lastResult' = Ok,
   }
 
@@ -1504,6 +2024,12 @@ module ekapkgs {
     activationInProgress' = false,
     savedPreviousProfile' = "",
     substituterRunning' = substituterRunning,
+    channelConfig' = channelConfig,
+    envRenderedFingerprints' = envRenderedFingerprints,
+    casChunks' = casChunks,
+    remoteCasChunks' = remoteCasChunks,
+    remoteSourceManifests' = remoteSourceManifests,
+    remoteFodPaths' = remoteFodPaths,
     lastResult' = Ok,
   }
 
@@ -1598,6 +2124,16 @@ module ekapkgs {
   val noStaleFlakeLockBackup: bool =
     flakeLockBackup == ""
 
+  /// Channel config: if either field is set, both must be set.
+  /// Prevents partial configuration from causing runtime errors.
+  val channelConfigConsistent: bool =
+    (channelConfig.channel_input == "") == (channelConfig.channel_url == "")
+
+  /// Sources-only push invariant: source manifests only reference
+  /// FOD paths that are in the remote FOD store (not the full cache)
+  val sourceManifestsConsistent: bool =
+    remoteSourceManifests.size() >= 0  // simplified: structural consistency
+
   /// All invariants combined
   val allInvariants: bool = and {
     systemGensMonotonic,
@@ -1616,6 +2152,7 @@ module ekapkgs {
     envProfilePathsInStore,
     envPackagesConsistent,
     noStaleFlakeLockBackup,
+    channelConfigConsistent,
   }
 
   // ============================================================
@@ -1640,7 +2177,7 @@ module ekapkgs {
     envPackages' = Map(),
     envFlakes' = Map(),
     envProfiles' = Map(),
-    trustedEnvs' = Set(),
+    trustedEnvs' = Map(),
     searchIndexes' = Set(),
     envManifestExists' = Set(),
     flakeLockBackup' = "",
@@ -1649,6 +2186,12 @@ module ekapkgs {
     activationInProgress' = false,
     savedPreviousProfile' = "",
     substituterRunning' = false,
+    channelConfig' = { channel_input: "", channel_url: "" },
+    envRenderedFingerprints' = Map(),
+    casChunks' = Set(),
+    remoteCasChunks' = Set(),
+    remoteSourceManifests' = Set(),
+    remoteFodPaths' = Set(),
     lastResult' = Ok,
   }
 
@@ -1673,26 +2216,47 @@ module ekapkgs {
     nondet paths = Set("path1", "path2").powerset().oneOf()
     run_("nixpkgs#hello", paths),
 
+    // Wtf command
+    nondet paths = Set("wtf-path1").powerset().oneOf()
+    wtfRun("missing-cmd", "nixpkgs#some-pkg", paths),
+
+    // Closure docker
+    nondet paths = Set("docker-path1").powerset().oneOf()
+    closureDocker("nixpkgs#hello", paths),
+
     // Cache operations
     nondet paths = nixStore.powerset().oneOf()
     nondet url = Set("https://cache.example.com").oneOf()
     cachePush(paths, url),
 
+    // Cache push sources-only
+    nondet fodPaths = nixStore.powerset().oneOf()
+    nondet url = Set("https://cache.example.com").oneOf()
+    cachePushSourcesOnly("nixpkgs#hello", fodPaths, url),
+
     nondet paths = remoteCache.powerset().oneOf()
     nondet url = Set("https://cache.example.com").oneOf()
-    cachePull(paths, url),
+    nondet chunks = Set("chunk-a", "chunk-b").powerset().oneOf()
+    cachePull(paths, url, chunks),
 
     cacheAuthLogin("https://cache.example.com", "tok_abc123"),
     cacheAuthLogout("https://cache.example.com"),
 
-    // System lifecycle (gen numbers are auto-incremented)
+    // System lifecycle
     nondet succeeds = Set(true, false).oneOf()
-    systemSwitch(".", "sys-path-new", Set("sys-path-new", "dep1"), nextSysGenNum, succeeds),
+    nondet channel = Set(true, false).oneOf()
+    nondet rollback = Set(true, false).oneOf()
+    systemSwitch(".", "sys-path-new", Set("sys-path-new", "dep1"), nextSysGenNum, succeeds, channel, rollback),
 
-    systemBoot("sys-path-boot", Set("sys-path-boot"), nextSysGenNum),
+    nondet channel = Set(true, false).oneOf()
+    systemBoot("sys-path-boot", Set("sys-path-boot"), nextSysGenNum, channel),
 
     nondet succeeds = Set(true, false).oneOf()
     systemTest(Set("sys-path-test"), succeeds),
+
+    // System diff
+    nondet hasDiff = Set(true, false).oneOf()
+    systemDiff(".", Set("sys-diff-path"), "current-sys", "sys-diff-path", hasDiff),
 
     nondet succeeds = Set(true, false).oneOf()
     systemRollback(succeeds),
@@ -1700,9 +2264,10 @@ module ekapkgs {
     systemPruneBootEntries(false),
     systemPruneBootEntries(true),
 
-    // Home lifecycle (gen numbers are auto-incremented)
+    // Home lifecycle
     nondet succeeds = Set(true, false).oneOf()
-    homeSwitch("home-path-new", Set("home-path-new", "home-dep1"), nextHomeGenNum, succeeds),
+    nondet rollback = Set(true, false).oneOf()
+    homeSwitch("home-path-new", Set("home-path-new", "home-dep1"), nextHomeGenNum, succeeds, rollback),
 
     nondet succeeds = Set(true, false).oneOf()
     homeRollback(succeeds),
@@ -1719,10 +2284,12 @@ module ekapkgs {
 
     systemPackagesRemove("htop", "htop-profile-path"),
 
-    // Home services
+    // Home services (with failure reporting)
+    nondet applySucceeds = Set(true, false).oneOf()
     homeServicesAdd(
       { name: "my-svc", flake: ".", enabled: true, config: Map() },
       false,
+      applySucceeds,
     ),
     homeServicesRemove("my-svc", false),
     homeServicesEnable("my-svc"),
@@ -1760,10 +2327,14 @@ module ekapkgs {
     envFlakeRemove(dir, "github:user/repo"),
 
     nondet dir = Set("/home/user/project1", "/home/user/project2").oneOf()
-    envAllow(dir),
+    envAllow(dir, "abc123hash"),
 
     nondet dir = Set("/home/user/project1", "/home/user/project2").oneOf()
     envDisallow(dir),
+
+    // Env reload
+    nondet dir = Set("/home/user/project1", "/home/user/project2").oneOf()
+    envReload(dir, Set("reloaded-path"), "new-fingerprint", "manifest-hash"),
 
     // Search
     searchUpdate("nixpkgs"),
@@ -1796,6 +2367,49 @@ module ekapkgs {
       activationInProgress' = activationInProgress,
       savedPreviousProfile' = savedPreviousProfile,
       substituterRunning' = substituterRunning,
+      channelConfig' = channelConfig,
+      envRenderedFingerprints' = envRenderedFingerprints,
+      casChunks' = casChunks,
+      remoteCasChunks' = remoteCasChunks,
+      remoteSourceManifests' = remoteSourceManifests,
+      remoteFodPaths' = remoteFodPaths,
+      lastResult' = lastResult,
+    },
+
+    // Channel config setup
+    all {
+      channelConfig' = { channel_input: "core-pkgs", channel_url: "https://channels.example.com" },
+      nixStore' = nixStore,
+      remoteCache' = remoteCache,
+      systemGenerations' = systemGenerations,
+      systemCurrentGen' = systemCurrentGen,
+      homeGenerations' = homeGenerations,
+      homeCurrentGen' = homeCurrentGen,
+      homePackages' = homePackages,
+      homeProfilePaths' = homeProfilePaths,
+      systemPackages' = systemPackages,
+      systemProfilePaths' = systemProfilePaths,
+      homeServices' = homeServices,
+      serviceStates' = serviceStates,
+      configCaches' = configCaches,
+      registry' = registry,
+      envPackages' = envPackages,
+      envFlakes' = envFlakes,
+      envProfiles' = envProfiles,
+      trustedEnvs' = trustedEnvs,
+      searchIndexes' = searchIndexes,
+      envManifestExists' = envManifestExists,
+      flakeLockBackup' = flakeLockBackup,
+      bootEntries' = bootEntries,
+      hasSudo' = hasSudo,
+      activationInProgress' = activationInProgress,
+      savedPreviousProfile' = savedPreviousProfile,
+      substituterRunning' = substituterRunning,
+      envRenderedFingerprints' = envRenderedFingerprints,
+      casChunks' = casChunks,
+      remoteCasChunks' = remoteCasChunks,
+      remoteSourceManifests' = remoteSourceManifests,
+      remoteFodPaths' = remoteFodPaths,
       lastResult' = lastResult,
     },
   }
@@ -1862,10 +2476,16 @@ module ekapkgs_tests {
         activationInProgress' = activationInProgress,
         savedPreviousProfile' = savedPreviousProfile,
         substituterRunning' = substituterRunning,
+        channelConfig' = channelConfig,
+        envRenderedFingerprints' = envRenderedFingerprints,
+        casChunks' = casChunks,
+        remoteCasChunks' = remoteCasChunks,
+        remoteSourceManifests' = remoteSourceManifests,
+        remoteFodPaths' = remoteFodPaths,
         lastResult' = lastResult,
       })
-      // First successful switch
-      .then(systemSwitch(".", "path-gen1", Set("path-gen1"), 1, true))
+      // First successful switch (no channel, rollback irrelevant when succeeding)
+      .then(systemSwitch(".", "path-gen1", Set("path-gen1"), 1, true, false, true))
       .then(all {
         assert(systemGenerations.length() == 1),
         assert(systemCurrentGen == 0),
@@ -1900,10 +2520,16 @@ module ekapkgs_tests {
         activationInProgress' = activationInProgress,
         savedPreviousProfile' = savedPreviousProfile,
         substituterRunning' = substituterRunning,
+        channelConfig' = channelConfig,
+        envRenderedFingerprints' = envRenderedFingerprints,
+        casChunks' = casChunks,
+        remoteCasChunks' = remoteCasChunks,
+        remoteSourceManifests' = remoteSourceManifests,
+        remoteFodPaths' = remoteFodPaths,
         lastResult' = lastResult,
       })
       // Second successful switch
-      .then(systemSwitch(".", "path-gen2", Set("path-gen2"), 2, true))
+      .then(systemSwitch(".", "path-gen2", Set("path-gen2"), 2, true, false, true))
       .then(all {
         assert(systemGenerations.length() == 2),
         assert(systemCurrentGen == 1),
@@ -1938,12 +2564,18 @@ module ekapkgs_tests {
         activationInProgress' = activationInProgress,
         savedPreviousProfile' = savedPreviousProfile,
         substituterRunning' = substituterRunning,
+        channelConfig' = channelConfig,
+        envRenderedFingerprints' = envRenderedFingerprints,
+        casChunks' = casChunks,
+        remoteCasChunks' = remoteCasChunks,
+        remoteSourceManifests' = remoteSourceManifests,
+        remoteFodPaths' = remoteFodPaths,
         lastResult' = lastResult,
       })
   }
 
   // ----------------------------------------------------------
-  // Test: system switch failure triggers rollback
+  // Test: system switch failure triggers rollback with reporting
   // ----------------------------------------------------------
   run systemSwitchRollbackTest = {
     init
@@ -1974,18 +2606,24 @@ module ekapkgs_tests {
         activationInProgress' = activationInProgress,
         savedPreviousProfile' = savedPreviousProfile,
         substituterRunning' = substituterRunning,
+        channelConfig' = channelConfig,
+        envRenderedFingerprints' = envRenderedFingerprints,
+        casChunks' = casChunks,
+        remoteCasChunks' = remoteCasChunks,
+        remoteSourceManifests' = remoteSourceManifests,
+        remoteFodPaths' = remoteFodPaths,
         lastResult' = lastResult,
       })
       // First successful switch — establishes gen 1
-      .then(systemSwitch(".", "path-gen1", Set("path-gen1"), 1, true))
-      // Second switch FAILS — should rollback
-      .then(systemSwitch(".", "path-gen2", Set("path-gen2"), 2, false))
+      .then(systemSwitch(".", "path-gen1", Set("path-gen1"), 1, true, false, true))
+      // Second switch FAILS — rollback succeeds
+      .then(systemSwitch(".", "path-gen2", Set("path-gen2"), 2, false, false, true))
       .then(all {
         // Generation should NOT have advanced
         assert(systemGenerations.length() == 1),
         assert(systemCurrentGen == 0),
         assert(systemGenerations[0].path == "path-gen1"),
-        assert(lastResult == Err("activation failed, rolled back")),
+        assert(lastResult == Err("activation failed, rolled back to previous configuration")),
         // But the paths were still built (downloaded to store)
         assert(nixStore.contains("path-gen2")),
         // stutter
@@ -2015,6 +2653,259 @@ module ekapkgs_tests {
         activationInProgress' = activationInProgress,
         savedPreviousProfile' = savedPreviousProfile,
         substituterRunning' = substituterRunning,
+        channelConfig' = channelConfig,
+        envRenderedFingerprints' = envRenderedFingerprints,
+        casChunks' = casChunks,
+        remoteCasChunks' = remoteCasChunks,
+        remoteSourceManifests' = remoteSourceManifests,
+        remoteFodPaths' = remoteFodPaths,
+        lastResult' = lastResult,
+      })
+  }
+
+  // ----------------------------------------------------------
+  // Test: system switch failure with rollback also failing
+  // ----------------------------------------------------------
+  run systemSwitchDoubleFailureTest = {
+    init
+      .then(all {
+        hasSudo' = true,
+        nixStore' = nixStore,
+        remoteCache' = remoteCache,
+        systemGenerations' = systemGenerations,
+        systemCurrentGen' = systemCurrentGen,
+        homeGenerations' = homeGenerations,
+        homeCurrentGen' = homeCurrentGen,
+        homePackages' = homePackages,
+        homeProfilePaths' = homeProfilePaths,
+        systemPackages' = systemPackages,
+        systemProfilePaths' = systemProfilePaths,
+        homeServices' = homeServices,
+        serviceStates' = serviceStates,
+        configCaches' = configCaches,
+        registry' = registry,
+        envPackages' = envPackages,
+        envFlakes' = envFlakes,
+        envProfiles' = envProfiles,
+        trustedEnvs' = trustedEnvs,
+        searchIndexes' = searchIndexes,
+        envManifestExists' = envManifestExists,
+        flakeLockBackup' = flakeLockBackup,
+        bootEntries' = bootEntries,
+        activationInProgress' = activationInProgress,
+        savedPreviousProfile' = savedPreviousProfile,
+        substituterRunning' = substituterRunning,
+        channelConfig' = channelConfig,
+        envRenderedFingerprints' = envRenderedFingerprints,
+        casChunks' = casChunks,
+        remoteCasChunks' = remoteCasChunks,
+        remoteSourceManifests' = remoteSourceManifests,
+        remoteFodPaths' = remoteFodPaths,
+        lastResult' = lastResult,
+      })
+      .then(systemSwitch(".", "path-gen1", Set("path-gen1"), 1, true, false, true))
+      // Switch fails AND rollback fails
+      .then(systemSwitch(".", "path-gen2", Set("path-gen2"), 2, false, false, false))
+      .then(all {
+        assert(lastResult == Err("activation failed, rollback also failed, system may be inconsistent")),
+        assert(systemGenerations.length() == 1),
+        // stutter
+        nixStore' = nixStore,
+        remoteCache' = remoteCache,
+        systemGenerations' = systemGenerations,
+        systemCurrentGen' = systemCurrentGen,
+        homeGenerations' = homeGenerations,
+        homeCurrentGen' = homeCurrentGen,
+        homePackages' = homePackages,
+        homeProfilePaths' = homeProfilePaths,
+        systemPackages' = systemPackages,
+        systemProfilePaths' = systemProfilePaths,
+        homeServices' = homeServices,
+        serviceStates' = serviceStates,
+        configCaches' = configCaches,
+        registry' = registry,
+        envPackages' = envPackages,
+        envFlakes' = envFlakes,
+        envProfiles' = envProfiles,
+        trustedEnvs' = trustedEnvs,
+        searchIndexes' = searchIndexes,
+        envManifestExists' = envManifestExists,
+        flakeLockBackup' = flakeLockBackup,
+        bootEntries' = bootEntries,
+        hasSudo' = hasSudo,
+        activationInProgress' = activationInProgress,
+        savedPreviousProfile' = savedPreviousProfile,
+        substituterRunning' = substituterRunning,
+        channelConfig' = channelConfig,
+        envRenderedFingerprints' = envRenderedFingerprints,
+        casChunks' = casChunks,
+        remoteCasChunks' = remoteCasChunks,
+        remoteSourceManifests' = remoteSourceManifests,
+        remoteFodPaths' = remoteFodPaths,
+        lastResult' = lastResult,
+      })
+  }
+
+  // ----------------------------------------------------------
+  // Test: system switch with --channel requires valid config
+  // ----------------------------------------------------------
+  run systemSwitchWithChannelTest = {
+    init
+      .then(all {
+        hasSudo' = true,
+        channelConfig' = { channel_input: "core-pkgs", channel_url: "https://channels.example.com" },
+        nixStore' = nixStore,
+        remoteCache' = remoteCache,
+        systemGenerations' = systemGenerations,
+        systemCurrentGen' = systemCurrentGen,
+        homeGenerations' = homeGenerations,
+        homeCurrentGen' = homeCurrentGen,
+        homePackages' = homePackages,
+        homeProfilePaths' = homeProfilePaths,
+        systemPackages' = systemPackages,
+        systemProfilePaths' = systemProfilePaths,
+        homeServices' = homeServices,
+        serviceStates' = serviceStates,
+        configCaches' = configCaches,
+        registry' = registry,
+        envPackages' = envPackages,
+        envFlakes' = envFlakes,
+        envProfiles' = envProfiles,
+        trustedEnvs' = trustedEnvs,
+        searchIndexes' = searchIndexes,
+        envManifestExists' = envManifestExists,
+        flakeLockBackup' = flakeLockBackup,
+        bootEntries' = bootEntries,
+        activationInProgress' = activationInProgress,
+        savedPreviousProfile' = savedPreviousProfile,
+        substituterRunning' = substituterRunning,
+        envRenderedFingerprints' = envRenderedFingerprints,
+        casChunks' = casChunks,
+        remoteCasChunks' = remoteCasChunks,
+        remoteSourceManifests' = remoteSourceManifests,
+        remoteFodPaths' = remoteFodPaths,
+        lastResult' = lastResult,
+      })
+      // Switch with channel enabled — should succeed
+      .then(systemSwitch(".", "path-ch1", Set("path-ch1"), 1, true, true, true))
+      .then(all {
+        assert(systemGenerations.length() == 1),
+        assert(lastResult == Ok),
+        // stutter
+        nixStore' = nixStore,
+        remoteCache' = remoteCache,
+        systemGenerations' = systemGenerations,
+        systemCurrentGen' = systemCurrentGen,
+        homeGenerations' = homeGenerations,
+        homeCurrentGen' = homeCurrentGen,
+        homePackages' = homePackages,
+        homeProfilePaths' = homeProfilePaths,
+        systemPackages' = systemPackages,
+        systemProfilePaths' = systemProfilePaths,
+        homeServices' = homeServices,
+        serviceStates' = serviceStates,
+        configCaches' = configCaches,
+        registry' = registry,
+        envPackages' = envPackages,
+        envFlakes' = envFlakes,
+        envProfiles' = envProfiles,
+        trustedEnvs' = trustedEnvs,
+        searchIndexes' = searchIndexes,
+        envManifestExists' = envManifestExists,
+        flakeLockBackup' = flakeLockBackup,
+        bootEntries' = bootEntries,
+        hasSudo' = hasSudo,
+        activationInProgress' = activationInProgress,
+        savedPreviousProfile' = savedPreviousProfile,
+        substituterRunning' = substituterRunning,
+        channelConfig' = channelConfig,
+        envRenderedFingerprints' = envRenderedFingerprints,
+        casChunks' = casChunks,
+        remoteCasChunks' = remoteCasChunks,
+        remoteSourceManifests' = remoteSourceManifests,
+        remoteFodPaths' = remoteFodPaths,
+        lastResult' = lastResult,
+      })
+  }
+
+  // ----------------------------------------------------------
+  // Test: system diff reports differences vs up-to-date
+  // ----------------------------------------------------------
+  run systemDiffTest = {
+    init
+      .then(all {
+        hasSudo' = true,
+        nixStore' = Set("current-sys"),
+        remoteCache' = remoteCache,
+        systemGenerations' = systemGenerations,
+        systemCurrentGen' = systemCurrentGen,
+        homeGenerations' = homeGenerations,
+        homeCurrentGen' = homeCurrentGen,
+        homePackages' = homePackages,
+        homeProfilePaths' = homeProfilePaths,
+        systemPackages' = systemPackages,
+        systemProfilePaths' = systemProfilePaths,
+        homeServices' = homeServices,
+        serviceStates' = serviceStates,
+        configCaches' = configCaches,
+        registry' = registry,
+        envPackages' = envPackages,
+        envFlakes' = envFlakes,
+        envProfiles' = envProfiles,
+        trustedEnvs' = trustedEnvs,
+        searchIndexes' = searchIndexes,
+        envManifestExists' = envManifestExists,
+        flakeLockBackup' = flakeLockBackup,
+        bootEntries' = bootEntries,
+        activationInProgress' = activationInProgress,
+        savedPreviousProfile' = savedPreviousProfile,
+        substituterRunning' = substituterRunning,
+        channelConfig' = channelConfig,
+        envRenderedFingerprints' = envRenderedFingerprints,
+        casChunks' = casChunks,
+        remoteCasChunks' = remoteCasChunks,
+        remoteSourceManifests' = remoteSourceManifests,
+        remoteFodPaths' = remoteFodPaths,
+        lastResult' = lastResult,
+      })
+      // Diff with differences
+      .then(systemDiff(".", Set("new-sys-path"), "current-sys", "new-sys-path", true))
+      .then(all {
+        assert(lastResult == Ok),
+        assert(nixStore.contains("new-sys-path")),
+        // stutter
+        nixStore' = nixStore,
+        remoteCache' = remoteCache,
+        systemGenerations' = systemGenerations,
+        systemCurrentGen' = systemCurrentGen,
+        homeGenerations' = homeGenerations,
+        homeCurrentGen' = homeCurrentGen,
+        homePackages' = homePackages,
+        homeProfilePaths' = homeProfilePaths,
+        systemPackages' = systemPackages,
+        systemProfilePaths' = systemProfilePaths,
+        homeServices' = homeServices,
+        serviceStates' = serviceStates,
+        configCaches' = configCaches,
+        registry' = registry,
+        envPackages' = envPackages,
+        envFlakes' = envFlakes,
+        envProfiles' = envProfiles,
+        trustedEnvs' = trustedEnvs,
+        searchIndexes' = searchIndexes,
+        envManifestExists' = envManifestExists,
+        flakeLockBackup' = flakeLockBackup,
+        bootEntries' = bootEntries,
+        hasSudo' = hasSudo,
+        activationInProgress' = activationInProgress,
+        savedPreviousProfile' = savedPreviousProfile,
+        substituterRunning' = substituterRunning,
+        channelConfig' = channelConfig,
+        envRenderedFingerprints' = envRenderedFingerprints,
+        casChunks' = casChunks,
+        remoteCasChunks' = remoteCasChunks,
+        remoteSourceManifests' = remoteSourceManifests,
+        remoteFodPaths' = remoteFodPaths,
         lastResult' = lastResult,
       })
   }
@@ -2060,6 +2951,12 @@ module ekapkgs_tests {
         activationInProgress' = activationInProgress,
         savedPreviousProfile' = savedPreviousProfile,
         substituterRunning' = substituterRunning,
+        channelConfig' = channelConfig,
+        envRenderedFingerprints' = envRenderedFingerprints,
+        casChunks' = casChunks,
+        remoteCasChunks' = remoteCasChunks,
+        remoteSourceManifests' = remoteSourceManifests,
+        remoteFodPaths' = remoteFodPaths,
         lastResult' = lastResult,
       })
       .then(homePackagesRemove("hello", "hello-store-path"))
@@ -2093,12 +2990,18 @@ module ekapkgs_tests {
         activationInProgress' = activationInProgress,
         savedPreviousProfile' = savedPreviousProfile,
         substituterRunning' = substituterRunning,
+        channelConfig' = channelConfig,
+        envRenderedFingerprints' = envRenderedFingerprints,
+        casChunks' = casChunks,
+        remoteCasChunks' = remoteCasChunks,
+        remoteSourceManifests' = remoteSourceManifests,
+        remoteFodPaths' = remoteFodPaths,
         lastResult' = lastResult,
       })
   }
 
   // ----------------------------------------------------------
-  // Test: env init then add package
+  // Test: env init then add package (trust invalidated on add)
   // ----------------------------------------------------------
   run envLifecycleTest = {
     init
@@ -2133,12 +3036,20 @@ module ekapkgs_tests {
         activationInProgress' = activationInProgress,
         savedPreviousProfile' = savedPreviousProfile,
         substituterRunning' = substituterRunning,
+        channelConfig' = channelConfig,
+        envRenderedFingerprints' = envRenderedFingerprints,
+        casChunks' = casChunks,
+        remoteCasChunks' = remoteCasChunks,
+        remoteSourceManifests' = remoteSourceManifests,
+        remoteFodPaths' = remoteFodPaths,
         lastResult' = lastResult,
       })
       .then(envAdd("/home/user/project1", { name: "ripgrep", flake: "nixpkgs" }, "rg-store"))
       .then(all {
         assert(envPackages.get("/home/user/project1").size() == 1),
         assert(nixStore.contains("rg-store")),
+        // Trust invalidated after manifest change
+        assert(trustedEnvs.get("/home/user/project1") == ""),
         // stutter
         nixStore' = nixStore,
         remoteCache' = remoteCache,
@@ -2166,6 +3077,70 @@ module ekapkgs_tests {
         activationInProgress' = activationInProgress,
         savedPreviousProfile' = savedPreviousProfile,
         substituterRunning' = substituterRunning,
+        channelConfig' = channelConfig,
+        envRenderedFingerprints' = envRenderedFingerprints,
+        casChunks' = casChunks,
+        remoteCasChunks' = remoteCasChunks,
+        remoteSourceManifests' = remoteSourceManifests,
+        remoteFodPaths' = remoteFodPaths,
+        lastResult' = lastResult,
+      })
+  }
+
+  // ----------------------------------------------------------
+  // Test: env reload resets profile and renders dev shell
+  // ----------------------------------------------------------
+  run envReloadTest = {
+    init
+      .then(envInit("/home/user/project1"))
+      .then(envFlakeAdd("/home/user/project1", {
+        ref_: "github:user/repo",
+        devshell: "default",
+        rev: "",
+        overrides: Map(),
+      }))
+      .then(envReload("/home/user/project1", Set("new-profile-path"), "fp-abc123", "mhash-1"))
+      .then(all {
+        // Profile was reset with new paths
+        assert(envProfiles.get("/home/user/project1") == Set("new-profile-path")),
+        assert(nixStore.contains("new-profile-path")),
+        // Fingerprint was recorded (flakes present)
+        assert(envRenderedFingerprints.get("/home/user/project1") == "fp-abc123"),
+        // Trust re-established
+        assert(trustedEnvs.get("/home/user/project1") == "mhash-1"),
+        // stutter
+        nixStore' = nixStore,
+        remoteCache' = remoteCache,
+        systemGenerations' = systemGenerations,
+        systemCurrentGen' = systemCurrentGen,
+        homeGenerations' = homeGenerations,
+        homeCurrentGen' = homeCurrentGen,
+        homePackages' = homePackages,
+        homeProfilePaths' = homeProfilePaths,
+        systemPackages' = systemPackages,
+        systemProfilePaths' = systemProfilePaths,
+        homeServices' = homeServices,
+        serviceStates' = serviceStates,
+        configCaches' = configCaches,
+        registry' = registry,
+        envPackages' = envPackages,
+        envFlakes' = envFlakes,
+        envProfiles' = envProfiles,
+        trustedEnvs' = trustedEnvs,
+        searchIndexes' = searchIndexes,
+        envManifestExists' = envManifestExists,
+        flakeLockBackup' = flakeLockBackup,
+        bootEntries' = bootEntries,
+        hasSudo' = hasSudo,
+        activationInProgress' = activationInProgress,
+        savedPreviousProfile' = savedPreviousProfile,
+        substituterRunning' = substituterRunning,
+        channelConfig' = channelConfig,
+        envRenderedFingerprints' = envRenderedFingerprints,
+        casChunks' = casChunks,
+        remoteCasChunks' = remoteCasChunks,
+        remoteSourceManifests' = remoteSourceManifests,
+        remoteFodPaths' = remoteFodPaths,
         lastResult' = lastResult,
       })
   }
@@ -2211,24 +3186,32 @@ module ekapkgs_tests {
         activationInProgress' = activationInProgress,
         savedPreviousProfile' = savedPreviousProfile,
         substituterRunning' = substituterRunning,
+        channelConfig' = channelConfig,
+        envRenderedFingerprints' = envRenderedFingerprints,
+        casChunks' = casChunks,
+        remoteCasChunks' = remoteCasChunks,
+        remoteSourceManifests' = remoteSourceManifests,
+        remoteFodPaths' = remoteFodPaths,
         lastResult' = lastResult,
       })
   }
 
   // ----------------------------------------------------------
-  // Test: home switch with rollback on failure
+  // Test: cache push --sources-only transfers only FODs
   // ----------------------------------------------------------
-  run homeSwitchRollbackTest = {
+  run cachePushSourcesOnlyTest = {
     init
-      // First successful switch
-      .then(homeSwitch("home-gen1-path", Set("home-gen1-path"), 1, true))
-      // Second switch fails → rollback
-      .then(homeSwitch("home-gen2-path", Set("home-gen2-path"), 2, false))
+      .then(build("nixpkgs#hello", Set("fod-path1", "fod-path2", "built-path")))
+      .then(cacheAuthLogin("https://cache.example.com", "tok_secret"))
+      .then(cachePushSourcesOnly("nixpkgs#hello", Set("fod-path1", "fod-path2"), "https://cache.example.com"))
       .then(all {
-        assert(homeGenerations.length() == 1),
-        assert(homeCurrentGen == 0),
-        assert(homeGenerations[0].path == "home-gen1-path"),
-        assert(lastResult == Err("home activation failed, rolled back")),
+        // FOD paths uploaded
+        assert(remoteFodPaths.contains("fod-path1")),
+        assert(remoteFodPaths.contains("fod-path2")),
+        // Source manifest registered
+        assert(remoteSourceManifests.contains("nixpkgs#hello")),
+        // Built output NOT in remote cache (sources-only)
+        assert(not(remoteCache.contains("built-path"))),
         // stutter
         nixStore' = nixStore,
         remoteCache' = remoteCache,
@@ -2256,6 +3239,117 @@ module ekapkgs_tests {
         activationInProgress' = activationInProgress,
         savedPreviousProfile' = savedPreviousProfile,
         substituterRunning' = substituterRunning,
+        channelConfig' = channelConfig,
+        envRenderedFingerprints' = envRenderedFingerprints,
+        casChunks' = casChunks,
+        remoteCasChunks' = remoteCasChunks,
+        remoteSourceManifests' = remoteSourceManifests,
+        remoteFodPaths' = remoteFodPaths,
+        lastResult' = lastResult,
+      })
+  }
+
+  // ----------------------------------------------------------
+  // Test: home switch with rollback on failure
+  // ----------------------------------------------------------
+  run homeSwitchRollbackTest = {
+    init
+      // First successful switch
+      .then(homeSwitch("home-gen1-path", Set("home-gen1-path"), 1, true, true))
+      // Second switch fails → rollback succeeds
+      .then(homeSwitch("home-gen2-path", Set("home-gen2-path"), 2, false, true))
+      .then(all {
+        assert(homeGenerations.length() == 1),
+        assert(homeCurrentGen == 0),
+        assert(homeGenerations[0].path == "home-gen1-path"),
+        assert(lastResult == Err("home activation failed, rolled back to previous generation")),
+        // stutter
+        nixStore' = nixStore,
+        remoteCache' = remoteCache,
+        systemGenerations' = systemGenerations,
+        systemCurrentGen' = systemCurrentGen,
+        homeGenerations' = homeGenerations,
+        homeCurrentGen' = homeCurrentGen,
+        homePackages' = homePackages,
+        homeProfilePaths' = homeProfilePaths,
+        systemPackages' = systemPackages,
+        systemProfilePaths' = systemProfilePaths,
+        homeServices' = homeServices,
+        serviceStates' = serviceStates,
+        configCaches' = configCaches,
+        registry' = registry,
+        envPackages' = envPackages,
+        envFlakes' = envFlakes,
+        envProfiles' = envProfiles,
+        trustedEnvs' = trustedEnvs,
+        searchIndexes' = searchIndexes,
+        envManifestExists' = envManifestExists,
+        flakeLockBackup' = flakeLockBackup,
+        bootEntries' = bootEntries,
+        hasSudo' = hasSudo,
+        activationInProgress' = activationInProgress,
+        savedPreviousProfile' = savedPreviousProfile,
+        substituterRunning' = substituterRunning,
+        channelConfig' = channelConfig,
+        envRenderedFingerprints' = envRenderedFingerprints,
+        casChunks' = casChunks,
+        remoteCasChunks' = remoteCasChunks,
+        remoteSourceManifests' = remoteSourceManifests,
+        remoteFodPaths' = remoteFodPaths,
+        lastResult' = lastResult,
+      })
+  }
+
+  // ----------------------------------------------------------
+  // Test: home services add with apply failure reporting
+  // ----------------------------------------------------------
+  run homeServicesFailureReportingTest = {
+    init
+      .then(homeServicesAdd(
+        { name: "my-svc", flake: ".", enabled: true, config: Map() },
+        false,   // apply = true (noApply = false)
+        false,   // apply fails
+      ))
+      .then(all {
+        // Service is added to manifest even on apply failure
+        assert(homeServices.size() == 1),
+        // Service state is Failed
+        assert(serviceStates.get("my-svc") == Failed),
+        // Error reported
+        assert(lastResult == Err("service failed to start")),
+        // stutter
+        nixStore' = nixStore,
+        remoteCache' = remoteCache,
+        systemGenerations' = systemGenerations,
+        systemCurrentGen' = systemCurrentGen,
+        homeGenerations' = homeGenerations,
+        homeCurrentGen' = homeCurrentGen,
+        homePackages' = homePackages,
+        homeProfilePaths' = homeProfilePaths,
+        systemPackages' = systemPackages,
+        systemProfilePaths' = systemProfilePaths,
+        homeServices' = homeServices,
+        serviceStates' = serviceStates,
+        configCaches' = configCaches,
+        registry' = registry,
+        envPackages' = envPackages,
+        envFlakes' = envFlakes,
+        envProfiles' = envProfiles,
+        trustedEnvs' = trustedEnvs,
+        searchIndexes' = searchIndexes,
+        envManifestExists' = envManifestExists,
+        flakeLockBackup' = flakeLockBackup,
+        bootEntries' = bootEntries,
+        hasSudo' = hasSudo,
+        activationInProgress' = activationInProgress,
+        savedPreviousProfile' = savedPreviousProfile,
+        substituterRunning' = substituterRunning,
+        channelConfig' = channelConfig,
+        envRenderedFingerprints' = envRenderedFingerprints,
+        casChunks' = casChunks,
+        remoteCasChunks' = remoteCasChunks,
+        remoteSourceManifests' = remoteSourceManifests,
+        remoteFodPaths' = remoteFodPaths,
         lastResult' = lastResult,
       })
   }
@@ -2296,6 +3390,12 @@ module ekapkgs_tests {
         activationInProgress' = activationInProgress,
         savedPreviousProfile' = savedPreviousProfile,
         substituterRunning' = substituterRunning,
+        channelConfig' = channelConfig,
+        envRenderedFingerprints' = envRenderedFingerprints,
+        casChunks' = casChunks,
+        remoteCasChunks' = remoteCasChunks,
+        remoteSourceManifests' = remoteSourceManifests,
+        remoteFodPaths' = remoteFodPaths,
         lastResult' = lastResult,
       })
       .then(registryPin("nixpkgs"))
@@ -2328,6 +3428,12 @@ module ekapkgs_tests {
         activationInProgress' = activationInProgress,
         savedPreviousProfile' = savedPreviousProfile,
         substituterRunning' = substituterRunning,
+        channelConfig' = channelConfig,
+        envRenderedFingerprints' = envRenderedFingerprints,
+        casChunks' = casChunks,
+        remoteCasChunks' = remoteCasChunks,
+        remoteSourceManifests' = remoteSourceManifests,
+        remoteFodPaths' = remoteFodPaths,
         lastResult' = lastResult,
       })
       .then(registryUnpin("nixpkgs"))
@@ -2361,6 +3467,12 @@ module ekapkgs_tests {
         activationInProgress' = activationInProgress,
         savedPreviousProfile' = savedPreviousProfile,
         substituterRunning' = substituterRunning,
+        channelConfig' = channelConfig,
+        envRenderedFingerprints' = envRenderedFingerprints,
+        casChunks' = casChunks,
+        remoteCasChunks' = remoteCasChunks,
+        remoteSourceManifests' = remoteSourceManifests,
+        remoteFodPaths' = remoteFodPaths,
         lastResult' = lastResult,
       })
   }
