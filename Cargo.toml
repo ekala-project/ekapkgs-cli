@@ -72,6 +72,8 @@ fs2 = "0.4"
 jiff = { version = "0.2", features = ["serde"] }
 dialoguer = "0.11"
 
+listenfd = "1"
+
 aws-sdk-s3 = "1"
 aws-config = { version = "1", features = ["behavior-version-latest"] }
 
