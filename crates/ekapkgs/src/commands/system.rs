@@ -51,9 +51,22 @@ pub fn execute(command: SystemCommand) -> color_eyre::Result<()> {
         SystemCommand::Switch {
             installable,
             dry_run,
+            channel,
             extra,
-        } => cmd_activate(&installable, "switch", dry_run, &extra),
-        SystemCommand::Boot { installable, extra } => {
+        } => {
+            if let Some(ch) = &channel {
+                apply_channel(ch, &installable)?;
+            }
+            cmd_activate(&installable, "switch", dry_run, &extra)
+        },
+        SystemCommand::Boot {
+            installable,
+            channel,
+            extra,
+        } => {
+            if let Some(ch) = &channel {
+                apply_channel(ch, &installable)?;
+            }
             cmd_activate(&installable, "boot", false, &extra)
         },
         SystemCommand::Test { installable, extra } => {
@@ -69,6 +82,51 @@ pub fn execute(command: SystemCommand) -> color_eyre::Result<()> {
         } => cmd_prune_boot_entries(&boot_mount, gc, dry_run),
         SystemCommand::Packages { command } => cmd_packages(command),
     }
+}
+
+/// Update the flake lock to point a configured input at a specific channel
+/// (branch). Reads `channel_input` and `channel_url` from the client config.
+fn apply_channel(channel: &str, installable: &str) -> color_eyre::Result<()> {
+    let config = ClientConfig::load()?;
+    let input = config.defaults.channel_input.as_deref().ok_or_else(|| {
+        color_eyre::eyre::eyre!(
+            "`--channel` requires `channel_input` in config (~/.config/ekapkgs/config.toml)"
+        )
+    })?;
+    let base_url = config.defaults.channel_url.as_deref().ok_or_else(|| {
+        color_eyre::eyre::eyre!(
+            "`--channel` requires `channel_url` in config (~/.config/ekapkgs/config.toml)"
+        )
+    })?;
+
+    let flake_ref = format!("{base_url}/{channel}");
+    tracing::info!("Switching channel: {input} → {flake_ref}");
+
+    // Resolve the flake directory from the installable (everything before #).
+    let flake_dir = installable
+        .split_once('#')
+        .map_or(installable, |(flake, _)| flake);
+
+    let status = Command::new("nix")
+        .arg("flake")
+        .arg("lock")
+        .arg(flake_dir)
+        .arg("--override-input")
+        .arg(input)
+        .arg(&flake_ref)
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
+        .map_err(|e| color_eyre::eyre::eyre!("failed to run nix flake lock: {e}"))?;
+
+    if !status.success() {
+        return Err(color_eyre::eyre::eyre!(
+            "Failed to update flake input for channel '{channel}' (exit {})",
+            status.code().unwrap_or(1)
+        ));
+    }
+
+    Ok(())
 }
 
 fn cmd_activate(
