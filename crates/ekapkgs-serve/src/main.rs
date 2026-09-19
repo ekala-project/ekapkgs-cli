@@ -1,4 +1,5 @@
 mod api;
+mod compression;
 mod config;
 mod gc;
 pub mod metrics;
@@ -108,6 +109,10 @@ pub struct AppState {
     pub storage: Box<dyn StorageBackend>,
     pub signer: NarInfoSigner,
     pub cert_signer: Option<signing::CertSigner>,
+    /// Additional certificate signers for threshold signing.
+    pub cert_signers: Vec<signing::CertSigner>,
+    /// Threshold: require this many valid cert signatures. 0 = no threshold.
+    pub signing_threshold: u32,
     pub gc_tracker: Option<Arc<gc::GcTracker>>,
     pub write_tokens: Option<Vec<String>>,
     pub delta_cache: DeltaCache,
@@ -118,36 +123,70 @@ pub struct AppState {
 ///
 /// Populated during negotiate when the server finds a suitable delta candidate,
 /// consumed by the delta HTTP endpoint and StreamNars handler.
+///
+/// Capped at 256 MiB total. When the cap is exceeded, the oldest entries are
+/// evicted until usage drops below the limit.
 pub struct DeltaCache {
-    entries: std::sync::Mutex<std::collections::HashMap<(String, String), Vec<u8>>>,
+    entries: std::sync::Mutex<DeltaCacheInner>,
 }
+
+struct DeltaCacheInner {
+    /// Entries in insertion order (oldest first).
+    entries: Vec<((String, String), Vec<u8>)>,
+    total_bytes: usize,
+}
+
+/// Maximum total bytes stored in the delta cache.
+const DELTA_CACHE_MAX_BYTES: usize = 256 * 1024 * 1024;
 
 impl DeltaCache {
     pub fn new() -> Self {
         Self {
-            entries: std::sync::Mutex::new(std::collections::HashMap::new()),
+            entries: std::sync::Mutex::new(DeltaCacheInner {
+                entries: Vec::new(),
+                total_bytes: 0,
+            }),
         }
     }
 
     pub fn insert(&self, base_hash: String, target_hash: String, delta: Vec<u8>) {
-        self.entries
-            .lock()
-            .expect("delta cache lock")
-            .insert((base_hash, target_hash), delta);
+        let mut inner = self.entries.lock().expect("delta cache lock");
+        let delta_len = delta.len();
+
+        // Remove existing entry for this key if present.
+        if let Some(pos) = inner
+            .entries
+            .iter()
+            .position(|((b, t), _)| b == &base_hash && t == &target_hash)
+        {
+            let (_, old) = inner.entries.remove(pos);
+            inner.total_bytes -= old.len();
+        }
+
+        // Evict oldest entries until we have room.
+        while inner.total_bytes + delta_len > DELTA_CACHE_MAX_BYTES && !inner.entries.is_empty() {
+            let (_, evicted) = inner.entries.remove(0);
+            inner.total_bytes -= evicted.len();
+        }
+
+        inner.total_bytes += delta_len;
+        inner.entries.push(((base_hash, target_hash), delta));
     }
 
     pub fn get(&self, base_hash: &str, target_hash: &str) -> Option<Vec<u8>> {
-        self.entries
-            .lock()
-            .expect("delta cache lock")
-            .get(&(base_hash.to_owned(), target_hash.to_owned()))
-            .cloned()
+        let inner = self.entries.lock().expect("delta cache lock");
+        inner
+            .entries
+            .iter()
+            .find(|((b, t), _)| b == base_hash && t == target_hash)
+            .map(|(_, delta)| delta.clone())
     }
 
     /// Find any cached delta targeting the given hash.
     pub fn get_for_target(&self, target_hash: &str) -> Option<Vec<u8>> {
-        let entries = self.entries.lock().expect("delta cache lock");
-        entries
+        let inner = self.entries.lock().expect("delta cache lock");
+        inner
+            .entries
             .iter()
             .find(|((_, t), _)| t == target_hash)
             .map(|(_, delta)| delta.clone())
@@ -173,19 +212,35 @@ async fn metrics_handler(
     )
 }
 
-fn build_http_router(state: Arc<AppState>) -> Router {
-    Router::new()
+fn build_http_router(
+    state: Arc<AppState>,
+    compression_config: config::CompressionConfig,
+) -> Router {
+    use axum::extract::DefaultBodyLimit;
+
+    // 1 MiB limit for narinfo metadata uploads.
+    const NARINFO_BODY_LIMIT: usize = 1024 * 1024;
+    // 8 GiB limit for NAR file uploads.
+    const NAR_BODY_LIMIT: usize = 8 * 1024 * 1024 * 1024;
+    // 16 MiB limit for CAS chunk uploads.
+    const CHUNK_BODY_LIMIT: usize = 16 * 1024 * 1024;
+
+    let router = Router::new()
         .route("/", get(api::compat::root))
         .route("/health", get(api::compat::health))
         .route("/version", get(api::compat::version))
         .route("/nix-cache-info", get(api::compat::nix_cache_info))
         .route(
             "/{hash_narinfo}",
-            get(api::compat::get_narinfo).put(api::upload::put_narinfo),
+            get(api::compat::get_narinfo)
+                .put(api::upload::put_narinfo)
+                .layer(DefaultBodyLimit::max(NARINFO_BODY_LIMIT)),
         )
         .route(
             "/nar/{file}",
-            get(api::compat::get_nar).put(api::upload::put_nar),
+            get(api::compat::get_nar)
+                .put(api::upload::put_nar)
+                .layer(DefaultBodyLimit::max(NAR_BODY_LIMIT)),
         )
         .route(
             "/nar/{outhash}-{narhash}.nar",
@@ -195,14 +250,22 @@ fn build_http_router(state: Arc<AppState>) -> Router {
         .route("/log/{drv}", get(api::logs::get_log))
         .route(
             "/cas/chunk/{b3hex}",
-            get(api::chunks::get_chunk).put(api::chunks::put_chunk),
+            get(api::chunks::get_chunk)
+                .put(api::chunks::put_chunk)
+                .layer(DefaultBodyLimit::max(CHUNK_BODY_LIMIT)),
         )
         .route(
             "/delta/{base_hash}/{target_hash}",
             get(api::delta::get_delta),
         )
         .route("/metrics", get(metrics_handler))
-        .with_state(state)
+        .with_state(state);
+
+    if compression_config.enable {
+        router.layer(compression::ZstdCompressionLayer::new(compression_config))
+    } else {
+        router
+    }
 }
 
 #[tokio::main]
@@ -399,8 +462,11 @@ async fn cmd_serve(cli: Cli) -> color_eyre::Result<()> {
     let storage_backend: Box<dyn StorageBackend>;
     let signer: NarInfoSigner;
     let cert_signer: Option<signing::CertSigner>;
+    let mut extra_signers: Vec<signing::CertSigner> = Vec::new();
+    let mut threshold: u32 = 0;
     let gc_tracker: Option<Arc<gc::GcTracker>>;
     let write_tokens: Option<Vec<String>>;
+    let compression_config: config::CompressionConfig;
     let server_metrics = metrics::Metrics::new();
 
     let gc_metrics = gc::GcMetrics {
@@ -423,6 +489,14 @@ async fn cmd_serve(cli: Cli) -> color_eyre::Result<()> {
         } else {
             None
         };
+        // Load additional certificate signers for threshold signing.
+        for cert_config in &config.signing.certificates {
+            extra_signers.push(signing::CertSigner::from_files(
+                &cert_config.cert_file,
+                &cert_config.private_key_file,
+            )?);
+        }
+        threshold = config.signing.threshold.unwrap_or(0);
         storage_backend = match config.storage {
             config::StorageConfig::Filesystem { path, gc } => {
                 let gc_t = if let Some(gc_raw) = gc {
@@ -448,6 +522,32 @@ async fn cmd_serve(cli: Cli) -> color_eyre::Result<()> {
             config::StorageConfig::NixStore => {
                 gc_tracker = None;
                 Box::new(storage::nix_store::NixStoreBackend::new())
+            },
+            #[cfg(feature = "s3")]
+            config::StorageConfig::S3 {
+                bucket,
+                region,
+                endpoint,
+                prefix,
+            } => {
+                gc_tracker = None;
+                let s3_config = storage::s3::S3Config {
+                    bucket,
+                    region,
+                    endpoint,
+                    prefix,
+                };
+                Box::new(
+                    tokio::runtime::Handle::current()
+                        .block_on(storage::s3::S3Backend::new(s3_config))?,
+                )
+            },
+            #[cfg(not(feature = "s3"))]
+            config::StorageConfig::S3 { .. } => {
+                return Err(color_eyre::eyre::eyre!(
+                    "S3 storage backend requires the 's3' feature. Rebuild with: cargo build \
+                     --features s3"
+                ));
             },
             config::StorageConfig::Castore { path, gc } => {
                 let gc_t = if let Some(gc_raw) = gc {
@@ -483,6 +583,7 @@ async fn cmd_serve(cli: Cli) -> color_eyre::Result<()> {
         } else {
             Some(all_tokens)
         };
+        compression_config = config.compression;
     } else {
         bind_addr = cli.bind.unwrap_or_else(|| "127.0.0.1:8080".to_owned());
 
@@ -503,6 +604,8 @@ async fn cmd_serve(cli: Cli) -> color_eyre::Result<()> {
             Some(all_tokens)
         };
 
+        compression_config = config::CompressionConfig::default();
+
         let storage_str = cli.storage.unwrap_or_else(|| "nix-store".to_owned());
         storage_backend = if storage_str == "nix-store" {
             Box::new(storage::nix_store::NixStoreBackend::new())
@@ -517,6 +620,8 @@ async fn cmd_serve(cli: Cli) -> color_eyre::Result<()> {
         storage: storage_backend,
         signer,
         cert_signer,
+        cert_signers: extra_signers,
+        signing_threshold: threshold,
         gc_tracker,
         write_tokens,
         delta_cache: DeltaCache::new(),
@@ -529,9 +634,13 @@ async fn cmd_serve(cli: Cli) -> color_eyre::Result<()> {
         state: Arc::clone(&state),
     });
 
-    let app = build_http_router(state)
+    let app = build_http_router(state, compression_config)
         .route_service("/ekapkgs.v1.CacheService/Negotiate", grpc_service.clone())
-        .route_service("/ekapkgs.v1.CacheService/NegotiateChunks", grpc_service);
+        .route_service(
+            "/ekapkgs.v1.CacheService/NegotiateChunks",
+            grpc_service.clone(),
+        )
+        .route_service("/ekapkgs.v1.CacheService/StreamNars", grpc_service);
 
     tracing::info!("Listening on {addr} (gRPC + HTTP)");
 
