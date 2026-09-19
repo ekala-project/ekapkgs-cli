@@ -2,6 +2,7 @@ mod api;
 mod compression;
 mod config;
 mod gc;
+mod http_metrics;
 pub mod metrics;
 mod signing;
 mod storage;
@@ -199,6 +200,24 @@ impl Default for DeltaCache {
     }
 }
 
+/// Add security headers to all HTTP responses.
+async fn security_headers(mut response: axum::response::Response) -> axum::response::Response {
+    let headers = response.headers_mut();
+    headers.insert(
+        axum::http::header::X_CONTENT_TYPE_OPTIONS,
+        "nosniff".parse().unwrap(),
+    );
+    headers.insert(
+        axum::http::header::X_FRAME_OPTIONS,
+        "DENY".parse().unwrap(),
+    );
+    headers.insert(
+        axum::http::header::CONTENT_SECURITY_POLICY,
+        "default-src 'none'; style-src 'unsafe-inline'".parse().unwrap(),
+    );
+    response
+}
+
 async fn metrics_handler(
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
 ) -> impl axum::response::IntoResponse {
@@ -215,6 +234,8 @@ async fn metrics_handler(
 fn build_http_router(
     state: Arc<AppState>,
     compression_config: config::CompressionConfig,
+    enable_metrics: bool,
+    request_timeout: std::time::Duration,
 ) -> Router {
     use axum::extract::DefaultBodyLimit;
 
@@ -225,7 +246,7 @@ fn build_http_router(
     // 16 MiB limit for CAS chunk uploads.
     const CHUNK_BODY_LIMIT: usize = 16 * 1024 * 1024;
 
-    let router = Router::new()
+    let mut router = Router::new()
         .route("/", get(api::compat::root))
         .route("/health", get(api::compat::health))
         .route("/version", get(api::compat::version))
@@ -257,8 +278,22 @@ fn build_http_router(
         .route(
             "/delta/{base_hash}/{target_hash}",
             get(api::delta::get_delta),
-        )
-        .route("/metrics", get(metrics_handler))
+        );
+
+    if enable_metrics {
+        router = router.route("/metrics", get(metrics_handler));
+    }
+
+    let router = router
+        .layer(http_metrics::HttpMetricsLayer::new(
+            state.metrics.http_requests_total.clone(),
+            state.metrics.http_request_duration_seconds.clone(),
+        ))
+        .layer(tower_http::timeout::TimeoutLayer::with_status_code(
+            axum::http::StatusCode::REQUEST_TIMEOUT,
+            request_timeout,
+        ))
+        .layer(axum::middleware::map_response(security_headers))
         .with_state(state);
 
     if compression_config.enable {
@@ -301,7 +336,7 @@ fn cmd_generate_ca(name: &str, output: &std::path::Path) -> color_eyre::Result<(
     let secret_b64 = BASE64.encode(secret.as_bytes());
     let public_b64 = BASE64.encode(public.as_bytes());
 
-    std::fs::write(&secret_path, format!("{name}:{secret_b64}\n"))?;
+    tokens::write_secret_file(&secret_path, format!("{name}:{secret_b64}\n").as_bytes())?;
     std::fs::write(&public_path, format!("{name}:{public_b64}\n"))?;
 
     tracing::info!("CA keypair generated:");
@@ -354,10 +389,10 @@ fn cmd_issue_cert(
     })?;
     std::fs::write(&cert_path, &cert_json)?;
 
-    // Write the signing secret key.
+    // Write the signing secret key with restrictive permissions.
     let key_path = output.join(format!("{name}.key"));
     let key_b64 = BASE64.encode(cert_secret.as_bytes());
-    std::fs::write(&key_path, format!("{name}:{key_b64}\n"))?;
+    tokens::write_secret_file(&key_path, format!("{name}:{key_b64}\n").as_bytes())?;
 
     tracing::info!("Signing certificate issued:");
     tracing::info!("  Certificate: {}", cert_path.display());
@@ -482,8 +517,10 @@ async fn cmd_serve(cli: Cli) -> color_eyre::Result<()> {
     if let Some(config_path) = &cli.config {
         let config = Config::load(config_path)?;
         bind_addr = cli.bind.unwrap_or(config.server.bind);
+        warn_insecure_key_permissions(&config.signing.secret_key_file);
         signer = NarInfoSigner::from_file(&config.signing.secret_key_file)?;
         cert_signer = if let Some(ref cert_config) = config.signing.certificate {
+            warn_insecure_key_permissions(&cert_config.private_key_file);
             Some(signing::CertSigner::from_files(
                 &cert_config.cert_file,
                 &cert_config.private_key_file,
@@ -493,6 +530,7 @@ async fn cmd_serve(cli: Cli) -> color_eyre::Result<()> {
         };
         // Load additional certificate signers for threshold signing.
         for cert_config in &config.signing.certificates {
+            warn_insecure_key_permissions(&cert_config.private_key_file);
             extra_signers.push(signing::CertSigner::from_files(
                 &cert_config.cert_file,
                 &cert_config.private_key_file,
@@ -652,7 +690,7 @@ async fn cmd_serve(cli: Cli) -> color_eyre::Result<()> {
         ));
     }
 
-    // Warn on insecure TLS key permissions.
+    // Warn on insecure key file permissions.
     if let Some(ref key_path) = tls_key_path {
         warn_insecure_key_permissions(key_path);
     }
@@ -661,7 +699,8 @@ async fn cmd_serve(cli: Cli) -> color_eyre::Result<()> {
         state: Arc::clone(&state),
     });
 
-    let app = build_http_router(state, compression_config)
+    let request_timeout = std::time::Duration::from_secs(request_timeout_secs);
+    let app = build_http_router(state, compression_config, enable_metrics, request_timeout)
         .route_service("/ekapkgs.v1.CacheService/Negotiate", grpc_service.clone())
         .route_service(
             "/ekapkgs.v1.CacheService/NegotiateChunks",
@@ -682,11 +721,11 @@ async fn cmd_serve(cli: Cli) -> color_eyre::Result<()> {
         // Remove stale socket file.
         let _ = std::fs::remove_file(socket_path);
         let listener = tokio::net::UnixListener::bind(socket_path)?;
-        // Set permissions to 0o777.
+        // Restrict socket to owner and group.
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o777))?;
+            std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o660))?;
         }
         tracing::info!("Listening on unix:{socket_path} (gRPC + HTTP)");
         notify_ready();
@@ -725,7 +764,7 @@ fn warn_insecure_key_permissions(path: &std::path::Path) {
     if let Ok(meta) = std::fs::metadata(path) {
         if meta.mode() & 0o077 != 0 {
             tracing::warn!(
-                "TLS key file {:?} has insecure permissions (mode {:o})",
+                "Key file {:?} has insecure permissions (mode {:o}). Consider chmod 600.",
                 path,
                 meta.mode() & 0o777
             );
