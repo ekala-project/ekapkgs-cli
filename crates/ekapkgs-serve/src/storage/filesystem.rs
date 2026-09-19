@@ -80,7 +80,10 @@ impl StorageBackend for FilesystemBackend {
     }
 
     fn put_nar(&self, file_path: &str, data: &[u8]) -> color_eyre::Result<bool> {
-        let path = self.root.join(file_path);
+        let Some(path) = self.safe_join(file_path) else {
+            tracing::warn!("Rejected NAR write path traversal attempt: {file_path}");
+            return Err(color_eyre::eyre::eyre!("invalid NAR path"));
+        };
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
