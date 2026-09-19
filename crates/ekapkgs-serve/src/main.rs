@@ -675,6 +675,7 @@ async fn cmd_serve(cli: Cli) -> color_eyre::Result<()> {
     if let Some(listener) = inherited_listener {
         tracing::info!("Using systemd socket activation");
         notify_ready();
+        spawn_watchdog();
         axum::serve(listener, app).await?;
     } else if is_unix {
         let socket_path = bind_addr.strip_prefix("unix:").unwrap();
@@ -689,6 +690,7 @@ async fn cmd_serve(cli: Cli) -> color_eyre::Result<()> {
         }
         tracing::info!("Listening on unix:{socket_path} (gRPC + HTTP)");
         notify_ready();
+        spawn_watchdog();
         axum::serve(listener, app.into_make_service()).await?;
     } else if use_tls {
         let cert_path = tls_cert_path.unwrap();
@@ -700,6 +702,7 @@ async fn cmd_serve(cli: Cli) -> color_eyre::Result<()> {
 
         tracing::info!("Listening on {addr} with TLS (gRPC + HTTP)");
         notify_ready();
+        spawn_watchdog();
         axum_server::bind_rustls(addr, rustls_config)
             .serve(app.into_make_service())
             .await?;
@@ -708,6 +711,7 @@ async fn cmd_serve(cli: Cli) -> color_eyre::Result<()> {
         tracing::info!("Listening on {addr} (gRPC + HTTP)");
         let listener = tokio::net::TcpListener::bind(addr).await?;
         notify_ready();
+        spawn_watchdog();
         axum::serve(listener, app).await?;
     };
 
@@ -737,6 +741,28 @@ fn notify_ready() {
     if let Err(e) = sd_notify::notify(false, &[sd_notify::NotifyState::Ready]) {
         tracing::warn!("sd_notify READY=1 failed (non-fatal): {e}");
     }
+}
+
+/// Spawn a watchdog task that pings systemd at half the configured interval.
+fn spawn_watchdog() {
+    let Some(watchdog_usec) = std::env::var("WATCHDOG_USEC")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+    else {
+        return;
+    };
+
+    let interval =
+        std::time::Duration::from_micros(watchdog_usec / 2).max(std::time::Duration::from_secs(1));
+
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            ticker.tick().await;
+            let _ = sd_notify::notify(false, &[sd_notify::NotifyState::Watchdog]);
+        }
+    });
 }
 
 /// Attempt systemd socket activation via inherited file descriptors.
