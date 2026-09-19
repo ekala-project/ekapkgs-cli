@@ -1,4 +1,5 @@
 mod api;
+mod compression;
 mod config;
 mod gc;
 pub mod metrics;
@@ -211,7 +212,10 @@ async fn metrics_handler(
     )
 }
 
-fn build_http_router(state: Arc<AppState>) -> Router {
+fn build_http_router(
+    state: Arc<AppState>,
+    compression_config: config::CompressionConfig,
+) -> Router {
     use axum::extract::DefaultBodyLimit;
 
     // 1 MiB limit for narinfo metadata uploads.
@@ -221,7 +225,7 @@ fn build_http_router(state: Arc<AppState>) -> Router {
     // 16 MiB limit for CAS chunk uploads.
     const CHUNK_BODY_LIMIT: usize = 16 * 1024 * 1024;
 
-    Router::new()
+    let router = Router::new()
         .route("/", get(api::compat::root))
         .route("/health", get(api::compat::health))
         .route("/version", get(api::compat::version))
@@ -255,7 +259,13 @@ fn build_http_router(state: Arc<AppState>) -> Router {
             get(api::delta::get_delta),
         )
         .route("/metrics", get(metrics_handler))
-        .with_state(state)
+        .with_state(state);
+
+    if compression_config.enable {
+        router.layer(compression::ZstdCompressionLayer::new(compression_config))
+    } else {
+        router
+    }
 }
 
 #[tokio::main]
@@ -456,6 +466,7 @@ async fn cmd_serve(cli: Cli) -> color_eyre::Result<()> {
     let mut threshold: u32 = 0;
     let gc_tracker: Option<Arc<gc::GcTracker>>;
     let write_tokens: Option<Vec<String>>;
+    let compression_config: config::CompressionConfig;
     let server_metrics = metrics::Metrics::new();
 
     let gc_metrics = gc::GcMetrics {
@@ -572,6 +583,7 @@ async fn cmd_serve(cli: Cli) -> color_eyre::Result<()> {
         } else {
             Some(all_tokens)
         };
+        compression_config = config.compression;
     } else {
         bind_addr = cli.bind.unwrap_or_else(|| "0.0.0.0:8080".to_owned());
 
@@ -591,6 +603,8 @@ async fn cmd_serve(cli: Cli) -> color_eyre::Result<()> {
         } else {
             Some(all_tokens)
         };
+
+        compression_config = config::CompressionConfig::default();
 
         let storage_str = cli.storage.unwrap_or_else(|| "nix-store".to_owned());
         storage_backend = if storage_str == "nix-store" {
@@ -620,7 +634,7 @@ async fn cmd_serve(cli: Cli) -> color_eyre::Result<()> {
         state: Arc::clone(&state),
     });
 
-    let app = build_http_router(state)
+    let app = build_http_router(state, compression_config)
         .route_service("/ekapkgs.v1.CacheService/Negotiate", grpc_service.clone())
         .route_service(
             "/ekapkgs.v1.CacheService/NegotiateChunks",
