@@ -8,6 +8,9 @@ pub struct Config {
     pub storage: StorageConfig,
     pub signing: SigningConfig,
     pub auth: Option<AuthConfig>,
+    /// Zstd compression settings for HTTP responses.
+    #[serde(default)]
+    pub compression: CompressionConfig,
 }
 
 #[derive(Debug, Deserialize)]
@@ -87,6 +90,49 @@ pub struct GcRawConfig {
 
 fn default_gc_interval() -> u64 {
     300
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct CompressionConfig {
+    /// Master switch for HTTP response compression. Default: true.
+    #[serde(default = "default_true")]
+    pub enable: bool,
+    /// Zstd compression level. Default: 1.
+    #[serde(default = "default_compression_level")]
+    pub level: i32,
+    /// Enable long distance matching for NAR responses. Default: true.
+    #[serde(default = "default_true")]
+    pub long_distance_matching: bool,
+    /// Zstd window_log parameter. 0 = auto (use cap). Default: 0.
+    #[serde(default)]
+    pub window_log: u32,
+    /// Maximum concurrent LDM encoders per worker. Default: 16.
+    #[serde(default = "default_max_ldm_encoders")]
+    pub max_ldm_encoders: u32,
+}
+
+impl Default for CompressionConfig {
+    fn default() -> Self {
+        Self {
+            enable: true,
+            level: 1,
+            long_distance_matching: true,
+            window_log: 0,
+            max_ldm_encoders: 16,
+        }
+    }
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_compression_level() -> i32 {
+    1
+}
+
+fn default_max_ldm_encoders() -> u32 {
+    16
 }
 
 #[derive(Debug, Deserialize)]
