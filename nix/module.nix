@@ -114,12 +114,13 @@ in
       serviceConfig = {
         Type = "notify";
         WatchdogSec = 15;
+        LoadCredential = [ "signing-key:${cfg.signingKeyFile}" ];
         ExecStart = lib.escapeShellArgs [
           "${cfg.package}/bin/ekapkgs-serve"
           "--config"
           configFile
           "--signing-key"
-          cfg.signingKeyFile
+          "%d/signing-key"
         ];
         Restart = "on-failure";
         RestartSec = "10s";
