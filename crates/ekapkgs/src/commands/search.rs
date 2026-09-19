@@ -12,8 +12,9 @@ pub fn execute(command: SearchCommand) -> color_eyre::Result<()> {
             query,
             flake,
             json,
+            names_only,
             limit,
-        } => cmd_packages(&query, &flake, json, limit),
+        } => cmd_packages(&query, &flake, json, names_only, limit),
         SearchCommand::Options {
             query,
             flake,
@@ -132,6 +133,7 @@ fn cmd_packages(
     query: &str,
     flake: &str,
     json_output: bool,
+    names_only: bool,
     limit: usize,
 ) -> color_eyre::Result<()> {
     let index_name = format!("packages-{}", flake.replace(['/', '#'], "-"));
@@ -162,11 +164,20 @@ fn cmd_packages(
         .collect();
 
     results.sort_by_key(|(score, e)| (*score, e.pname.clone()));
-    results.truncate(limit);
+    if limit > 0 {
+        results.truncate(limit);
+    }
 
     if json_output {
         let out: Vec<&PackageSearchEntry> = results.iter().map(|(_, e)| *e).collect();
         println!("{}", serde_json::to_string_pretty(&out)?);
+        return Ok(());
+    }
+
+    if names_only {
+        for (_, entry) in &results {
+            println!("{}", entry.attr);
+        }
         return Ok(());
     }
 

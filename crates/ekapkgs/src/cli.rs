@@ -1110,7 +1110,8 @@ pub enum EnvHookShell {
 pub enum SearchCommand {
     /// Search packages by name or description.
     Packages {
-        /// Search query (substring or regex).
+        /// Search query (substring or regex). Use "" to list all packages.
+        #[arg(default_value = "")]
         query: String,
 
         /// Flake reference to search (default: `nixpkgs`).
@@ -1121,7 +1122,11 @@ pub enum SearchCommand {
         #[arg(long)]
         json: bool,
 
-        /// Maximum number of results.
+        /// Print only package attribute names, one per line (useful for scripting).
+        #[arg(long)]
+        names_only: bool,
+
+        /// Maximum number of results (0 for unlimited).
         #[arg(long, default_value = "20")]
         limit: usize,
     },
