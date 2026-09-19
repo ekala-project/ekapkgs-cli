@@ -669,7 +669,13 @@ async fn cmd_serve(cli: Cli) -> color_eyre::Result<()> {
         )
         .route_service("/ekapkgs.v1.CacheService/StreamNars", grpc_service);
 
-    if is_unix {
+    // Check for systemd socket activation.
+    let inherited_listener = try_socket_activation()?;
+
+    if let Some(listener) = inherited_listener {
+        tracing::info!("Using systemd socket activation");
+        axum::serve(listener, app).await?;
+    } else if is_unix {
         let socket_path = bind_addr.strip_prefix("unix:").unwrap();
         // Remove stale socket file.
         let _ = std::fs::remove_file(socket_path);
@@ -721,3 +727,20 @@ fn warn_insecure_key_permissions(path: &std::path::Path) {
 
 #[cfg(not(unix))]
 fn warn_insecure_key_permissions(_path: &std::path::Path) {}
+
+/// Attempt systemd socket activation via inherited file descriptors.
+///
+/// Uses the `listenfd` crate which handles LISTEN_PID checking, FD_CLOEXEC,
+/// and non-blocking mode safely.
+fn try_socket_activation() -> color_eyre::Result<Option<tokio::net::TcpListener>> {
+    let mut listenfd = listenfd::ListenFd::from_env();
+
+    match listenfd.take_tcp_listener(0) {
+        Ok(Some(std_listener)) => {
+            std_listener.set_nonblocking(true)?;
+            let listener = tokio::net::TcpListener::from_std(std_listener)?;
+            Ok(Some(listener))
+        },
+        Ok(None) | Err(_) => Ok(None),
+    }
+}

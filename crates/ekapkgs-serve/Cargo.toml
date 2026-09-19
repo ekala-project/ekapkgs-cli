@@ -39,6 +39,7 @@ fastcdc.workspace = true
 zstd.workspace = true
 bzip2.workspace = true
 prometheus.workspace = true
+listenfd.workspace = true
 
 [features]
 s3 = ["dep:aws-sdk-s3", "dep:aws-config"]
