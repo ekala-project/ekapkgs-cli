@@ -73,6 +73,7 @@ pub fn execute(command: SystemCommand) -> color_eyre::Result<()> {
             cmd_activate(&installable, "test", false, &extra)
         },
         SystemCommand::Build { installable, extra } => cmd_build(&installable, &extra),
+        SystemCommand::Diff { installable, extra } => cmd_diff(&installable, &extra),
         SystemCommand::ListGenerations { json } => cmd_list_generations(json),
         SystemCommand::Rollback { dry_run } => cmd_rollback(dry_run),
         SystemCommand::PruneBootEntries {
@@ -241,6 +242,34 @@ fn cmd_activate(
 fn cmd_build(installable: &str, extra: &[String]) -> color_eyre::Result<()> {
     let store_path = build_system(installable, extra)?;
     println!("{store_path}");
+    Ok(())
+}
+
+fn cmd_diff(installable: &str, extra: &[String]) -> color_eyre::Result<()> {
+    let new_path = build_system(installable, extra)?;
+    let current = "/run/current-system";
+
+    if !Path::new(current).exists() {
+        return Err(color_eyre::eyre::eyre!(
+            "{current} does not exist — is this a NixOS system?"
+        ));
+    }
+
+    let current_resolved = std::fs::read_link(current)
+        .unwrap_or_else(|_| PathBuf::from(current))
+        .to_string_lossy()
+        .into_owned();
+
+    if current_resolved == new_path {
+        println!("System is up to date.");
+        std::process::exit(1);
+    }
+
+    NixCommand::new(&["store", "diff-closures"])
+        .arg(&current_resolved)
+        .arg(&new_path)
+        .stream()?;
+
     Ok(())
 }
 
