@@ -1,8 +1,8 @@
 //! Prometheus metrics for the binary cache server.
 
 use prometheus::{
-    Encoder, HistogramVec, IntCounter, IntCounterVec, IntGauge, Registry, TextEncoder,
-    register_histogram_vec_with_registry, register_int_counter_vec_with_registry,
+    Encoder, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge, Registry,
+    TextEncoder, register_histogram_vec_with_registry, register_int_counter_vec_with_registry,
     register_int_counter_with_registry, register_int_gauge_with_registry,
 };
 
@@ -35,6 +35,10 @@ pub struct Metrics {
     // Cache state
     pub cache_size_bytes: IntGauge,
     pub cache_paths_total: IntGauge,
+
+    // HTTP request metrics
+    pub http_requests_total: IntCounterVec,
+    pub http_request_duration_seconds: HistogramVec,
 }
 
 impl Metrics {
@@ -144,6 +148,27 @@ impl Metrics {
         )
         .expect("metric");
 
+        let http_requests_total = register_int_counter_vec_with_registry!(
+            "ekapkgs_http_requests_total",
+            "Total HTTP requests by method, path, and status",
+            &["method", "path", "status"],
+            registry
+        )
+        .expect("metric");
+
+        let http_request_duration_seconds = register_histogram_vec_with_registry!(
+            HistogramOpts::new(
+                "ekapkgs_http_request_duration_seconds",
+                "HTTP request duration in seconds",
+            )
+            .buckets(vec![
+                0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0,
+            ]),
+            &["method", "path", "status"],
+            registry
+        )
+        .expect("metric");
+
         Self {
             registry,
             negotiate_requests_total,
@@ -160,6 +185,8 @@ impl Metrics {
             gc_bytes_freed_total,
             cache_size_bytes,
             cache_paths_total,
+            http_requests_total,
+            http_request_duration_seconds,
         }
     }
 

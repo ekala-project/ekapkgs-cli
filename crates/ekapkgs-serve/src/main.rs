@@ -2,6 +2,7 @@ mod api;
 mod compression;
 mod config;
 mod gc;
+mod http_metrics;
 pub mod metrics;
 mod signing;
 mod storage;
@@ -259,6 +260,10 @@ fn build_http_router(
             get(api::delta::get_delta),
         )
         .route("/metrics", get(metrics_handler))
+        .layer(http_metrics::HttpMetricsLayer::new(
+            state.metrics.http_requests_total.clone(),
+            state.metrics.http_request_duration_seconds.clone(),
+        ))
         .with_state(state);
 
     if compression_config.enable {
