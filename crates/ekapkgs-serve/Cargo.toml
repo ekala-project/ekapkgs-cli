@@ -36,6 +36,7 @@ fastcdc.workspace = true
 zstd.workspace = true
 bzip2.workspace = true
 prometheus.workspace = true
+sd-notify.workspace = true
 listenfd.workspace = true
 
 [dev-dependencies]

@@ -674,6 +674,7 @@ async fn cmd_serve(cli: Cli) -> color_eyre::Result<()> {
 
     if let Some(listener) = inherited_listener {
         tracing::info!("Using systemd socket activation");
+        notify_ready();
         axum::serve(listener, app).await?;
     } else if is_unix {
         let socket_path = bind_addr.strip_prefix("unix:").unwrap();
@@ -687,6 +688,7 @@ async fn cmd_serve(cli: Cli) -> color_eyre::Result<()> {
             std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o777))?;
         }
         tracing::info!("Listening on unix:{socket_path} (gRPC + HTTP)");
+        notify_ready();
         axum::serve(listener, app.into_make_service()).await?;
     } else if use_tls {
         let cert_path = tls_cert_path.unwrap();
@@ -697,6 +699,7 @@ async fn cmd_serve(cli: Cli) -> color_eyre::Result<()> {
             axum_server::tls_rustls::RustlsConfig::from_pem_file(&cert_path, &key_path).await?;
 
         tracing::info!("Listening on {addr} with TLS (gRPC + HTTP)");
+        notify_ready();
         axum_server::bind_rustls(addr, rustls_config)
             .serve(app.into_make_service())
             .await?;
@@ -704,6 +707,7 @@ async fn cmd_serve(cli: Cli) -> color_eyre::Result<()> {
         let addr: SocketAddr = bind_addr.parse()?;
         tracing::info!("Listening on {addr} (gRPC + HTTP)");
         let listener = tokio::net::TcpListener::bind(addr).await?;
+        notify_ready();
         axum::serve(listener, app).await?;
     };
 
@@ -727,6 +731,13 @@ fn warn_insecure_key_permissions(path: &std::path::Path) {
 
 #[cfg(not(unix))]
 fn warn_insecure_key_permissions(_path: &std::path::Path) {}
+
+/// Send `READY=1` to systemd if the notify socket is available.
+fn notify_ready() {
+    if let Err(e) = sd_notify::notify(false, &[sd_notify::NotifyState::Ready]) {
+        tracing::warn!("sd_notify READY=1 failed (non-fatal): {e}");
+    }
+}
 
 /// Attempt systemd socket activation via inherited file descriptors.
 ///
