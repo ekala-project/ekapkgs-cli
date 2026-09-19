@@ -17,6 +17,10 @@ pub struct Config {
 pub struct ServerConfig {
     #[serde(default = "default_bind")]
     pub bind: String,
+    /// Path to TLS certificate file (PEM).
+    pub tls_cert_path: Option<PathBuf>,
+    /// Path to TLS private key file (PEM).
+    pub tls_key_path: Option<PathBuf>,
 }
 
 fn default_bind() -> String {

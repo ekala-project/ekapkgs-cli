@@ -467,6 +467,8 @@ async fn cmd_serve(cli: Cli) -> color_eyre::Result<()> {
     let gc_tracker: Option<Arc<gc::GcTracker>>;
     let write_tokens: Option<Vec<String>>;
     let compression_config: config::CompressionConfig;
+    let tls_cert_path: Option<PathBuf>;
+    let tls_key_path: Option<PathBuf>;
     let server_metrics = metrics::Metrics::new();
 
     let gc_metrics = gc::GcMetrics {
@@ -584,6 +586,8 @@ async fn cmd_serve(cli: Cli) -> color_eyre::Result<()> {
             Some(all_tokens)
         };
         compression_config = config.compression;
+        tls_cert_path = config.server.tls_cert_path;
+        tls_key_path = config.server.tls_key_path;
     } else {
         bind_addr = cli.bind.unwrap_or_else(|| "127.0.0.1:8080".to_owned());
 
@@ -605,6 +609,8 @@ async fn cmd_serve(cli: Cli) -> color_eyre::Result<()> {
         };
 
         compression_config = config::CompressionConfig::default();
+        tls_cert_path = None;
+        tls_key_path = None;
 
         let storage_str = cli.storage.unwrap_or_else(|| "nix-store".to_owned());
         storage_backend = if storage_str == "nix-store" {
@@ -628,7 +634,21 @@ async fn cmd_serve(cli: Cli) -> color_eyre::Result<()> {
         metrics: server_metrics,
     });
 
-    let addr: SocketAddr = bind_addr.parse()?;
+    // Validate TLS config consistency.
+    let use_tls = match (&tls_cert_path, &tls_key_path) {
+        (Some(_), Some(_)) => true,
+        (None, None) => false,
+        _ => {
+            return Err(color_eyre::eyre::eyre!(
+                "both tls_cert_path and tls_key_path must be set, or neither"
+            ));
+        },
+    };
+
+    // Warn on insecure TLS key permissions.
+    if let Some(ref key_path) = tls_key_path {
+        warn_insecure_key_permissions(key_path);
+    }
 
     let grpc_service = CacheServiceServer::new(api::negotiate::NegotiateService {
         state: Arc::clone(&state),
@@ -642,10 +662,42 @@ async fn cmd_serve(cli: Cli) -> color_eyre::Result<()> {
         )
         .route_service("/ekapkgs.v1.CacheService/StreamNars", grpc_service);
 
-    tracing::info!("Listening on {addr} (gRPC + HTTP)");
+    if use_tls {
+        let cert_path = tls_cert_path.unwrap();
+        let key_path = tls_key_path.unwrap();
+        let addr: SocketAddr = bind_addr.parse()?;
 
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app).await?;
+        let rustls_config =
+            axum_server::tls_rustls::RustlsConfig::from_pem_file(&cert_path, &key_path).await?;
+
+        tracing::info!("Listening on {addr} with TLS (gRPC + HTTP)");
+        axum_server::bind_rustls(addr, rustls_config)
+            .serve(app.into_make_service())
+            .await?;
+    } else {
+        let addr: SocketAddr = bind_addr.parse()?;
+        tracing::info!("Listening on {addr} (gRPC + HTTP)");
+        let listener = tokio::net::TcpListener::bind(addr).await?;
+        axum::serve(listener, app).await?;
+    };
 
     Ok(())
 }
+
+/// Warn if a key file has world/group-readable permissions.
+#[cfg(unix)]
+fn warn_insecure_key_permissions(path: &std::path::Path) {
+    use std::os::unix::fs::MetadataExt;
+    if let Ok(meta) = std::fs::metadata(path) {
+        if meta.mode() & 0o077 != 0 {
+            tracing::warn!(
+                "TLS key file {:?} has insecure permissions (mode {:o})",
+                path,
+                meta.mode() & 0o777
+            );
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn warn_insecure_key_permissions(_path: &std::path::Path) {}
