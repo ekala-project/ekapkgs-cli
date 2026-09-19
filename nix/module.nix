@@ -112,7 +112,8 @@ in
       wants = [ "network-online.target" ];
 
       serviceConfig = {
-        Type = "simple";
+        Type = "notify";
+        WatchdogSec = 15;
         ExecStart = lib.escapeShellArgs [
           "${cfg.package}/bin/ekapkgs-serve"
           "--config"
