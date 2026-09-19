@@ -21,10 +21,26 @@ pub struct ServerConfig {
     pub tls_cert_path: Option<PathBuf>,
     /// Path to TLS private key file (PEM).
     pub tls_key_path: Option<PathBuf>,
+    /// Cache priority advertised in nix-cache-info. Default: 30.
+    #[serde(default = "default_priority")]
+    pub priority: u32,
+    /// Client request timeout in seconds. Default: 30.
+    /// Reserved for future use with hyper server tuning.
+    #[serde(default = "default_request_timeout")]
+    #[allow(dead_code)]
+    pub client_request_timeout_secs: u64,
 }
 
 fn default_bind() -> String {
     "0.0.0.0:8080".to_owned()
+}
+
+fn default_priority() -> u32 {
+    30
+}
+
+fn default_request_timeout() -> u64 {
+    30
 }
 
 #[derive(Debug, Deserialize)]
