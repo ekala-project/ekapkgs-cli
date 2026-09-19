@@ -63,6 +63,12 @@ in
       '';
     };
 
+    socketActivation = lib.mkOption {
+      type = lib.types.bool;
+      default = false;
+      description = "Whether to use systemd socket activation instead of direct binding.";
+    };
+
     openFirewall = lib.mkOption {
       type = lib.types.bool;
       default = false;
@@ -85,9 +91,23 @@ in
       ekapkgs = { };
     };
 
+    systemd.sockets.ekapkgs-serve = lib.mkIf cfg.socketActivation {
+      description = "ekapkgs binary cache server socket";
+      wantedBy = [ "sockets.target" ];
+
+      socketConfig = {
+        ListenStream =
+          let
+            bind = cfg.settings.server.bind or "0.0.0.0:8080";
+          in
+          bind;
+        ReusePort = true;
+      };
+    };
+
     systemd.services.ekapkgs-serve = {
       description = "ekapkgs binary cache server";
-      wantedBy = [ "multi-user.target" ];
+      wantedBy = lib.mkIf (!cfg.socketActivation) [ "multi-user.target" ];
       after = [ "network-online.target" ];
       wants = [ "network-online.target" ];
 
