@@ -118,6 +118,8 @@ pub struct AppState {
     pub write_tokens: Option<Vec<String>>,
     pub delta_cache: DeltaCache,
     pub metrics: metrics::Metrics,
+    /// Cache priority advertised in nix-cache-info.
+    pub priority: u32,
 }
 
 /// Cache for computed delta NARs, keyed by (base_hash, target_hash).
@@ -474,6 +476,7 @@ async fn cmd_serve(cli: Cli) -> color_eyre::Result<()> {
     let compression_config: config::CompressionConfig;
     let tls_cert_path: Option<PathBuf>;
     let tls_key_path: Option<PathBuf>;
+    let mut priority: u32 = 30;
     let server_metrics = metrics::Metrics::new();
 
     let gc_metrics = gc::GcMetrics {
@@ -593,6 +596,7 @@ async fn cmd_serve(cli: Cli) -> color_eyre::Result<()> {
         compression_config = config.compression;
         tls_cert_path = config.server.tls_cert_path;
         tls_key_path = config.server.tls_key_path;
+        priority = config.server.priority;
     } else {
         bind_addr = cli.bind.unwrap_or_else(|| "0.0.0.0:8080".to_owned());
 
@@ -637,6 +641,7 @@ async fn cmd_serve(cli: Cli) -> color_eyre::Result<()> {
         write_tokens,
         delta_cache: DeltaCache::new(),
         metrics: server_metrics,
+        priority,
     });
 
     // Validate TLS config consistency.
