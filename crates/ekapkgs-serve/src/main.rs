@@ -645,6 +645,13 @@ async fn cmd_serve(cli: Cli) -> color_eyre::Result<()> {
         },
     };
 
+    let is_unix = bind_addr.starts_with("unix:");
+    if use_tls && is_unix {
+        return Err(color_eyre::eyre::eyre!(
+            "TLS is not compatible with Unix socket binding"
+        ));
+    }
+
     // Warn on insecure TLS key permissions.
     if let Some(ref key_path) = tls_key_path {
         warn_insecure_key_permissions(key_path);
@@ -662,7 +669,20 @@ async fn cmd_serve(cli: Cli) -> color_eyre::Result<()> {
         )
         .route_service("/ekapkgs.v1.CacheService/StreamNars", grpc_service);
 
-    if use_tls {
+    if is_unix {
+        let socket_path = bind_addr.strip_prefix("unix:").unwrap();
+        // Remove stale socket file.
+        let _ = std::fs::remove_file(socket_path);
+        let listener = tokio::net::UnixListener::bind(socket_path)?;
+        // Set permissions to 0o777.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o777))?;
+        }
+        tracing::info!("Listening on unix:{socket_path} (gRPC + HTTP)");
+        axum::serve(listener, app.into_make_service()).await?;
+    } else if use_tls {
         let cert_path = tls_cert_path.unwrap();
         let key_path = tls_key_path.unwrap();
         let addr: SocketAddr = bind_addr.parse()?;
