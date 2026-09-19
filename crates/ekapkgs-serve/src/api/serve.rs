@@ -158,7 +158,10 @@ fn serve_directory_listing(dir: &std::path::Path, hash: &str, tail: &str) -> Res
 fn not_found() -> Response {
     (
         StatusCode::NOT_FOUND,
-        [(header::CACHE_CONTROL, "no-store")],
+        [
+            (header::CACHE_CONTROL, "no-store"),
+            (header::CONTENT_TYPE, "text/plain; charset=utf-8"),
+        ],
         "not found",
     )
         .into_response()

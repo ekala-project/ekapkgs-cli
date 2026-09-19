@@ -320,11 +320,14 @@ fn narinfo_to_json(ni: &crate::storage::NarInfo) -> String {
     serde_json::to_string_pretty(&json).unwrap_or_default()
 }
 
-/// Standard 404 response with `Cache-Control: no-store`.
+/// Standard 404 response with proper error headers.
 fn not_found_response() -> Response {
     (
         StatusCode::NOT_FOUND,
-        [(header::CACHE_CONTROL, "no-store")],
+        [
+            (header::CACHE_CONTROL, "no-store"),
+            (header::CONTENT_TYPE, "text/plain; charset=utf-8"),
+        ],
         "not found",
     )
         .into_response()
