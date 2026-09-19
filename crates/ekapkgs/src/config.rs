@@ -56,12 +56,23 @@ pub struct ClientConfig {
 pub struct Defaults {
     #[serde(default = "default_parallel")]
     pub max_parallel_downloads: usize,
+
+    /// Flake input name to override when using `--channel`
+    /// (e.g., `"omarchy"`).
+    pub channel_input: Option<String>,
+
+    /// Base flake URL for channel switching
+    /// (e.g., `"github:omacom/omarchy-nix-pkgs"`).
+    /// The channel name is appended as `/{channel}`.
+    pub channel_url: Option<String>,
 }
 
 impl Default for Defaults {
     fn default() -> Self {
         Self {
             max_parallel_downloads: default_parallel(),
+            channel_input: None,
+            channel_url: None,
         }
     }
 }

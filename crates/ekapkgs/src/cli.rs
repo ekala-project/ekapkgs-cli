@@ -810,6 +810,12 @@ pub enum SystemCommand {
         #[arg(long)]
         dry_run: bool,
 
+        /// Switch the system flake to a different channel (branch) before
+        /// building. Requires `channel_input` and `channel_url` in the
+        /// client config.
+        #[arg(long)]
+        channel: Option<String>,
+
         /// Extra arguments passed through to nix build.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         extra: Vec<String>,
@@ -823,6 +829,11 @@ pub enum SystemCommand {
         /// The system configuration installable.
         #[arg(default_value = ".#config.system.build.toplevel")]
         installable: String,
+
+        /// Switch the system flake to a different channel (branch) before
+        /// building.
+        #[arg(long)]
+        channel: Option<String>,
 
         /// Extra arguments passed through to nix build.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
