@@ -12,6 +12,7 @@ ekapkgs-protocol.workspace = true
 ekapkgs-nix.workspace = true
 ekapkgs-ui.workspace = true
 tonic.workspace = true
+tokio-stream.workspace = true
 prost.workspace = true
 clap.workspace = true
 clap-verbosity-flag.workspace = true
@@ -28,6 +29,8 @@ tower-http.workspace = true
 toml.workspace = true
 ed25519-dalek.workspace = true
 data-encoding.workspace = true
+getrandom.workspace = true
+subtle.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
 rusqlite.workspace = true
@@ -38,6 +41,17 @@ bzip2.workspace = true
 prometheus.workspace = true
 sd-notify.workspace = true
 listenfd.workspace = true
+
+[features]
+s3 = ["dep:aws-sdk-s3", "dep:aws-config"]
+
+[dependencies.aws-sdk-s3]
+workspace = true
+optional = true
+
+[dependencies.aws-config]
+workspace = true
+optional = true
 
 [dev-dependencies]
 tempfile.workspace = true
