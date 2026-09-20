@@ -10,10 +10,10 @@ rustPlatform.buildRustPackage {
   pname = "ekapkgs-serve";
   version =
     let
-      cargo_toml = builtins.readFile ../crates/ekapkgs-serve/Cargo.toml;
+      cargo_toml = builtins.readFile ../Cargo.toml;
       cargo_info = builtins.fromTOML cargo_toml;
     in
-    cargo_info.package.version;
+    cargo_info.workspace.package.version;
 
   cargoLock.lockFile = ../Cargo.lock;
   src = ../.;
