@@ -16,8 +16,8 @@ fn warn_insecure_token(url: &str, token: Option<&str>) {
         && !url.starts_with("http://[::1]")
     {
         tracing::warn!(
-            "Sending bearer token over plaintext HTTP to {url}. \
-             Consider using HTTPS to protect credentials."
+            "Sending bearer token over plaintext HTTP to {url}. Consider using HTTPS to protect \
+             credentials."
         );
     }
 }
