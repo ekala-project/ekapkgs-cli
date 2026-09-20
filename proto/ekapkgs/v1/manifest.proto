@@ -17,7 +17,9 @@ message PathManifestEntry {
   repeated string references = 4;
   // Standard nix narinfo signatures for backward compatibility.
   repeated string signatures = 5;
-  // Certificate-based signature (optional, alongside standard sigs).
+  // Certificate-based signatures (one per signing service for threshold policies).
+  repeated CertSignature cert_signatures = 15;
+  // Deprecated: single cert signature (kept for wire compat, use cert_signatures).
   CertSignature cert_signature = 6;
   // Content-addressed hash (if applicable).
   string ca = 7;

@@ -7,4 +7,6 @@ pub mod ekapkgs {
     }
 }
 
+pub mod signing;
+
 pub use ekapkgs::v1::*;

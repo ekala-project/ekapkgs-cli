@@ -42,3 +42,11 @@ message CertSignature {
   // 64 bytes ed25519 signature over the narinfo fingerprint.
   bytes signature = 2;
 }
+
+// Threshold signing policy: require k-of-n independent cert signatures.
+message ThresholdPolicy {
+  // Minimum number of valid signatures required.
+  uint32 threshold = 1;
+  // Certificates authorized to sign under this policy.
+  repeated SigningCertificate authorized_certs = 2;
+}
