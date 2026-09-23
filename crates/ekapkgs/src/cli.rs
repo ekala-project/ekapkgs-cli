@@ -1,4 +1,9 @@
 use clap::{Parser, Subcommand};
+#[allow(unused_imports)]
+use clap_complete::engine::ArgValueCompleter;
+
+#[allow(unused_imports)]
+use crate::completions as compl;
 
 #[derive(Parser)]
 #[command(
@@ -546,6 +551,20 @@ pub enum HomeCommand {
         extra: Vec<String>,
     },
 
+    /// Update flake inputs and rebuild the home configuration.
+    ///
+    /// Runs `nix flake update`, invalidates the store path index, and
+    /// rebuilds the home configuration with the updated inputs.
+    Update {
+        /// The installable for the home configuration.
+        #[arg(default_value = ".#config.system.build.home")]
+        installable: String,
+
+        /// Extra arguments passed through to nix build.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        extra: Vec<String>,
+    },
+
     /// List home configuration generations.
     Generations,
 
@@ -571,7 +590,7 @@ pub enum HomePackagesCommand {
     Add {
         /// Package names or attribute paths (e.g., `alacritty`,
         /// `python311Packages.requests`).
-        #[arg(required = true)]
+        #[arg(required = true, add = ArgValueCompleter::new(compl::complete_packages))]
         packages: Vec<String>,
 
         /// Flake to resolve packages from (overrides manifest default).
@@ -582,6 +601,25 @@ pub enum HomePackagesCommand {
     /// Remove packages from the home configuration.
     Remove {
         /// Package names to remove.
+        #[arg(required = true, add = ArgValueCompleter::new(compl::complete_home_pkgs))]
+        packages: Vec<String>,
+    },
+
+    /// Check if packages are present (in manifest or on PATH).
+    ///
+    /// Exits with code 0 if all packages are present, 1 otherwise.
+    /// Checks the manifest first, then falls back to PATH lookup.
+    Present {
+        /// Package names to check.
+        #[arg(required = true)]
+        packages: Vec<String>,
+    },
+
+    /// Check if packages are missing (not in manifest and not on PATH).
+    ///
+    /// Exits with code 0 if all packages are missing, 1 otherwise.
+    Missing {
+        /// Package names to check.
         #[arg(required = true)]
         packages: Vec<String>,
     },
@@ -616,6 +654,7 @@ pub enum HomeServicesCommand {
     /// Add a service to the manifest and activate it.
     Add {
         /// Service name (e.g., `openssh`, `my-api`).
+        #[arg(add = ArgValueCompleter::new(compl::complete_services))]
         service: String,
 
         /// Flake to resolve the service package from.
@@ -635,7 +674,7 @@ pub enum HomeServicesCommand {
     /// Remove services from the manifest, stop and uninstall them.
     Remove {
         /// Service names to remove.
-        #[arg(required = true)]
+        #[arg(required = true, add = ArgValueCompleter::new(compl::complete_home_svcs))]
         services: Vec<String>,
 
         /// Only update the manifest without stopping or uninstalling.
@@ -919,6 +958,20 @@ pub enum SystemCommand {
         dry_run: bool,
     },
 
+    /// Update flake inputs and rebuild the system configuration.
+    ///
+    /// Runs `nix flake update`, invalidates the store path index, and
+    /// rebuilds the system with the updated inputs.
+    Update {
+        /// The system configuration installable.
+        #[arg(default_value = ".#config.system.build.toplevel")]
+        installable: String,
+
+        /// Extra arguments passed through to nix build.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        extra: Vec<String>,
+    },
+
     /// Manage imperatively-installed system packages.
     Packages {
         #[command(subcommand)]
@@ -932,7 +985,7 @@ pub enum SystemPackagesCommand {
     Add {
         /// Package names or attribute paths (e.g., `htop`,
         /// `linuxPackages.perf`).
-        #[arg(required = true)]
+        #[arg(required = true, add = ArgValueCompleter::new(compl::complete_packages))]
         packages: Vec<String>,
 
         /// Flake to resolve packages from (overrides manifest default).
@@ -943,6 +996,24 @@ pub enum SystemPackagesCommand {
     /// Remove packages from the system.
     Remove {
         /// Package names to remove.
+        #[arg(required = true, add = ArgValueCompleter::new(compl::complete_system_pkgs))]
+        packages: Vec<String>,
+    },
+
+    /// Check if packages are present (in manifest or on PATH).
+    ///
+    /// Exits with code 0 if all packages are present, 1 otherwise.
+    Present {
+        /// Package names to check.
+        #[arg(required = true)]
+        packages: Vec<String>,
+    },
+
+    /// Check if packages are missing (not in manifest and not on PATH).
+    ///
+    /// Exits with code 0 if all packages are missing, 1 otherwise.
+    Missing {
+        /// Package names to check.
         #[arg(required = true)]
         packages: Vec<String>,
     },
@@ -986,7 +1057,7 @@ pub enum EnvCommand {
     /// Add packages to the directory environment.
     Add {
         /// Package names or attribute paths.
-        #[arg(required = true)]
+        #[arg(required = true, add = ArgValueCompleter::new(compl::complete_packages))]
         packages: Vec<String>,
 
         /// Flake to resolve packages from (overrides manifest default).
