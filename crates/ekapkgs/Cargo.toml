@@ -35,9 +35,9 @@ uuid.workspace = true
 zstd.workspace = true
 yansi.workspace = true
 dialoguer.workspace = true
+nucleo-matcher.workspace = true
 axum.workspace = true
 jiff.workspace = true
-nucleo-matcher.workspace = true
 which.workspace = true
 
 [lints]

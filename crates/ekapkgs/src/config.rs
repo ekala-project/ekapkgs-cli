@@ -65,6 +65,12 @@ pub struct Defaults {
     /// (e.g., `"github:omacom/omarchy-nix-pkgs"`).
     /// The channel name is appended as `/{channel}`.
     pub channel_url: Option<String>,
+
+    /// Base URL for downloading pre-built search indexes from CI.
+    /// When set, `ekapkgs search update` and first-use index
+    /// generation will try this URL before falling back to local
+    /// nix evaluation.
+    pub index_url: Option<String>,
 }
 
 impl Default for Defaults {
@@ -73,6 +79,7 @@ impl Default for Defaults {
             max_parallel_downloads: default_parallel(),
             channel_input: None,
             channel_url: None,
+            index_url: None,
         }
     }
 }
