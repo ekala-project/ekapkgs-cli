@@ -81,6 +81,7 @@ pub fn execute(command: SystemCommand) -> color_eyre::Result<()> {
             gc,
             dry_run,
         } => cmd_prune_boot_entries(&boot_mount, gc, dry_run),
+        SystemCommand::Update { installable, extra } => cmd_update(&installable, &extra),
         SystemCommand::Packages { command } => cmd_packages(command),
     }
 }
@@ -236,7 +237,54 @@ fn cmd_activate(
     }
 
     tracing::info!("System activation complete");
+
+    // Populate the store path index from the built closure.
+    populate_store_path_index(&system_path);
+
     Ok(())
+}
+
+fn cmd_update(installable: &str, extra: &[String]) -> color_eyre::Result<()> {
+    // Update flake inputs.
+    tracing::info!("Updating flake inputs...");
+    NixCommand::new(&["flake", "update"]).stream()?;
+
+    // Invalidate the store path index.
+    if let Ok(mut index) = crate::store_path_index::StorePathIndex::load() {
+        index.invalidate();
+        let _ = index.save();
+        tracing::info!("Store path index invalidated");
+    }
+
+    // Rebuild and activate.
+    cmd_activate(installable, "switch", false, extra)
+}
+
+/// Populate the store path index from the closure of a built store path.
+fn populate_store_path_index(store_path: &str) {
+    let inst = Installable::new(store_path);
+    match ekapkgs_nix::store::closure_path_info(&inst) {
+        Ok(entries) => {
+            let paths: Vec<String> = entries.into_iter().map(|e| e.path).collect();
+            match crate::store_path_index::StorePathIndex::load() {
+                Ok(mut index) => {
+                    index.populate_from_closure(&paths);
+                    if let Err(e) = index.save() {
+                        tracing::warn!("Failed to save store path index: {e}");
+                    } else {
+                        tracing::info!(
+                            "Updated store path index ({} entries)",
+                            index.entries.len()
+                        );
+                    }
+                },
+                Err(e) => tracing::warn!("Failed to load store path index: {e}"),
+            }
+        },
+        Err(e) => {
+            tracing::debug!("Could not populate store path index: {e}");
+        },
+    }
 }
 
 fn cmd_build(installable: &str, extra: &[String]) -> color_eyre::Result<()> {
@@ -648,6 +696,8 @@ fn cmd_packages(command: SystemPackagesCommand) -> color_eyre::Result<()> {
             cmd_packages_add(&packages, flake.as_deref())
         },
         SystemPackagesCommand::Remove { packages } => cmd_packages_remove(&packages),
+        SystemPackagesCommand::Present { packages } => cmd_packages_present(&packages),
+        SystemPackagesCommand::Missing { packages } => cmd_packages_missing(&packages),
         SystemPackagesCommand::List { json } => cmd_packages_list(json),
         SystemPackagesCommand::Export { output } => cmd_packages_export(output.as_deref()),
         SystemPackagesCommand::Import { file, merge } => cmd_packages_import(&file, merge),
@@ -656,7 +706,12 @@ fn cmd_packages(command: SystemPackagesCommand) -> color_eyre::Result<()> {
 
 fn cmd_packages_add(packages: &[String], flake_override: Option<&str>) -> color_eyre::Result<()> {
     let (mut manifest, _lock) = SystemPackages::load_locked()?;
+    let mut index = crate::store_path_index::StorePathIndex::load()?;
     let mut added = 0u32;
+
+    let effective_flake = flake_override
+        .map(str::to_owned)
+        .unwrap_or_else(|| manifest.flake.clone());
 
     for name in packages {
         if manifest.packages.iter().any(|p| p.name == *name) {
@@ -664,14 +719,17 @@ fn cmd_packages_add(packages: &[String], flake_override: Option<&str>) -> color_
             continue;
         }
 
+        // Validate the package name against the search index.
+        crate::package_validate::validate_package_name(name, &effective_flake)?;
+
         let entry = SystemPackageEntry {
             name: name.clone(),
             flake: flake_override.map(str::to_owned),
         };
         let installable = manifest.resolve_installable(&entry);
 
-        // Install to the nix profile first — only record in the manifest
-        // after the profile mutation succeeds.
+        // System packages still use nix profile install (requires sudo),
+        // but we validate first and cache the result.
         tracing::info!("Installing {installable}...");
         let status = Command::new("sudo")
             .arg("nix")
@@ -692,7 +750,19 @@ fn cmd_packages_add(packages: &[String], flake_override: Option<&str>) -> color_
             ));
         }
 
-        // Profile install succeeded — now record in the manifest.
+        // Cache in the store path index for next time.
+        let outputs: Result<Vec<BuildOutput>, _> = NixCommand::new(&["build"])
+            .arg(&installable)
+            .arg("--no-link")
+            .arg("--json")
+            .json();
+        if let Ok(outputs) = outputs {
+            if let Some(store_path) = outputs.first().and_then(|o| o.outputs.get("out")) {
+                index.add_from_build_output(name, store_path);
+                let _ = index.save();
+            }
+        }
+
         manifest.add(entry);
         manifest.save()?;
         added += 1;
@@ -749,6 +819,37 @@ fn cmd_packages_remove(packages: &[String]) -> color_eyre::Result<()> {
         println!("Removed {removed} package(s)");
     }
 
+    Ok(())
+}
+
+/// Check if all packages are present.
+fn cmd_packages_present(packages: &[String]) -> color_eyre::Result<()> {
+    let manifest = SystemPackages::load()?;
+
+    for name in packages {
+        if manifest.packages.iter().any(|p| p.name == *name) {
+            continue;
+        }
+        if which::which(name).is_ok() {
+            continue;
+        }
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+/// Check if all packages are missing.
+fn cmd_packages_missing(packages: &[String]) -> color_eyre::Result<()> {
+    let manifest = SystemPackages::load()?;
+
+    for name in packages {
+        if manifest.packages.iter().any(|p| p.name == *name) {
+            std::process::exit(1);
+        }
+        if which::which(name).is_ok() {
+            std::process::exit(1);
+        }
+    }
     Ok(())
 }
 

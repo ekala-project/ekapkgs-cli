@@ -14,6 +14,7 @@ pub fn execute(command: HomeCommand) -> color_eyre::Result<()> {
     match command {
         HomeCommand::Switch { installable, extra } => cmd_switch(&installable, &extra),
         HomeCommand::Build { installable, extra } => cmd_build(&installable, &extra),
+        HomeCommand::Update { installable, extra } => cmd_update(&installable, &extra),
         HomeCommand::Generations => cmd_generations(),
         HomeCommand::Rollback => cmd_rollback(),
         HomeCommand::Packages { command } => cmd_packages(command),
@@ -79,7 +80,37 @@ fn cmd_switch(installable: &str, extra: &[String]) -> color_eyre::Result<()> {
     }
 
     tracing::info!("Home configuration activated");
+
+    // Populate the store path index from the built closure.
+    populate_store_path_index(&store_path);
+
+    // Reconcile the symlink directory after apply.
+    reconcile_symlink_dir();
+
+    // Check if a re-apply was requested during this build.
+    if crate::background_apply::check_and_clear_pending().unwrap_or(false) {
+        tracing::info!("Re-apply requested during build, scheduling...");
+        let _ = crate::background_apply::schedule_home_apply();
+    }
+
     Ok(())
+}
+
+fn cmd_update(installable: &str, extra: &[String]) -> color_eyre::Result<()> {
+    // Update flake inputs.
+    tracing::info!("Updating flake inputs...");
+    NixCommand::new(&["flake", "update"]).stream()?;
+
+    // Invalidate the store path index — new nixpkgs pin means different
+    // store paths.
+    if let Ok(mut index) = crate::store_path_index::StorePathIndex::load() {
+        index.invalidate();
+        let _ = index.save();
+        tracing::info!("Store path index invalidated");
+    }
+
+    // Rebuild and activate.
+    cmd_switch(installable, extra)
 }
 
 fn cmd_rollback() -> color_eyre::Result<()> {
@@ -229,6 +260,8 @@ fn cmd_packages(command: HomePackagesCommand) -> color_eyre::Result<()> {
             cmd_packages_add(&packages, flake.as_deref())
         },
         HomePackagesCommand::Remove { packages } => cmd_packages_remove(&packages),
+        HomePackagesCommand::Present { packages } => cmd_packages_present(&packages),
+        HomePackagesCommand::Missing { packages } => cmd_packages_missing(&packages),
         HomePackagesCommand::List { json } => cmd_packages_list(json),
         HomePackagesCommand::Export { output } => cmd_packages_export(output.as_deref()),
         HomePackagesCommand::Import { file, merge } => cmd_packages_import(&file, merge),
@@ -241,10 +274,21 @@ fn packages_profile_path() -> color_eyre::Result<String> {
     Ok(format!("{home}/{PACKAGES_PROFILE}"))
 }
 
+fn packages_dir() -> color_eyre::Result<std::path::PathBuf> {
+    let home = std::env::var("HOME")
+        .map_err(|_| color_eyre::eyre::eyre!("HOME environment variable not set"))?;
+    Ok(std::path::PathBuf::from(home).join(PACKAGES_PROFILE))
+}
+
 fn cmd_packages_add(packages: &[String], flake_override: Option<&str>) -> color_eyre::Result<()> {
     let (mut manifest, _lock) = HomePackages::load_locked()?;
-    let profile = packages_profile_path()?;
+    let packages_dir = packages_dir()?;
+    let mut index = crate::store_path_index::StorePathIndex::load()?;
     let mut added = 0u32;
+
+    let effective_flake = flake_override
+        .map(str::to_owned)
+        .unwrap_or_else(|| manifest.flake.clone());
 
     for name in packages {
         if manifest.packages.iter().any(|p| p.name == *name) {
@@ -252,28 +296,62 @@ fn cmd_packages_add(packages: &[String], flake_override: Option<&str>) -> color_
             continue;
         }
 
+        // Validate the package name against the search index.
+        crate::package_validate::validate_package_name(name, &effective_flake)?;
+
         let entry = HomePackageEntry {
             name: name.clone(),
             flake: flake_override.map(str::to_owned),
         };
+
+        // Compute the installable before mutating manifest.
         let installable = manifest.resolve_installable(&entry);
 
-        // Install to the nix profile first — only add to the manifest
-        // after the profile mutation succeeds.  This avoids a state where
-        // the manifest claims a package exists but the profile doesn't
-        // have it (e.g. if the install fails or the process is killed
-        // between manifest.save and profile install).
-        tracing::info!("Installing {installable}...");
-        NixCommand::new(&["profile", "install"])
-            .arg("--profile")
-            .arg(&profile)
-            .arg(&installable)
-            .stream()?;
+        // Fast path: check the store path index.
+        if let Some(idx_entry) = index.lookup(name) {
+            if crate::store_path_index::StorePathIndex::path_exists_locally(&idx_entry.store_path) {
+                // Sub-millisecond: create symlinks directly.
+                tracing::info!("Installing {name} (cached)...");
+                crate::symlink_dir::create_package_symlinks(&packages_dir, &idx_entry.store_path)?;
+                manifest.add(entry);
+                manifest.save()?;
+                added += 1;
 
-        // Profile install succeeded — now record in the manifest.
+                // Schedule debounced background apply.
+                let _ = crate::background_apply::schedule_home_apply();
+                continue;
+            }
+        }
+
+        // Slow path: resolve via nix build.
+        tracing::info!("Installing {installable}...");
+
+        let outputs: Vec<BuildOutput> = NixCommand::new(&["build"])
+            .arg(&installable)
+            .arg("--no-link")
+            .arg("--json")
+            .json()?;
+
+        let store_path = outputs
+            .first()
+            .and_then(|o| o.outputs.get("out").cloned())
+            .ok_or_else(|| {
+                color_eyre::eyre::eyre!("nix build produced no output for {installable}")
+            })?;
+
+        // Create symlinks from the resolved store path.
+        crate::symlink_dir::create_package_symlinks(&packages_dir, &store_path)?;
+
+        // Cache the mapping for next time.
+        index.add_from_build_output(name, &store_path);
+        let _ = index.save();
+
         manifest.add(entry);
         manifest.save()?;
         added += 1;
+
+        // Schedule debounced background apply.
+        let _ = crate::background_apply::schedule_home_apply();
     }
 
     if added > 0 {
@@ -283,7 +361,7 @@ fn cmd_packages_add(packages: &[String], flake_override: Option<&str>) -> color_
         );
 
         // Hint about PATH on first use.
-        let profile_bin = format!("{profile}/bin");
+        let profile_bin = format!("{}/bin", packages_dir.display());
         if let Ok(path) = std::env::var("PATH") {
             if !path.contains(&profile_bin) {
                 println!(
@@ -303,7 +381,8 @@ fn cmd_packages_add(packages: &[String], flake_override: Option<&str>) -> color_
 
 fn cmd_packages_remove(packages: &[String]) -> color_eyre::Result<()> {
     let (mut manifest, _lock) = HomePackages::load_locked()?;
-    let profile = packages_profile_path()?;
+    let packages_dir = packages_dir()?;
+    let index = crate::store_path_index::StorePathIndex::load()?;
     let mut removed = 0u32;
 
     for name in packages {
@@ -312,15 +391,10 @@ fn cmd_packages_remove(packages: &[String]) -> color_eyre::Result<()> {
             continue;
         }
 
-        tracing::info!("Removing {name} from profile...");
-        // `nix profile remove` accepts a regex matching the package name.
-        if let Err(e) = NixCommand::new(&["profile", "remove"])
-            .arg("--profile")
-            .arg(&profile)
-            .arg(name)
-            .stream()
-        {
-            tracing::warn!("Failed to remove {name} from nix profile: {e}");
+        // Remove symlinks from the packages directory (instant).
+        if let Some(idx_entry) = index.lookup(name) {
+            let _ =
+                crate::symlink_dir::remove_package_symlinks(&packages_dir, &idx_entry.store_path);
         }
 
         removed += 1;
@@ -330,8 +404,49 @@ fn cmd_packages_remove(packages: &[String]) -> color_eyre::Result<()> {
 
     if removed > 0 {
         println!("Removed {removed} package(s)");
+
+        // Schedule debounced background apply.
+        let _ = crate::background_apply::schedule_home_apply();
     }
 
+    Ok(())
+}
+
+/// Check if all packages are present. Exits with code 0 if yes, 1 if any
+/// are missing. Checks manifest first, then PATH.
+fn cmd_packages_present(packages: &[String]) -> color_eyre::Result<()> {
+    let manifest = HomePackages::load()?;
+
+    for name in packages {
+        // 1. In the imperative manifest?
+        if manifest.packages.iter().any(|p| p.name == *name) {
+            continue;
+        }
+        // 2. Binary on PATH? Catches declaratively-installed packages.
+        if which::which(name).is_ok() {
+            continue;
+        }
+        // Not found anywhere.
+        std::process::exit(1);
+    }
+    // All present.
+    Ok(())
+}
+
+/// Check if all packages are missing. Exits with code 0 if all are missing,
+/// 1 if any are present.
+fn cmd_packages_missing(packages: &[String]) -> color_eyre::Result<()> {
+    let manifest = HomePackages::load()?;
+
+    for name in packages {
+        if manifest.packages.iter().any(|p| p.name == *name) {
+            std::process::exit(1);
+        }
+        if which::which(name).is_ok() {
+            std::process::exit(1);
+        }
+    }
+    // All missing.
     Ok(())
 }
 
@@ -891,18 +1006,19 @@ fn build_services_nix_expr(manifest: &HomeServices) -> color_eyre::Result<String
             continue;
         }
         let nix_config = toml_table_to_nix(&entry.config);
+        let escaped_name = escape_nix_string(&entry.name);
         service_defs.push(format!(
-            r#"    "{name}" = {{ enable = true; {config} }};"#,
-            name = entry.name,
+            r#"    "{escaped_name}" = {{ enable = true; {config} }};"#,
             config = nix_config,
         ));
     }
     let services_attrset = service_defs.join("\n");
 
+    let escaped_flake_ref = escape_nix_string(&flake_ref);
     let expr = format!(
         r#"
 let
-  flake = builtins.getFlake "{flake_ref}";
+  flake = builtins.getFlake "{escaped_flake_ref}";
   system = builtins.currentSystem;
   pkgs = flake.legacyPackages.${{system}}
          or flake.pkgs.${{system}}
@@ -928,9 +1044,9 @@ in merged
                 if !entry.enable {
                     continue;
                 }
+                let escaped_name = escape_nix_string(&entry.name);
                 cmds.push(format!(
-                    r#"    cp ${{units."{name}"}}/{name}.service $out/{name}.service"#,
-                    name = entry.name,
+                    r#"    cp ${{units."{escaped_name}"}}/{escaped_name}.service $out/{escaped_name}.service"#,
                 ));
             }
             cmds.join("\n")
@@ -1619,6 +1735,58 @@ fn print_option_defs(options: &[crate::service_schema::OptionDef]) {
                 println!("    {}: {default}", "Default".dim());
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Store path index
+// ---------------------------------------------------------------------------
+
+/// Populate the store path index from the closure of a built store path.
+/// Called after successful `home switch` or `home update`.
+fn populate_store_path_index(store_path: &str) {
+    let inst = Installable::new(store_path);
+    match ekapkgs_nix::store::closure_path_info(&inst) {
+        Ok(entries) => {
+            let paths: Vec<String> = entries.into_iter().map(|e| e.path).collect();
+            match crate::store_path_index::StorePathIndex::load() {
+                Ok(mut index) => {
+                    index.populate_from_closure(&paths);
+                    if let Err(e) = index.save() {
+                        tracing::warn!("Failed to save store path index: {e}");
+                    } else {
+                        tracing::info!(
+                            "Updated store path index ({} entries)",
+                            index.entries.len()
+                        );
+                    }
+                },
+                Err(e) => tracing::warn!("Failed to load store path index: {e}"),
+            }
+        },
+        Err(e) => {
+            tracing::debug!("Could not populate store path index: {e}");
+        },
+    }
+}
+
+/// Reconcile the symlink directory after a successful home apply.
+/// Rebuilds the directory from the manifest + store path index so it
+/// exactly mirrors the TOML.
+fn reconcile_symlink_dir() {
+    let Ok(packages_dir) = packages_dir() else {
+        return;
+    };
+    let Ok(manifest) = HomePackages::load() else {
+        return;
+    };
+    let Ok(index) = crate::store_path_index::StorePathIndex::load() else {
+        return;
+    };
+
+    let names: Vec<String> = manifest.packages.iter().map(|p| p.name.clone()).collect();
+    if let Err(e) = crate::symlink_dir::rebuild_symlink_dir(&packages_dir, &index, &names) {
+        tracing::warn!("Failed to reconcile symlink directory: {e}");
     }
 }
 

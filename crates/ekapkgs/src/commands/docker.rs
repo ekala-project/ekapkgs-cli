@@ -148,11 +148,12 @@ fn installable_to_nix_expr(installable: &str) -> (String, String) {
         .unwrap_or(("nixpkgs", installable));
 
     // Resolve the flake reference to a nix expression.
+    let escaped_flake_ref = escape_nix_string(flake_ref);
     let flake_expr =
         if flake_ref == "." || flake_ref.starts_with("./") || flake_ref.starts_with('/') {
-            format!("builtins.getFlake \"path:{}\"", flake_ref)
+            format!("builtins.getFlake \"path:{escaped_flake_ref}\"")
         } else {
-            format!("builtins.getFlake \"{flake_ref}\"")
+            format!("builtins.getFlake \"{escaped_flake_ref}\"")
         };
 
     // Build the package expression.  Installables can be either a plain attribute
@@ -188,12 +189,13 @@ fn build_docker_expr(
 
     let entrypoint_nix = match entrypoint {
         Some(ep) => {
+            let escaped = escape_nix_string(ep);
             // If the entrypoint doesn't contain a slash, resolve it from the
             // package's bin directory.
             if ep.contains('/') {
-                format!("  config.Entrypoint = [ \"{ep}\" ];\n")
+                format!("  config.Entrypoint = [ \"{escaped}\" ];\n")
             } else {
-                format!("  config.Entrypoint = [ \"${{pkg}}/bin/{ep}\" ];\n")
+                format!("  config.Entrypoint = [ \"${{pkg}}/bin/{escaped}\" ];\n")
             }
         },
         None => String::new(),
@@ -201,11 +203,17 @@ fn build_docker_expr(
 
     let cmd_nix = match cmd {
         Some(args) if !args.is_empty() => {
-            let items: Vec<String> = args.iter().map(|a| format!("\"{a}\"")).collect();
+            let items: Vec<String> = args
+                .iter()
+                .map(|a| format!("\"{}\"", escape_nix_string(a)))
+                .collect();
             format!("  config.Cmd = [ {} ];\n", items.join(" "))
         },
         _ => String::new(),
     };
+
+    let escaped_name = escape_nix_string(name);
+    let escaped_tag = escape_nix_string(tag);
 
     format!(
         r#"
@@ -213,8 +221,8 @@ let
   pkgs = {nixpkgs_expr};
   pkg = {pkg_expr};
 in pkgs.dockerTools.streamLayeredImage {{
-  name = "{name}";
-  tag = "{tag}";
+  name = "{escaped_name}";
+  tag = "{escaped_tag}";
   contents = [ pkg ];
 {entrypoint_nix}{cmd_nix}}}
 "#
@@ -232,6 +240,15 @@ fn detect_main_program(installable: &str) -> Option<String> {
 
     let prog = String::from_utf8_lossy(&output.stdout).trim().to_owned();
     if prog.is_empty() { None } else { Some(prog) }
+}
+
+/// Escape a string for use inside nix double quotes.
+fn escape_nix_string(s: &str) -> String {
+    s.replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+        .replace('\t', "\\t")
+        .replace("${", "\\${")
 }
 
 /// Derive a Docker image name from a nix installable string.
