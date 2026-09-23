@@ -98,7 +98,7 @@ in
       socketConfig = {
         ListenStream =
           let
-            bind = cfg.settings.server.bind or "0.0.0.0:8080";
+            bind = cfg.settings.server.bind or "127.0.0.1:8080";
           in
           bind;
         ReusePort = true;
@@ -147,14 +147,27 @@ in
         ProtectClock = true;
         ProtectControlGroups = true;
         RestrictSUIDSGID = true;
-        RestrictAddressFamilies = [ "AF_UNIX" "AF_INET" "AF_INET6" ];
+        RestrictAddressFamilies = [
+          "AF_UNIX"
+          "AF_INET"
+          "AF_INET6"
+        ];
         LockPersonality = true;
         MemoryDenyWriteExecute = true;
-        SystemCallFilter = [ "@system-service" "~@privileged" "~@resources" ];
+        SystemCallFilter = [
+          "@system-service"
+          "~@privileged"
+          "~@resources"
+        ];
         CapabilityBoundingSet = "";
         LimitNOFILE = 65536;
         ProcSubset = "pid";
         ProtectProc = "invisible";
+        SystemCallArchitectures = "native";
+        RestrictNamespaces = true;
+        RestrictRealtime = true;
+        DevicePolicy = "closed";
+        UMask = "0077";
 
         ReadWritePaths = [
           "/nix/var/nix/daemon-socket"
@@ -165,7 +178,7 @@ in
 
     networking.firewall.allowedTCPPorts =
       let
-        port = cfg.settings.server.bind or "0.0.0.0:8080";
+        port = cfg.settings.server.bind or "127.0.0.1:8080";
         portNum = lib.toInt (lib.last (lib.splitString ":" port));
       in
       lib.mkIf cfg.openFirewall [ portNum ];

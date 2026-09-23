@@ -344,7 +344,7 @@ Server config:
 bind = "0.0.0.0:8080"
 
 [storage]
-backend = "filesystem"  # or "nix-store"
+backend = "filesystem"  # or "nix-store" or "castore"
 path = "/var/cache/ekapkgs"
 
 [storage.gc]
@@ -368,6 +368,11 @@ write_tokens = ["legacy-token-if-needed"]
   Supports LRU garbage collection with configurable size limits.
 - **nix-store** — serves directly from `/nix/store` via the nix daemon,
   like `nix-serve`. No cache directory needed.
+- **castore** — content-addressed storage with chunk-level deduplication.
+  Decomposes NARs into a blake3 Merkle tree of FastCDC chunks. Identical
+  file content across store paths is stored once. Clients negotiate at
+  the chunk level and download only data they don't already have locally.
+  Supports LRU garbage collection. Typical storage savings: 30-50%.
 
 ### Nix compatibility
 
