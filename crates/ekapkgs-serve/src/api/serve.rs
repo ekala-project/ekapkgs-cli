@@ -69,8 +69,22 @@ pub async fn get_serve(
     }
 }
 
+/// Maximum file size served via /serve/ (256 MiB).
+/// Files larger than this should be accessed via the NAR endpoint instead.
+const MAX_SERVE_FILE_SIZE: u64 = 256 * 1024 * 1024;
+
 /// Serve a single file with MIME type detection.
 fn serve_file(path: &std::path::Path) -> Response {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return not_found();
+    };
+    if meta.len() > MAX_SERVE_FILE_SIZE {
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "file too large for /serve/ endpoint",
+        )
+            .into_response();
+    }
     let Ok(data) = std::fs::read(path) else {
         return not_found();
     };

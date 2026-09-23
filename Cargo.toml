@@ -56,7 +56,7 @@ axum = "0.8"
 axum-server = { version = "0.7", features = ["tls-rustls"] }
 http-body-util = "0.1"
 tower = "0.5"
-tower-http = { version = "0.6", features = ["compression-zstd", "cors", "trace"] }
+tower-http = { version = "0.6", features = ["compression-zstd", "cors", "timeout", "trace"] }
 
 prost = "0.13"
 tonic = "0.12"

@@ -425,18 +425,6 @@ pub async fn get_nar(
     }
 }
 
-/// GET /nar/{outhash}-{narhash}.nar — nix-serve compatible NAR URL.
-///
-/// Extracts the outhash from the compound path segment and delegates to the
-/// standard NAR handler logic.
-pub async fn get_nar_compat(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Path(file): Path<String>,
-) -> Response {
-    get_nar(State(state), headers, Path(file)).await
-}
-
 /// Parse a `Range: bytes=start-end` header, returning `(start, end)` inclusive.
 ///
 /// Supports `bytes=N-` (from N to end) and `bytes=N-M` (from N to M inclusive).

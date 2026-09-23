@@ -25,14 +25,18 @@ pub struct ServerConfig {
     #[serde(default = "default_priority")]
     pub priority: u32,
     /// Client request timeout in seconds. Default: 30.
-    /// Reserved for future use with hyper server tuning.
     #[serde(default = "default_request_timeout")]
-    #[allow(dead_code)]
     pub client_request_timeout_secs: u64,
+    /// Expose /metrics endpoint. Default: true.
+    /// Set to false to disable the metrics endpoint entirely.
+    /// Consider binding to a separate internal address or using a reverse proxy
+    /// to restrict access to metrics in production.
+    #[serde(default = "default_true")]
+    pub enable_metrics: bool,
 }
 
 fn default_bind() -> String {
-    "0.0.0.0:8080".to_owned()
+    "127.0.0.1:8080".to_owned()
 }
 
 fn default_priority() -> u32 {

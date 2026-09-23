@@ -24,7 +24,10 @@ pub async fn negotiate_with_target(
     have: Vec<String>,
     target: Option<&str>,
 ) -> color_eyre::Result<NegotiateResponse> {
-    let mut client = CacheServiceClient::connect(server_url.to_owned()).await?;
+    let mut client = CacheServiceClient::connect(server_url.to_owned())
+        .await?
+        .max_decoding_message_size(64 * 1024 * 1024)
+        .max_encoding_message_size(64 * 1024 * 1024);
 
     let request = tonic::Request::new(NegotiateRequest {
         want,
@@ -40,6 +43,7 @@ pub async fn negotiate_with_target(
 }
 
 /// Send a chunk-level negotiate request to the ekapkgs cache server.
+#[allow(dead_code)]
 pub async fn negotiate_chunks(
     server_url: &str,
     want: Vec<String>,
@@ -72,7 +76,10 @@ pub async fn stream_nars(
     server_url: &str,
     path_hashes: Vec<String>,
 ) -> color_eyre::Result<tonic::Streaming<NarChunk>> {
-    let mut client = CacheServiceClient::connect(server_url.to_owned()).await?;
+    let mut client = CacheServiceClient::connect(server_url.to_owned())
+        .await?
+        .max_decoding_message_size(64 * 1024 * 1024)
+        .max_encoding_message_size(64 * 1024 * 1024);
 
     let request = tonic::Request::new(StreamNarsRequest { path_hashes });
     let response = client.stream_nars(request).await?;

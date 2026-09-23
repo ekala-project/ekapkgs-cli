@@ -65,19 +65,6 @@ pub async fn put_chunk(
         .as_any()
         .downcast_ref::<crate::storage::castore::CastoreBackend>()
     {
-        match castore.get_chunk_by_digest(&expected_digest) {
-            Ok(Some(_)) => {
-                // Already exists.
-                return (StatusCode::OK, "ok").into_response();
-            },
-            Ok(None) => {},
-            Err(e) => {
-                tracing::error!("chunk check failed: {e}");
-                return (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response();
-            },
-        }
-
-        // Store it using the internal method which handles both file and DB.
         match castore.store_chunk_external(&body) {
             Ok(_) => (StatusCode::OK, "ok").into_response(),
             Err(e) => {

@@ -1,8 +1,6 @@
 pub mod castore;
 pub mod filesystem;
 pub mod nix_store;
-#[cfg(feature = "s3")]
-pub mod s3;
 
 /// Parsed narinfo metadata.
 #[derive(Debug, Clone)]
@@ -86,26 +84,13 @@ impl NarInfo {
             }
         }
 
-        let store_path = store_path?;
-        let nar_hash = nar_hash?;
-
-        // StorePath must be under /nix/store/.
-        if !store_path.starts_with("/nix/store/") {
-            return None;
-        }
-
-        // NarHash must have a recognized algorithm prefix.
-        if !nar_hash.starts_with("sha256:") && !nar_hash.starts_with("sha512:") {
-            return None;
-        }
-
         Some(NarInfo {
-            store_path,
+            store_path: store_path?,
             url: url?,
             compression: compression.unwrap_or_else(|| "none".to_owned()),
             file_hash: file_hash.unwrap_or_default(),
             file_size: file_size.unwrap_or(0),
-            nar_hash,
+            nar_hash: nar_hash?,
             nar_size: nar_size?,
             references,
             deriver,

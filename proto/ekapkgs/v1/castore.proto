@@ -23,6 +23,7 @@ message CaNode {
 
 message CaDirectoryNode {
   B3Digest digest = 1;
+  // Number of direct child entries in this directory.
   uint64 size = 2;
 }
 

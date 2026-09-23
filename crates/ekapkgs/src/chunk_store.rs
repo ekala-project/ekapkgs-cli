@@ -230,6 +230,7 @@ impl ChunkStore {
                     });
                 }
 
+                entries.sort_by(|a, b| a.name.cmp(&b.name));
                 Ok(NarNode::Directory { entries })
             },
 
@@ -305,6 +306,129 @@ impl ChunkStore {
         Ok(())
     }
 
+    /// Return total bytes stored in chunks.
+    pub fn total_chunk_bytes(&self) -> color_eyre::Result<u64> {
+        let db = self.db.lock().expect("db lock");
+        let total: i64 = db.query_row("SELECT COALESCE(SUM(size), 0) FROM chunks", [], |row| {
+            row.get(0)
+        })?;
+        Ok(total as u64)
+    }
+
+    /// Evict oldest CAS path entries until total chunk size is under
+    /// `target_bytes`. Returns the number of bytes freed.
+    pub fn evict_to_size(&self, target_bytes: u64) -> color_eyre::Result<u64> {
+        let current = self.total_chunk_bytes()?;
+        if current <= target_bytes {
+            return Ok(0);
+        }
+
+        let db = self.db.lock().expect("db lock");
+
+        // Load paths ordered by age (oldest first).
+        let mut stmt = db.prepare("SELECT hash FROM cas_paths ORDER BY added_at ASC")?;
+        let hashes: Vec<String> = stmt
+            .query_map([], |row| row.get(0))?
+            .filter_map(std::result::Result::ok)
+            .collect();
+        drop(stmt);
+
+        let mut total_freed: u64 = 0;
+        let to_free = current - target_bytes;
+
+        for hash in &hashes {
+            if total_freed >= to_free {
+                break;
+            }
+
+            let tx = db.unchecked_transaction()?;
+
+            // Collect file digests for this path's root node.
+            let root_bytes: Option<Vec<u8>> = tx
+                .query_row(
+                    "SELECT root_node FROM cas_paths WHERE hash = ?1",
+                    params![hash],
+                    |row| row.get(0),
+                )
+                .ok();
+
+            let Some(root_bytes) = root_bytes else {
+                continue;
+            };
+
+            // Collect file digests from the tree.
+            let mut file_digests = Vec::new();
+            if let Ok(root_node) = CaNode::decode(root_bytes.as_slice()) {
+                collect_file_digests(&root_node, &db, &mut file_digests);
+            }
+
+            // Delete the cas_paths row.
+            tx.execute("DELETE FROM cas_paths WHERE hash = ?1", params![hash])?;
+
+            // Collect chunk digests, then clean up orphans.
+            let mut chunk_digests = Vec::new();
+            for file_digest in &file_digests {
+                let mut cstmt =
+                    tx.prepare("SELECT chunk_digest FROM file_chunks WHERE file_digest = ?1")?;
+                let chunks: Vec<Vec<u8>> = cstmt
+                    .query_map(params![file_digest.as_slice()], |row| row.get(0))?
+                    .filter_map(std::result::Result::ok)
+                    .collect();
+                drop(cstmt);
+                for c in chunks {
+                    if let Ok(d) = <[u8; 32]>::try_from(c.as_slice()) {
+                        chunk_digests.push(d);
+                    }
+                }
+
+                // Check if this file_digest is still referenced by another path.
+                let still_used: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM cas_paths WHERE hash != ?1)",
+                    params![hash],
+                    |row| row.get(0),
+                )?;
+                if !still_used {
+                    tx.execute(
+                        "DELETE FROM file_chunks WHERE file_digest = ?1",
+                        params![file_digest.as_slice()],
+                    )?;
+                }
+            }
+
+            // Delete orphaned chunks.
+            for chunk_digest in &chunk_digests {
+                let still_ref: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM file_chunks WHERE chunk_digest = ?1)",
+                    params![chunk_digest.as_slice()],
+                    |row| row.get(0),
+                )?;
+                if !still_ref {
+                    let size: Option<i64> = tx
+                        .query_row(
+                            "SELECT size FROM chunks WHERE digest = ?1",
+                            params![chunk_digest.as_slice()],
+                            |row| row.get(0),
+                        )
+                        .ok();
+                    tx.execute(
+                        "DELETE FROM chunks WHERE digest = ?1",
+                        params![chunk_digest.as_slice()],
+                    )?;
+                    if let Some(s) = size {
+                        total_freed += s as u64;
+                    }
+                    let hex = hex_encode(chunk_digest);
+                    let path = self.chunk_path(&hex);
+                    let _ = std::fs::remove_file(path);
+                }
+            }
+
+            tx.commit()?;
+        }
+
+        Ok(total_freed)
+    }
+
     fn chunk_path(&self, hex: &str) -> PathBuf {
         let prefix = &hex[..4.min(hex.len())];
         self.root
@@ -351,6 +475,45 @@ fn create_tables(conn: &Connection) -> color_eyre::Result<()> {
 
 fn hex_encode(bytes: &[u8; 32]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Recursively collect file digests from a CaNode tree.
+fn collect_file_digests(ca_node: &CaNode, db: &Connection, out: &mut Vec<[u8; 32]>) {
+    let Some(node) = ca_node.node.as_ref() else {
+        return;
+    };
+    match node {
+        ekapkgs_protocol::ekapkgs::v1::ca_node::Node::File(file) => {
+            if let Some(digest) = &file.digest {
+                if let Ok(d) = <[u8; 32]>::try_from(digest.digest.as_slice()) {
+                    out.push(d);
+                }
+            }
+        },
+        ekapkgs_protocol::ekapkgs::v1::ca_node::Node::Directory(dir) => {
+            if let Some(digest) = &dir.digest {
+                if let Ok(d) = <[u8; 32]>::try_from(digest.digest.as_slice()) {
+                    let data: Option<Vec<u8>> = db
+                        .query_row(
+                            "SELECT data FROM directories WHERE digest = ?1",
+                            params![d.as_slice()],
+                            |row| row.get(0),
+                        )
+                        .ok();
+                    if let Some(data) = data {
+                        if let Ok(ca_dir) = CaDirectory::decode(data.as_slice()) {
+                            for entry in &ca_dir.entries {
+                                if let Some(child) = &entry.node {
+                                    collect_file_digests(child, db, out);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        ekapkgs_protocol::ekapkgs::v1::ca_node::Node::Symlink(_) => {},
+    }
 }
 
 #[cfg(test)]

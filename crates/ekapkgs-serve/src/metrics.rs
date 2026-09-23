@@ -36,6 +36,13 @@ pub struct Metrics {
     pub cache_size_bytes: IntGauge,
     pub cache_paths_total: IntGauge,
 
+    // CAS dedup
+    pub cas_chunks_total: IntGauge,
+    pub cas_chunks_bytes_total: IntGauge,
+    pub cas_paths_total: IntGauge,
+    pub cas_push_chunks_new: IntCounter,
+    pub cas_push_chunks_existing: IntCounter,
+
     // HTTP request metrics
     pub http_requests_total: IntCounterVec,
     pub http_request_duration_seconds: HistogramVec,
@@ -148,6 +155,41 @@ impl Metrics {
         )
         .expect("metric");
 
+        let cas_chunks_total = register_int_gauge_with_registry!(
+            "ekapkgs_cas_chunks_total",
+            "Total chunks in CAS store",
+            registry
+        )
+        .expect("metric");
+
+        let cas_chunks_bytes_total = register_int_gauge_with_registry!(
+            "ekapkgs_cas_chunks_bytes_total",
+            "Total bytes in CAS chunk store",
+            registry
+        )
+        .expect("metric");
+
+        let cas_paths_total = register_int_gauge_with_registry!(
+            "ekapkgs_cas_paths_total",
+            "Total CAS paths stored",
+            registry
+        )
+        .expect("metric");
+
+        let cas_push_chunks_new = register_int_counter_with_registry!(
+            "ekapkgs_cas_push_chunks_new",
+            "New chunks stored on push",
+            registry
+        )
+        .expect("metric");
+
+        let cas_push_chunks_existing = register_int_counter_with_registry!(
+            "ekapkgs_cas_push_chunks_existing",
+            "Chunks already present on push (deduplicated)",
+            registry
+        )
+        .expect("metric");
+
         let http_requests_total = register_int_counter_vec_with_registry!(
             "ekapkgs_http_requests_total",
             "Total HTTP requests by method, path, and status",
@@ -185,6 +227,11 @@ impl Metrics {
             gc_bytes_freed_total,
             cache_size_bytes,
             cache_paths_total,
+            cas_chunks_total,
+            cas_chunks_bytes_total,
+            cas_paths_total,
+            cas_push_chunks_new,
+            cas_push_chunks_existing,
             http_requests_total,
             http_request_duration_seconds,
         }

@@ -114,6 +114,7 @@ pub async fn cas_pull(
             .collect::<Vec<_>>()
             .await;
 
+        let mut any_failed = false;
         for result in results {
             match result {
                 Ok((digest, data, size)) => {
@@ -122,11 +123,17 @@ pub async fn cas_pull(
                 },
                 Err(e) => {
                     tracing::warn!("Chunk download failed: {e}");
+                    any_failed = true;
                 },
             }
         }
 
         bar.finish_and_clear();
+
+        if any_failed {
+            tracing::warn!("Some chunks failed to download, falling back to NAR streaming");
+            return Ok(false);
+        }
     } else {
         tracing::info!("All chunks already available locally");
     }
@@ -178,6 +185,17 @@ pub async fn cas_pull(
         // Serialize to NAR bytes.
         let nar_bytes = write_nar(&nar_node);
 
+        // Verify the reassembled NAR hash matches the expected hash from the
+        // manifest. This catches corrupted chunks, incorrect file-chunk
+        // mappings, or any other reassembly errors.
+        if !verify_nar_hash(&nar_bytes, &entry.nar_hash) {
+            tracing::warn!(
+                "NAR hash mismatch for {hash} after CAS reassembly, skipping (will fall back)"
+            );
+            reassembly_bar.inc(1);
+            continue;
+        }
+
         // Write NAR file to staging.
         let nar_path = staging_dir.path().join(&entry.url);
         if let Some(parent) = nar_path.parent() {
@@ -211,5 +229,28 @@ pub async fn cas_pull(
         }
     }
 
+    // 9. Evict old chunks if the local store exceeds the size limit.
+    const DEFAULT_MAX_CACHE_BYTES: u64 = 10 * 1024 * 1024 * 1024; // 10 GiB
+    let target = DEFAULT_MAX_CACHE_BYTES * 4 / 5; // evict to 80%
+    if let Ok(freed) = store.evict_to_size(target) {
+        if freed > 0 {
+            tracing::info!("Evicted {freed} bytes from local chunk cache");
+        }
+    }
+
     Ok(true)
+}
+
+/// Verify that the sha256 hash of `nar_bytes` matches the expected
+/// `nar_hash` string (format: `sha256:hexdigest`).
+fn verify_nar_hash(nar_bytes: &[u8], expected: &str) -> bool {
+    let Some(expected_hex) = expected.strip_prefix("sha256:") else {
+        // Unknown hash algorithm — skip verification rather than rejecting.
+        return true;
+    };
+
+    use sha2::Digest;
+    let actual = sha2::Sha256::digest(nar_bytes);
+    let actual_hex: String = actual.iter().map(|b| format!("{b:02x}")).collect();
+    actual_hex == expected_hex
 }
