@@ -247,10 +247,6 @@ fn build_http_router(
                 .put(api::upload::put_nar)
                 .layer(DefaultBodyLimit::max(NAR_BODY_LIMIT)),
         )
-        .route(
-            "/nar/{outhash}-{narhash}.nar",
-            get(api::compat::get_nar_compat).layer(DefaultBodyLimit::max(NAR_BODY_LIMIT)),
-        )
         .route("/serve/{hash}/{*tail}", get(api::serve::get_serve))
         .route("/log/{drv}", get(api::logs::get_log))
         .route(

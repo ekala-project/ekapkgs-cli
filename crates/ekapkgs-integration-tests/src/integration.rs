@@ -9,6 +9,31 @@ use std::process::{Child, Command, Stdio};
 
 use tempfile::TempDir;
 
+// Valid 32-character nix base32 hashes for tests.
+// Nix base32 alphabet: 0123456789abcdfghijklmnpqrsvwxyz (no e, o, t, u)
+const HASH_ABC: &str = "abc123abc123abc123abc123abc123ab";
+const HASH_XYZ: &str = "xyz789xyz789xyz789xyz789xyz789xz";
+const HASH_AAA: &str = "aaa111aaa111aaa111aaa111aaa111aa";
+const HASH_HEAD: &str = "h3ad123h3ad123h3ad123h3ad123h3ad";
+const HASH_MULTI: &str = "m111222m111222m111222m111222m111";
+const HASH_MULTI2: &str = "m222333m222333m222333m222333m222";
+const HASH_CAS: &str = "cas111cas111cas111cas111cas111ca";
+const HASH_CHK: &str = "chk111chk111chk111chk111chk111ch";
+const HASH_MISS: &str = "n0n3x1n0n3x1n0n3x1n0n3x1n0n3x1nn"; // valid format but not in cache
+const HASH_MISS2: &str = "m1ss1ngm1ss1ngm1ss1ngm1ss1ngm1ss"; // valid format but not in cache
+const HASH_DEP: &str = "d3p111d3p111d3p111d3p111d3p111d3";
+const HASH_PKG: &str = "pkg222pkg222pkg222pkg222pkg222pk";
+const HASH_CAS2: &str = "cas222cas222cas222cas222cas222ca";
+const HASH_BIG: &str = "b1g111b1g111b1g111b1g111b1g111b1";
+const HASH_MET: &str = "m37111m37111m37111m37111m37111m3";
+const HASH_OLD: &str = "01d111x01d111x01d111x01d111x01d1";
+const HASH_NEW: &str = "n3w222n3w222n3w222n3w222n3w222n3";
+const HASH_DOLD: &str = "d01d1xd01d1xd01d1xd01d1xd01d1xd0";
+const HASH_DNEW: &str = "dn3w2xdn3w2xdn3w2xdn3w2xdn3w2xdn";
+const HASH_SOLD: &str = "s01d1xs01d1xs01d1xs01d1xs01d1xs0";
+const HASH_SNEW: &str = "sn3w2xsn3w2xsn3w2xsn3w2xsn3w2xsn";
+const HASH_AUTH: &str = "a111b2a111b2a111b2a111b2a111b2a1";
+
 /// Find the built binary in the target directory.
 fn cargo_bin(name: &str) -> PathBuf {
     let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -261,21 +286,21 @@ async fn test_narinfo_get_existing() {
 
     // Write a narinfo directly to the cache.
     server.write_narinfo(
-        "abc123",
-        "StorePath: /nix/store/abc123-hello-1.0\nURL: nar/abc123.nar\nCompression: none\nNarHash: \
-         sha256:deadbeef\nNarSize: 100\n",
+        HASH_ABC,
+        &format!("StorePath: /nix/store/{HASH_ABC}-hello-1.0\nURL: nar/{HASH_ABC}.nar\nCompression: none\nNarHash: \
+         sha256:deadbeef\nNarSize: 100\n"),
     );
 
     let client = reqwest::Client::new();
     let resp = client
-        .get(format!("{}/abc123.narinfo", server.base_url()))
+        .get(format!("{}/{HASH_ABC}.narinfo", server.base_url()))
         .send()
         .await
         .unwrap();
 
     assert_eq!(resp.status(), 200);
     let body = resp.text().await.unwrap();
-    assert!(body.contains("StorePath: /nix/store/abc123-hello-1.0"));
+    assert!(body.contains(&format!("StorePath: /nix/store/{HASH_ABC}-hello-1.0")));
     assert!(body.contains("NarHash: sha256:deadbeef"));
     // Should have been re-signed by the server.
     assert!(body.contains("Sig: test-cache-1:"));
@@ -287,7 +312,7 @@ async fn test_narinfo_get_missing() {
     let client = reqwest::Client::new();
 
     let resp = client
-        .get(format!("{}/nonexistent.narinfo", server.base_url()))
+        .get(format!("{}/{HASH_MISS}.narinfo", server.base_url()))
         .send()
         .await
         .unwrap();
@@ -300,11 +325,11 @@ async fn test_nar_get() {
     let server = TestServer::start();
 
     let nar_data = b"fake-nar-content-for-testing";
-    server.write_nar("abc123.nar", nar_data);
+    server.write_nar(&format!("{HASH_ABC}.nar"), nar_data);
 
     let client = reqwest::Client::new();
     let resp = client
-        .get(format!("{}/nar/abc123.nar", server.base_url()))
+        .get(format!("{}/nar/{HASH_ABC}.nar", server.base_url()))
         .send()
         .await
         .unwrap();
@@ -320,7 +345,7 @@ async fn test_nar_get_missing() {
     let client = reqwest::Client::new();
 
     let resp = client
-        .get(format!("{}/nar/nonexistent.nar", server.base_url()))
+        .get(format!("{}/nar/{HASH_MISS}.nar", server.base_url()))
         .send()
         .await
         .unwrap();
@@ -333,13 +358,13 @@ async fn test_push_narinfo_requires_auth() {
     let server = TestServer::start_with_tokens(&["ci"]);
     let client = reqwest::Client::new();
 
-    let narinfo = "StorePath: /nix/store/xyz789-pkg-1.0\nURL: nar/xyz789.nar\nCompression: \
-                   none\nNarHash: sha256:aabbccdd\nNarSize: 200\n";
+    let narinfo = format!("StorePath: /nix/store/{HASH_XYZ}-pkg-1.0\nURL: nar/{HASH_XYZ}.nar\nCompression: \
+                   none\nNarHash: sha256:aabbccdd\nNarSize: 200\n");
 
     // Without token — should fail.
     let resp = client
-        .put(format!("{}/xyz789.narinfo", server.base_url()))
-        .body(narinfo)
+        .put(format!("{}/{HASH_XYZ}.narinfo", server.base_url()))
+        .body(narinfo.clone())
         .send()
         .await
         .unwrap();
@@ -347,9 +372,9 @@ async fn test_push_narinfo_requires_auth() {
 
     // With wrong token — should fail.
     let resp = client
-        .put(format!("{}/xyz789.narinfo", server.base_url()))
+        .put(format!("{}/{HASH_XYZ}.narinfo", server.base_url()))
         .header("Authorization", "Bearer wrong_token")
-        .body(narinfo)
+        .body(narinfo.clone())
         .send()
         .await
         .unwrap();
@@ -357,9 +382,9 @@ async fn test_push_narinfo_requires_auth() {
 
     // With correct token — should succeed.
     let resp = client
-        .put(format!("{}/xyz789.narinfo", server.base_url()))
+        .put(format!("{}/{HASH_XYZ}.narinfo", server.base_url()))
         .header("Authorization", "Bearer test_token_ci")
-        .body(narinfo)
+        .body(narinfo.clone())
         .send()
         .await
         .unwrap();
@@ -367,13 +392,13 @@ async fn test_push_narinfo_requires_auth() {
 
     // Verify it's now readable.
     let resp = client
-        .get(format!("{}/xyz789.narinfo", server.base_url()))
+        .get(format!("{}/{HASH_XYZ}.narinfo", server.base_url()))
         .send()
         .await
         .unwrap();
     assert_eq!(resp.status(), 200);
     let body = resp.text().await.unwrap();
-    assert!(body.contains("StorePath: /nix/store/xyz789-pkg-1.0"));
+    assert!(body.contains(&format!("StorePath: /nix/store/{HASH_XYZ}-pkg-1.0")));
 }
 
 #[tokio::test]
@@ -383,12 +408,12 @@ async fn test_push_nar_and_narinfo_e2e() {
     let base = server.base_url();
 
     let nar_data = b"test-nar-binary-content";
-    let narinfo = "StorePath: /nix/store/aaa111-test-1.0\nURL: nar/aaa111.nar\nCompression: \
-                   none\nNarHash: sha256:112233\nNarSize: 50\nReferences: aaa111-test-1.0\n";
+    let narinfo = format!("StorePath: /nix/store/{HASH_AAA}-test-1.0\nURL: nar/{HASH_AAA}.nar\nCompression: \
+                   none\nNarHash: sha256:112233\nNarSize: 50\nReferences: {HASH_AAA}-test-1.0\n");
 
     // Push NAR.
     let resp = client
-        .put(format!("{base}/nar/aaa111.nar"))
+        .put(format!("{base}/nar/{HASH_AAA}.nar"))
         .header("Authorization", "Bearer test_token_writer")
         .body(nar_data.to_vec())
         .send()
@@ -398,7 +423,7 @@ async fn test_push_nar_and_narinfo_e2e() {
 
     // Push narinfo.
     let resp = client
-        .put(format!("{base}/aaa111.narinfo"))
+        .put(format!("{base}/{HASH_AAA}.narinfo"))
         .header("Authorization", "Bearer test_token_writer")
         .body(narinfo)
         .send()
@@ -408,7 +433,7 @@ async fn test_push_nar_and_narinfo_e2e() {
 
     // Verify both are readable.
     let resp = client
-        .get(format!("{base}/aaa111.narinfo"))
+        .get(format!("{base}/{HASH_AAA}.narinfo"))
         .send()
         .await
         .unwrap();
@@ -418,7 +443,7 @@ async fn test_push_nar_and_narinfo_e2e() {
     assert!(body.contains("Sig: test-cache-1:"));
 
     let resp = client
-        .get(format!("{base}/nar/aaa111.nar"))
+        .get(format!("{base}/nar/{HASH_AAA}.nar"))
         .send()
         .await
         .unwrap();
@@ -433,8 +458,8 @@ async fn test_push_rejected_without_auth_config() {
     let client = reqwest::Client::new();
 
     let resp = client
-        .put(format!("{}/test.narinfo", server.base_url()))
-        .body("StorePath: /nix/store/x\nURL: nar/x.nar\nNarHash: sha256:a\nNarSize: 1\n")
+        .put(format!("{}/{HASH_ABC}.narinfo", server.base_url()))
+        .body(format!("StorePath: /nix/store/{HASH_ABC}-x\nURL: nar/{HASH_ABC}.nar\nNarHash: sha256:a\nNarSize: 1\n"))
         .send()
         .await
         .unwrap();
@@ -447,16 +472,16 @@ async fn test_push_rejected_without_auth_config() {
 async fn test_head_narinfo() {
     let server = TestServer::start();
     server.write_narinfo(
-        "head123",
-        "StorePath: /nix/store/head123-pkg-1.0\nURL: nar/head123.nar\nNarHash: \
-         sha256:aabb\nNarSize: 10\n",
+        HASH_HEAD,
+        &format!("StorePath: /nix/store/{HASH_HEAD}-pkg-1.0\nURL: nar/{HASH_HEAD}.nar\nNarHash: \
+         sha256:aabb\nNarSize: 10\n"),
     );
 
     let client = reqwest::Client::new();
 
     // HEAD existing — 200.
     let resp = client
-        .head(format!("{}/head123.narinfo", server.base_url()))
+        .head(format!("{}/{HASH_HEAD}.narinfo", server.base_url()))
         .send()
         .await
         .unwrap();
@@ -464,7 +489,7 @@ async fn test_head_narinfo() {
 
     // HEAD missing — 404.
     let resp = client
-        .head(format!("{}/missing.narinfo", server.base_url()))
+        .head(format!("{}/{HASH_MISS2}.narinfo", server.base_url()))
         .send()
         .await
         .unwrap();
@@ -476,12 +501,13 @@ async fn test_multiple_tokens() {
     let server = TestServer::start_with_tokens(&["alice", "bob"]);
     let client = reqwest::Client::new();
 
-    let narinfo =
-        "StorePath: /nix/store/multi-1.0\nURL: nar/multi.nar\nNarHash: sha256:ff\nNarSize: 1\n";
+    let narinfo = format!(
+        "StorePath: /nix/store/{HASH_MULTI}-1.0\nURL: nar/{HASH_MULTI}.nar\nNarHash: sha256:ff\nNarSize: 1\n"
+    );
 
     // Alice's token works.
     let resp = client
-        .put(format!("{}/multi.narinfo", server.base_url()))
+        .put(format!("{}/{HASH_MULTI}.narinfo", server.base_url()))
         .header("Authorization", "Bearer test_token_alice")
         .body(narinfo)
         .send()
@@ -490,10 +516,11 @@ async fn test_multiple_tokens() {
     assert_eq!(resp.status(), 200);
 
     // Bob's token also works.
-    let narinfo_bob =
-        "StorePath: /nix/store/multi2-1.0\nURL: nar/multi2.nar\nNarHash: sha256:ff\nNarSize: 1\n";
+    let narinfo_bob = format!(
+        "StorePath: /nix/store/{HASH_MULTI2}-1.0\nURL: nar/{HASH_MULTI2}.nar\nNarHash: sha256:ff\nNarSize: 1\n"
+    );
     let resp = client
-        .put(format!("{}/multi2.narinfo", server.base_url()))
+        .put(format!("{}/{HASH_MULTI2}.narinfo", server.base_url()))
         .header("Authorization", "Bearer test_token_bob")
         .body(narinfo_bob)
         .send()
@@ -557,7 +584,7 @@ async fn test_castore_push_pull_nar_e2e() {
 
     // Push NAR.
     let resp = client
-        .put(format!("{base}/nar/cas111.nar"))
+        .put(format!("{base}/nar/{HASH_CAS}.nar"))
         .header("Authorization", "Bearer test_token_writer")
         .body(nar_data.clone())
         .send()
@@ -566,10 +593,10 @@ async fn test_castore_push_pull_nar_e2e() {
     assert_eq!(resp.status(), 200);
 
     // Push narinfo.
-    let narinfo = "StorePath: /nix/store/cas111-test-1.0\nURL: nar/cas111.nar\nCompression: \
-                   none\nNarHash: sha256:aabbccdd\nNarSize: 200\nReferences: cas111-test-1.0\n";
+    let narinfo = format!("StorePath: /nix/store/{HASH_CAS}-test-1.0\nURL: nar/{HASH_CAS}.nar\nCompression: \
+                   none\nNarHash: sha256:aabbccdd\nNarSize: 200\nReferences: {HASH_CAS}-test-1.0\n");
     let resp = client
-        .put(format!("{base}/cas111.narinfo"))
+        .put(format!("{base}/{HASH_CAS}.narinfo"))
         .header("Authorization", "Bearer test_token_writer")
         .body(narinfo)
         .send()
@@ -579,20 +606,20 @@ async fn test_castore_push_pull_nar_e2e() {
 
     // Read narinfo back.
     let resp = client
-        .get(format!("{base}/cas111.narinfo"))
+        .get(format!("{base}/{HASH_CAS}.narinfo"))
         .send()
         .await
         .unwrap();
     assert_eq!(resp.status(), 200);
     let body = resp.text().await.unwrap();
-    assert!(body.contains("StorePath: /nix/store/cas111-test-1.0"));
+    assert!(body.contains(&format!("StorePath: /nix/store/{HASH_CAS}-test-1.0")));
     assert!(body.contains("NarHash: sha256:aabbccdd"));
     // Should be re-signed by the server.
     assert!(body.contains("Sig: test-cache-1:"));
 
     // Read NAR back (reconstructed from CAS chunks).
     let resp = client
-        .get(format!("{base}/nar/cas111.nar"))
+        .get(format!("{base}/nar/{HASH_CAS}.nar"))
         .send()
         .await
         .unwrap();
@@ -607,7 +634,7 @@ async fn test_castore_narinfo_missing() {
     let client = reqwest::Client::new();
 
     let resp = client
-        .get(format!("{}/nonexistent.narinfo", server.base_url()))
+        .get(format!("{}/{HASH_MISS}.narinfo", server.base_url()))
         .send()
         .await
         .unwrap();
@@ -620,7 +647,7 @@ async fn test_castore_nar_missing() {
     let client = reqwest::Client::new();
 
     let resp = client
-        .get(format!("{}/nar/nonexistent.nar", server.base_url()))
+        .get(format!("{}/nar/{HASH_MISS}.nar", server.base_url()))
         .send()
         .await
         .unwrap();
@@ -636,7 +663,7 @@ async fn test_castore_chunk_endpoint() {
     // Push a NAR to populate chunks.
     let nar_data = build_test_nar(b"chunk endpoint test data");
     let resp = client
-        .put(format!("{base}/nar/chk111.nar"))
+        .put(format!("{base}/nar/{HASH_CHK}.nar"))
         .header("Authorization", "Bearer test_token_writer")
         .body(nar_data)
         .send()
@@ -645,10 +672,10 @@ async fn test_castore_chunk_endpoint() {
     assert_eq!(resp.status(), 200);
 
     // Push narinfo.
-    let narinfo = "StorePath: /nix/store/chk111-test-1.0\nURL: nar/chk111.nar\nCompression: \
-                   none\nNarHash: sha256:112233\nNarSize: 100\n";
+    let narinfo = format!("StorePath: /nix/store/{HASH_CHK}-test-1.0\nURL: nar/{HASH_CHK}.nar\nCompression: \
+                   none\nNarHash: sha256:112233\nNarSize: 100\n");
     let resp = client
-        .put(format!("{base}/chk111.narinfo"))
+        .put(format!("{base}/{HASH_CHK}.narinfo"))
         .header("Authorization", "Bearer test_token_writer")
         .body(narinfo)
         .send()
@@ -697,7 +724,7 @@ async fn test_castore_push_requires_auth() {
 
     // Without token — should fail.
     let resp = client
-        .put(format!("{base}/nar/auth111.nar"))
+        .put(format!("{base}/nar/{HASH_AUTH}.nar"))
         .body(nar_data.clone())
         .send()
         .await
@@ -706,7 +733,7 @@ async fn test_castore_push_requires_auth() {
 
     // With correct token — should succeed.
     let resp = client
-        .put(format!("{base}/nar/auth111.nar"))
+        .put(format!("{base}/nar/{HASH_AUTH}.nar"))
         .header("Authorization", "Bearer test_token_ci")
         .body(nar_data)
         .send()
@@ -727,18 +754,18 @@ async fn test_stream_nars_basic() {
     let nar_b = b"nar-data-for-pkg-bbb";
 
     server.write_narinfo(
-        "dep111",
-        "StorePath: /nix/store/dep111-dep-1.0\nURL: nar/dep111.nar\nCompression: none\nNarHash: \
-         sha256:aa11\nNarSize: 20\n",
+        HASH_DEP,
+        &format!("StorePath: /nix/store/{HASH_DEP}-dep-1.0\nURL: nar/{HASH_DEP}.nar\nCompression: none\nNarHash: \
+         sha256:aa11\nNarSize: 20\n"),
     );
-    server.write_nar("dep111.nar", nar_a);
+    server.write_nar(&format!("{HASH_DEP}.nar"), nar_a);
 
     server.write_narinfo(
-        "pkg222",
-        "StorePath: /nix/store/pkg222-pkg-1.0\nURL: nar/pkg222.nar\nCompression: none\nNarHash: \
-         sha256:bb22\nNarSize: 20\nReferences: dep111-dep-1.0\n",
+        HASH_PKG,
+        &format!("StorePath: /nix/store/{HASH_PKG}-pkg-1.0\nURL: nar/{HASH_PKG}.nar\nCompression: none\nNarHash: \
+         sha256:bb22\nNarSize: 20\nReferences: {HASH_DEP}-dep-1.0\n"),
     );
-    server.write_nar("pkg222.nar", nar_b);
+    server.write_nar(&format!("{HASH_PKG}.nar"), nar_b);
 
     // Connect gRPC and stream both NARs.
     use ekapkgs_protocol::ekapkgs::v1::StreamNarsRequest;
@@ -746,7 +773,7 @@ async fn test_stream_nars_basic() {
 
     let mut client = CacheServiceClient::connect(base.clone()).await.unwrap();
     let request = tonic::Request::new(StreamNarsRequest {
-        path_hashes: vec!["dep111".to_owned(), "pkg222".to_owned()],
+        path_hashes: vec![HASH_DEP.to_owned(), HASH_PKG.to_owned()],
     });
     let mut stream = client.stream_nars(request).await.unwrap().into_inner();
 
@@ -765,10 +792,10 @@ async fn test_stream_nars_basic() {
     }
 
     // Verify we got both paths with correct data.
-    assert_eq!(received.get("dep111").unwrap().as_slice(), nar_a);
-    assert_eq!(received.get("pkg222").unwrap().as_slice(), nar_b);
-    assert!(last_seen.get("dep111").copied().unwrap_or(false));
-    assert!(last_seen.get("pkg222").copied().unwrap_or(false));
+    assert_eq!(received.get(HASH_DEP).unwrap().as_slice(), nar_a);
+    assert_eq!(received.get(HASH_PKG).unwrap().as_slice(), nar_b);
+    assert!(last_seen.get(HASH_DEP).copied().unwrap_or(false));
+    assert!(last_seen.get(HASH_PKG).copied().unwrap_or(false));
 }
 
 #[tokio::test]
@@ -778,18 +805,18 @@ async fn test_stream_nars_missing_path() {
 
     // Populate one NAR.
     server.write_narinfo(
-        "exists1",
-        "StorePath: /nix/store/exists1-pkg-1.0\nURL: nar/exists1.nar\nCompression: none\nNarHash: \
-         sha256:ee11\nNarSize: 10\n",
+        HASH_ABC,
+        &format!("StorePath: /nix/store/{HASH_ABC}-pkg-1.0\nURL: nar/{HASH_ABC}.nar\nCompression: none\nNarHash: \
+         sha256:ee11\nNarSize: 10\n"),
     );
-    server.write_nar("exists1.nar", b"nar-exists");
+    server.write_nar(&format!("{HASH_ABC}.nar"), b"nar-exists");
 
     use ekapkgs_protocol::ekapkgs::v1::StreamNarsRequest;
     use ekapkgs_protocol::ekapkgs::v1::cache_service_client::CacheServiceClient;
 
     let mut client = CacheServiceClient::connect(base.clone()).await.unwrap();
     let request = tonic::Request::new(StreamNarsRequest {
-        path_hashes: vec!["nonexistent".to_owned(), "exists1".to_owned()],
+        path_hashes: vec![HASH_MISS.to_owned(), HASH_ABC.to_owned()],
     });
     let mut stream = client.stream_nars(request).await.unwrap().into_inner();
 
@@ -803,8 +830,8 @@ async fn test_stream_nars_missing_path() {
             .extend_from_slice(&chunk.data);
     }
 
-    assert!(!received.contains_key("nonexistent"));
-    assert_eq!(received.get("exists1").unwrap().as_slice(), b"nar-exists");
+    assert!(!received.contains_key(HASH_MISS));
+    assert_eq!(received.get(HASH_ABC).unwrap().as_slice(), b"nar-exists");
 }
 
 #[tokio::test]
@@ -816,7 +843,7 @@ async fn test_stream_nars_castore() {
     // Push a NAR via HTTP (castore backend decomposes it into chunks).
     let nar_data = build_test_nar(b"streamed from castore");
     let resp = client
-        .put(format!("{base}/nar/cas222.nar"))
+        .put(format!("{base}/nar/{HASH_CAS2}.nar"))
         .header("Authorization", "Bearer test_token_writer")
         .body(nar_data.clone())
         .send()
@@ -824,10 +851,10 @@ async fn test_stream_nars_castore() {
         .unwrap();
     assert_eq!(resp.status(), 200);
 
-    let narinfo = "StorePath: /nix/store/cas222-test-1.0\nURL: nar/cas222.nar\nCompression: \
-                   none\nNarHash: sha256:ccdd\nNarSize: 100\n";
+    let narinfo = format!("StorePath: /nix/store/{HASH_CAS2}-test-1.0\nURL: nar/{HASH_CAS2}.nar\nCompression: \
+                   none\nNarHash: sha256:ccdd\nNarSize: 100\n");
     let resp = client
-        .put(format!("{base}/cas222.narinfo"))
+        .put(format!("{base}/{HASH_CAS2}.narinfo"))
         .header("Authorization", "Bearer test_token_writer")
         .body(narinfo)
         .send()
@@ -841,13 +868,13 @@ async fn test_stream_nars_castore() {
 
     let mut grpc_client = CacheServiceClient::connect(base.clone()).await.unwrap();
     let request = tonic::Request::new(StreamNarsRequest {
-        path_hashes: vec!["cas222".to_owned()],
+        path_hashes: vec![HASH_CAS2.to_owned()],
     });
     let mut stream = grpc_client.stream_nars(request).await.unwrap().into_inner();
 
     let mut received = Vec::new();
     while let Some(chunk) = stream.message().await.unwrap() {
-        assert_eq!(chunk.path_hash, "cas222");
+        assert_eq!(chunk.path_hash, HASH_CAS2);
         received.extend_from_slice(&chunk.data);
     }
 
@@ -862,18 +889,18 @@ async fn test_stream_nars_file_size_on_first_chunk() {
 
     let nar_data = vec![0xABu8; 200_000]; // > 64 KiB so multiple chunks
     server.write_narinfo(
-        "big111",
-        "StorePath: /nix/store/big111-big-1.0\nURL: nar/big111.nar\nCompression: none\nNarHash: \
-         sha256:bbig\nNarSize: 200000\n",
+        HASH_BIG,
+        &format!("StorePath: /nix/store/{HASH_BIG}-big-1.0\nURL: nar/{HASH_BIG}.nar\nCompression: none\nNarHash: \
+         sha256:bbig\nNarSize: 200000\n"),
     );
-    server.write_nar("big111.nar", &nar_data);
+    server.write_nar(&format!("{HASH_BIG}.nar"), &nar_data);
 
     use ekapkgs_protocol::ekapkgs::v1::StreamNarsRequest;
     use ekapkgs_protocol::ekapkgs::v1::cache_service_client::CacheServiceClient;
 
     let mut client = CacheServiceClient::connect(base.clone()).await.unwrap();
     let request = tonic::Request::new(StreamNarsRequest {
-        path_hashes: vec!["big111".to_owned()],
+        path_hashes: vec![HASH_BIG.to_owned()],
     });
     let mut stream = client.stream_nars(request).await.unwrap().into_inner();
 
@@ -906,15 +933,15 @@ async fn test_metrics_endpoint() {
 
     // Write a narinfo and fetch it to generate some metrics.
     server.write_narinfo(
-        "met111",
-        "StorePath: /nix/store/met111-pkg-1.0\nURL: nar/met111.nar\nCompression: none\nNarHash: \
-         sha256:met1\nNarSize: 10\n",
+        HASH_MET,
+        &format!("StorePath: /nix/store/{HASH_MET}-pkg-1.0\nURL: nar/{HASH_MET}.nar\nCompression: none\nNarHash: \
+         sha256:m371\nNarSize: 10\n"),
     );
-    server.write_nar("met111.nar", b"nar-data");
+    server.write_nar(&format!("{HASH_MET}.nar"), b"nar-data");
 
     // Fetch narinfo to increment counters.
     let resp = client
-        .get(format!("{}/met111.narinfo", server.base_url()))
+        .get(format!("{}/{HASH_MET}.narinfo", server.base_url()))
         .send()
         .await
         .unwrap();
@@ -922,7 +949,7 @@ async fn test_metrics_endpoint() {
 
     // Fetch NAR.
     let resp = client
-        .get(format!("{}/nar/met111.nar", server.base_url()))
+        .get(format!("{}/nar/{HASH_MET}.nar", server.base_url()))
         .send()
         .await
         .unwrap();
@@ -930,7 +957,7 @@ async fn test_metrics_endpoint() {
 
     // Fetch a missing narinfo to increment miss counter.
     let _ = client
-        .get(format!("{}/missing.narinfo", server.base_url()))
+        .get(format!("{}/{HASH_MISS}.narinfo", server.base_url()))
         .send()
         .await
         .unwrap();
@@ -1051,7 +1078,7 @@ async fn test_delta_negotiate() {
     // Old version:
     let old_nar_data = build_test_nar(b"shared content between versions, old version data here!");
     let resp = client
-        .put(format!("{base}/nar/old111.nar"))
+        .put(format!("{base}/nar/{HASH_OLD}.nar"))
         .header("Authorization", "Bearer test_token_writer")
         .body(old_nar_data.clone())
         .send()
@@ -1060,13 +1087,13 @@ async fn test_delta_negotiate() {
     assert_eq!(resp.status(), 200);
 
     let old_narinfo = format!(
-        "StorePath: /nix/store/old111-mypkg-1.0\nURL: nar/old111.nar\nCompression: none\nNarHash: \
-         sha256:old1\nNarSize: {}\nFileSize: {}\n",
+        "StorePath: /nix/store/{HASH_OLD}-mypkg-1.0\nURL: nar/{HASH_OLD}.nar\nCompression: none\nNarHash: \
+         sha256:01d1\nNarSize: {}\nFileSize: {}\n",
         old_nar_data.len(),
         old_nar_data.len()
     );
     let resp = client
-        .put(format!("{base}/old111.narinfo"))
+        .put(format!("{base}/{HASH_OLD}.narinfo"))
         .header("Authorization", "Bearer test_token_writer")
         .body(old_narinfo)
         .send()
@@ -1077,7 +1104,7 @@ async fn test_delta_negotiate() {
     // New version (same pname "mypkg", different hash/version):
     let new_nar_data = build_test_nar(b"shared content between versions, new version data here!");
     let resp = client
-        .put(format!("{base}/nar/new222.nar"))
+        .put(format!("{base}/nar/{HASH_NEW}.nar"))
         .header("Authorization", "Bearer test_token_writer")
         .body(new_nar_data.clone())
         .send()
@@ -1086,13 +1113,13 @@ async fn test_delta_negotiate() {
     assert_eq!(resp.status(), 200);
 
     let new_narinfo = format!(
-        "StorePath: /nix/store/new222-mypkg-2.0\nURL: nar/new222.nar\nCompression: none\nNarHash: \
-         sha256:new2\nNarSize: {}\nFileSize: {}\n",
+        "StorePath: /nix/store/{HASH_NEW}-mypkg-2.0\nURL: nar/{HASH_NEW}.nar\nCompression: none\nNarHash: \
+         sha256:n3w2\nNarSize: {}\nFileSize: {}\n",
         new_nar_data.len(),
         new_nar_data.len()
     );
     let resp = client
-        .put(format!("{base}/new222.narinfo"))
+        .put(format!("{base}/{HASH_NEW}.narinfo"))
         .header("Authorization", "Bearer test_token_writer")
         .body(new_narinfo)
         .send()
@@ -1106,8 +1133,8 @@ async fn test_delta_negotiate() {
 
     let mut grpc_client = CacheServiceClient::connect(base.clone()).await.unwrap();
     let request = tonic::Request::new(NegotiateRequest {
-        want: vec!["new222".to_owned()],
-        have: vec!["old111".to_owned()],
+        want: vec![HASH_NEW.to_owned()],
+        have: vec![HASH_OLD.to_owned()],
         accept_compression: vec![Compression::Zstd as i32],
         trust_roots: Vec::new(),
         supports_cas: false,
@@ -1119,7 +1146,7 @@ async fn test_delta_negotiate() {
     let entry = &response.available[0];
 
     // Should have delta fields populated.
-    assert_eq!(entry.delta_base_hash, "old111");
+    assert_eq!(entry.delta_base_hash, HASH_OLD);
     assert!(!entry.delta_url.is_empty());
     assert!(entry.delta_size > 0);
     // Delta should be smaller than the full NAR.
@@ -1135,7 +1162,7 @@ async fn test_delta_http_download() {
     // Push two versions.
     let old_nar = build_test_nar(b"shared package content - the original version of the pkg");
     let resp = client
-        .put(format!("{base}/nar/dold1.nar"))
+        .put(format!("{base}/nar/{HASH_DOLD}.nar"))
         .header("Authorization", "Bearer test_token_writer")
         .body(old_nar.clone())
         .send()
@@ -1143,11 +1170,11 @@ async fn test_delta_http_download() {
         .unwrap();
     assert_eq!(resp.status(), 200);
     let resp = client
-        .put(format!("{base}/dold1.narinfo"))
+        .put(format!("{base}/{HASH_DOLD}.narinfo"))
         .header("Authorization", "Bearer test_token_writer")
         .body(format!(
-            "StorePath: /nix/store/dold1-deltapkg-1.0\nURL: nar/dold1.nar\nCompression: \
-             none\nNarHash: sha256:do1\nNarSize: {}\nFileSize: {}\n",
+            "StorePath: /nix/store/{HASH_DOLD}-deltapkg-1.0\nURL: nar/{HASH_DOLD}.nar\nCompression: \
+             none\nNarHash: sha256:d01\nNarSize: {}\nFileSize: {}\n",
             old_nar.len(),
             old_nar.len()
         ))
@@ -1158,7 +1185,7 @@ async fn test_delta_http_download() {
 
     let new_nar = build_test_nar(b"shared package content - the updated version of the pkg");
     let resp = client
-        .put(format!("{base}/nar/dnew2.nar"))
+        .put(format!("{base}/nar/{HASH_DNEW}.nar"))
         .header("Authorization", "Bearer test_token_writer")
         .body(new_nar.clone())
         .send()
@@ -1166,10 +1193,10 @@ async fn test_delta_http_download() {
         .unwrap();
     assert_eq!(resp.status(), 200);
     let resp = client
-        .put(format!("{base}/dnew2.narinfo"))
+        .put(format!("{base}/{HASH_DNEW}.narinfo"))
         .header("Authorization", "Bearer test_token_writer")
         .body(format!(
-            "StorePath: /nix/store/dnew2-deltapkg-2.0\nURL: nar/dnew2.nar\nCompression: \
+            "StorePath: /nix/store/{HASH_DNEW}-deltapkg-2.0\nURL: nar/{HASH_DNEW}.nar\nCompression: \
              none\nNarHash: sha256:dn2\nNarSize: {}\nFileSize: {}\n",
             new_nar.len(),
             new_nar.len()
@@ -1185,8 +1212,8 @@ async fn test_delta_http_download() {
 
     let mut grpc_client = CacheServiceClient::connect(base.clone()).await.unwrap();
     let request = tonic::Request::new(NegotiateRequest {
-        want: vec!["dnew2".to_owned()],
-        have: vec!["dold1".to_owned()],
+        want: vec![HASH_DNEW.to_owned()],
+        have: vec![HASH_DOLD.to_owned()],
         accept_compression: vec![Compression::Zstd as i32],
         trust_roots: Vec::new(),
         supports_cas: false,
@@ -1223,7 +1250,7 @@ async fn test_delta_stream() {
     // Push two versions.
     let old_nar = build_test_nar(b"streaming delta test - base version of the package content!");
     let resp = client
-        .put(format!("{base}/nar/sold1.nar"))
+        .put(format!("{base}/nar/{HASH_SOLD}.nar"))
         .header("Authorization", "Bearer test_token_writer")
         .body(old_nar.clone())
         .send()
@@ -1231,11 +1258,11 @@ async fn test_delta_stream() {
         .unwrap();
     assert_eq!(resp.status(), 200);
     let resp = client
-        .put(format!("{base}/sold1.narinfo"))
+        .put(format!("{base}/{HASH_SOLD}.narinfo"))
         .header("Authorization", "Bearer test_token_writer")
         .body(format!(
-            "StorePath: /nix/store/sold1-streampkg-1.0\nURL: nar/sold1.nar\nCompression: \
-             none\nNarHash: sha256:so1\nNarSize: {}\nFileSize: {}\n",
+            "StorePath: /nix/store/{HASH_SOLD}-streampkg-1.0\nURL: nar/{HASH_SOLD}.nar\nCompression: \
+             none\nNarHash: sha256:s01\nNarSize: {}\nFileSize: {}\n",
             old_nar.len(),
             old_nar.len()
         ))
@@ -1246,7 +1273,7 @@ async fn test_delta_stream() {
 
     let new_nar = build_test_nar(b"streaming delta test - new! version of the package content!");
     let resp = client
-        .put(format!("{base}/nar/snew2.nar"))
+        .put(format!("{base}/nar/{HASH_SNEW}.nar"))
         .header("Authorization", "Bearer test_token_writer")
         .body(new_nar.clone())
         .send()
@@ -1254,10 +1281,10 @@ async fn test_delta_stream() {
         .unwrap();
     assert_eq!(resp.status(), 200);
     let resp = client
-        .put(format!("{base}/snew2.narinfo"))
+        .put(format!("{base}/{HASH_SNEW}.narinfo"))
         .header("Authorization", "Bearer test_token_writer")
         .body(format!(
-            "StorePath: /nix/store/snew2-streampkg-2.0\nURL: nar/snew2.nar\nCompression: \
+            "StorePath: /nix/store/{HASH_SNEW}-streampkg-2.0\nURL: nar/{HASH_SNEW}.nar\nCompression: \
              none\nNarHash: sha256:sn2\nNarSize: {}\nFileSize: {}\n",
             new_nar.len(),
             new_nar.len()
@@ -1273,8 +1300,8 @@ async fn test_delta_stream() {
 
     let mut grpc_client = CacheServiceClient::connect(base.clone()).await.unwrap();
     let request = tonic::Request::new(NegotiateRequest {
-        want: vec!["snew2".to_owned()],
-        have: vec!["sold1".to_owned()],
+        want: vec![HASH_SNEW.to_owned()],
+        have: vec![HASH_SOLD.to_owned()],
         accept_compression: vec![Compression::Zstd as i32],
         trust_roots: Vec::new(),
         supports_cas: false,
@@ -1285,7 +1312,7 @@ async fn test_delta_stream() {
 
     // Stream the NAR — should receive delta bytes.
     let request = tonic::Request::new(StreamNarsRequest {
-        path_hashes: vec!["snew2".to_owned()],
+        path_hashes: vec![HASH_SNEW.to_owned()],
     });
     let mut stream = grpc_client.stream_nars(request).await.unwrap().into_inner();
 
