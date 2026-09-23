@@ -2,6 +2,8 @@ use std::io::Read;
 use std::path::PathBuf;
 
 use ekapkgs_nix::NixCommand;
+use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
+use nucleo_matcher::{Config, Matcher, Utf32Str};
 use yansi::Paint;
 
 use crate::cli::SearchCommand;
@@ -78,10 +80,48 @@ where
     if let Some(data) = read_index(name)? {
         return Ok(data);
     }
+
+    // Try downloading from configured index_url before generating locally.
+    if let Ok(config) = crate::config::ClientConfig::load() {
+        if let Some(url) = &config.defaults.index_url {
+            if let Ok(data) = try_download_index(url, name) {
+                return Ok(data);
+            }
+        }
+    }
+
     let spinner = ekapkgs_ui::progress::spinner(&format!("Generating {name} index..."));
     let data = generate()?;
     spinner.finish_and_clear();
     write_index(name, &data)?;
+    Ok(data)
+}
+
+/// Try to download a single index from a remote URL. Returns the
+/// decompressed data on success.
+fn try_download_index(base_url: &str, name: &str) -> color_eyre::Result<Vec<u8>> {
+    let url = format!("{base_url}/{name}.json.zst");
+    let spinner = ekapkgs_ui::progress::spinner(&format!("Downloading {name} index..."));
+    let rt = tokio::runtime::Runtime::new()?;
+    let result = rt.block_on(async {
+        let resp = reqwest::Client::new().get(&url).send().await?;
+        if !resp.status().is_success() {
+            return Err(color_eyre::eyre::eyre!("HTTP {} for {url}", resp.status()));
+        }
+        let bytes = resp.bytes().await?;
+        Ok(bytes.to_vec())
+    });
+    spinner.finish_and_clear();
+
+    let compressed = result?;
+    let dir = cache_dir()?;
+    let path = dir.join(format!("{name}.json.zst"));
+    std::fs::write(&path, &compressed)?;
+
+    // Decompress for the caller.
+    let mut decoder = zstd::Decoder::new(compressed.as_slice())?;
+    let mut data = Vec::new();
+    decoder.read_to_end(&mut data)?;
     Ok(data)
 }
 
@@ -116,6 +156,8 @@ fn generate_package_index(flake: &str) -> color_eyre::Result<Vec<u8>> {
             pname: entry.pname,
             version: entry.version,
             description: entry.description,
+            outputs: Vec::new(),
+            main_program: None,
         })
         .collect();
     Ok(serde_json::to_vec(&entries)?)
@@ -127,6 +169,13 @@ struct PackageSearchEntry {
     pname: String,
     version: String,
     description: String,
+    /// Package output names (e.g., `["out", "dev", "lib"]`).
+    /// Populated by enriched indexes from CI; empty when generated locally.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    outputs: Vec<String>,
+    /// Binary name from `meta.mainProgram`, if available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    main_program: Option<String>,
 }
 
 fn cmd_packages(
@@ -148,7 +197,7 @@ fn cmd_packages(
             let pname_lower = e.pname.to_lowercase();
             let desc_lower = e.description.to_lowercase();
 
-            // Score: 0 = exact pname, 1 = pname prefix, 2 = attr contains, 3 = desc contains
+            // Score: 0 = exact, 1 = prefix, 2 = contains, 3 = desc contains
             if pname_lower == query_lower {
                 Some((0, e))
             } else if pname_lower.starts_with(&query_lower) {
@@ -162,6 +211,16 @@ fn cmd_packages(
             }
         })
         .collect();
+
+    // If substring matching found few results, add fuzzy matches as tier 4.
+    if !query.is_empty() && results.len() < limit.max(1) {
+        let fuzzy = fuzzy_match_entries(&entries, query, limit);
+        for (_, e) in &fuzzy {
+            if !results.iter().any(|(_, r)| std::ptr::eq(*r, *e)) {
+                results.push((4, e));
+            }
+        }
+    }
 
     results.sort_by_key(|(score, e)| (*score, e.pname.clone()));
     if limit > 0 {
@@ -187,19 +246,66 @@ fn cmd_packages(
     }
 
     for (_, entry) in &results {
+        let attr_display = highlight_match(&entry.attr, query);
+        let mut version_info = format!("({})", entry.version);
+        if !entry.outputs.is_empty() && entry.outputs != ["out"] {
+            version_info.push_str(&format!(" [{}]", entry.outputs.join(", ")));
+        }
         println!(
             "{} {}",
-            format!("* {}", entry.attr).bold(),
-            format!("({})", entry.version).dim()
+            format!("* {attr_display}").bold(),
+            version_info.dim()
         );
         if !entry.description.is_empty() {
-            println!("  {}", entry.description);
+            let desc_display = highlight_match(&entry.description, query);
+            println!("  {desc_display}");
         }
     }
     println!();
     println!("{} result(s)", results.len());
 
     Ok(())
+}
+
+/// Fuzzy match package entries by pname using nucleo-matcher.
+fn fuzzy_match_entries<'a>(
+    entries: &'a [PackageSearchEntry],
+    query: &str,
+    max_results: usize,
+) -> Vec<(u32, &'a PackageSearchEntry)> {
+    let mut matcher = Matcher::new(Config::DEFAULT.match_paths());
+    let pattern = Pattern::parse(query, CaseMatching::Ignore, Normalization::Smart);
+
+    let mut scored: Vec<(u32, &PackageSearchEntry)> = entries
+        .iter()
+        .filter_map(|entry| {
+            let mut buf = Vec::new();
+            let haystack = Utf32Str::new(&entry.pname, &mut buf);
+            let score = pattern.score(haystack, &mut matcher)?;
+            Some((score, entry))
+        })
+        .collect();
+
+    scored.sort_by_key(|a| std::cmp::Reverse(a.0));
+    scored.truncate(max_results);
+    scored
+}
+
+/// Highlight the first occurrence of `query` (case-insensitive) in `text`.
+fn highlight_match(text: &str, query: &str) -> String {
+    if query.is_empty() {
+        return text.to_owned();
+    }
+    let lower = text.to_lowercase();
+    let query_lower = query.to_lowercase();
+    if let Some(pos) = lower.find(&query_lower) {
+        let before = &text[..pos];
+        let matched = &text[pos..pos + query.len()];
+        let after = &text[pos + query.len()..];
+        format!("{before}{}{after}", matched.underline())
+    } else {
+        text.to_owned()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -223,13 +329,23 @@ struct OptionSearchEntry {
     read_only: bool,
 }
 
+/// Escape a string for use inside nix double quotes.
+fn escape_nix_string(s: &str) -> String {
+    s.replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+        .replace('\t', "\\t")
+        .replace("${", "\\${")
+}
+
 fn generate_option_index(flake: &str) -> color_eyre::Result<Vec<u8>> {
     // Use nix eval with an inline expression that serializes options.
     // This works with any flake that has an ekaos-style options tree.
+    let escaped_flake = escape_nix_string(flake);
     let expr = format!(
         r#"
         let
-          flake = builtins.getFlake "{flake}";
+          flake = builtins.getFlake "{escaped_flake}";
           pkgs = flake.legacyPackages.${{builtins.currentSystem}} or flake.pkgs.${{builtins.currentSystem}} or (import <nixpkgs> {{}});
           lib = pkgs.lib;
           eval = flake.config or
@@ -355,6 +471,9 @@ fn cmd_options(
 struct FileSearchEntry {
     file: String,
     package: String,
+    /// Package output containing this file (e.g., `out`, `bin`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    output: Option<String>,
 }
 
 fn print_file_results(
@@ -373,7 +492,12 @@ fn print_file_results(
         println!("No files matching '{query}'.");
     } else {
         for entry in results {
-            println!("{}  {}", entry.file, format!("({})", entry.package).dim());
+            let pkg_info = if let Some(out) = &entry.output {
+                format!("{}.{out}", entry.package)
+            } else {
+                entry.package.clone()
+            };
+            println!("{}  {}", entry.file, format!("({pkg_info})").dim());
         }
         println!();
         println!("{} result(s)", results.len());
@@ -387,12 +511,7 @@ fn cmd_files(
     names_only: bool,
     limit: usize,
 ) -> color_eyre::Result<()> {
-    // Try nix-locate first (from nix-index).
-    if let Ok(results) = search_via_nix_locate(query, limit) {
-        return print_file_results(&results, query, json_output, names_only);
-    }
-
-    // Fallback: try loading a cached file index.
+    // Prefer local cached file index (instant, no external deps).
     if let Some(data) = read_index("files")? {
         let entries: Vec<FileSearchEntry> = serde_json::from_slice(&data)?;
         let query_lower = query.to_lowercase();
@@ -404,8 +523,29 @@ fn cmd_files(
         return print_file_results(&results, query, json_output, names_only);
     }
 
+    // Try downloading from remote if configured.
+    if let Ok(config) = crate::config::ClientConfig::load() {
+        if let Some(url) = &config.defaults.index_url {
+            if let Ok(data) = try_download_index(url, "files") {
+                let entries: Vec<FileSearchEntry> = serde_json::from_slice(&data)?;
+                let query_lower = query.to_lowercase();
+                let results: Vec<FileSearchEntry> = entries
+                    .into_iter()
+                    .filter(|e| e.file.to_lowercase().contains(&query_lower))
+                    .take(limit)
+                    .collect();
+                return print_file_results(&results, query, json_output, names_only);
+            }
+        }
+    }
+
+    // Fallback: try nix-locate.
+    if let Ok(results) = search_via_nix_locate(query, limit) {
+        return print_file_results(&results, query, json_output, names_only);
+    }
+
     Err(color_eyre::eyre::eyre!(
-        "No file index available. Install nix-index (`nix-locate`) or run `ekapkgs search update`."
+        "No file index available. Run `ekapkgs search update` or install nix-index (`nix-locate`)."
     ))
 }
 
@@ -442,14 +582,14 @@ fn search_via_nix_locate(query: &str, limit: usize) -> color_eyre::Result<Vec<Fi
         .take(limit)
         .map(|line| {
             // nix-locate --minimal outputs "attr.output" (e.g. "cowsay.out").
-            // Strip the output suffix to get the attribute name.
-            let package = line
-                .rsplit_once('.')
-                .map_or(line, |(attr, _output)| attr)
-                .to_owned();
+            let (package, output) = match line.rsplit_once('.') {
+                Some((attr, out)) => (attr.to_owned(), Some(out.to_owned())),
+                None => (line.to_owned(), None),
+            };
             FileSearchEntry {
                 file: query.to_owned(),
                 package,
+                output,
             }
         })
         .collect();
@@ -462,7 +602,13 @@ fn search_via_nix_locate(query: &str, limit: usize) -> color_eyre::Result<Vec<Fi
 // ---------------------------------------------------------------------------
 
 fn cmd_update(flake: &str, remote: Option<&str>) -> color_eyre::Result<()> {
-    if let Some(url) = remote {
+    // Explicit --remote flag takes priority over config.
+    let remote_url = remote.map(ToOwned::to_owned).or_else(|| {
+        crate::config::ClientConfig::load()
+            .ok()
+            .and_then(|c| c.defaults.index_url)
+    });
+    if let Some(url) = &remote_url {
         return download_indexes(url);
     }
 
