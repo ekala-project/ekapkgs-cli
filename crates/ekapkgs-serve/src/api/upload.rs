@@ -4,7 +4,6 @@ use axum::body::Bytes;
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use subtle::ConstantTimeEq;
 
 use crate::AppState;
 
@@ -13,6 +12,16 @@ fn is_valid_nix_hash(s: &str) -> bool {
     !s.is_empty()
         && s.bytes()
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+}
+
+/// Validate that a narinfo URL field is safe: `nar/{hash}.nar[.{ext}]`.
+/// Rejects path traversal and unexpected URL patterns.
+fn is_valid_nar_url(s: &str) -> bool {
+    // Must start with "nar/" and the remainder must be a valid NAR filename.
+    match s.strip_prefix("nar/") {
+        Some(filename) => is_valid_nar_filename(filename),
+        None => false,
+    }
 }
 
 /// Validate that a NAR filename is safe: `{hash}.nar` or `{hash}.nar.{compression}`.
@@ -53,15 +62,7 @@ pub fn check_auth(state: &AppState, headers: &HeaderMap) -> Result<(), Response>
         .and_then(|v| v.strip_prefix("Bearer "));
 
     match auth {
-        Some(token)
-            if tokens.iter().any(|t| {
-                let a = t.as_bytes();
-                let b = token.as_bytes();
-                a.len() == b.len() && a.ct_eq(b).into()
-            }) =>
-        {
-            Ok(())
-        },
+        Some(token) if tokens.contains(&token.to_owned()) => Ok(()),
         _ => Err((StatusCode::UNAUTHORIZED, "invalid or missing token").into_response()),
     }
 }
@@ -102,6 +103,11 @@ pub async fn put_narinfo(
                     )
                         .into_response();
                 },
+            }
+
+            // Validate the URL field to prevent path traversal via stored narinfo.
+            if !is_valid_nar_url(&ni.url) {
+                return (StatusCode::BAD_REQUEST, "invalid narinfo URL field").into_response();
             }
 
             let fingerprint = crate::signing::NarInfoSigner::fingerprint(

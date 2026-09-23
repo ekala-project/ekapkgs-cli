@@ -29,6 +29,14 @@ impl CacheService for NegotiateService {
     ) -> Result<Response<NegotiateResponse>, Status> {
         let req = request.into_inner();
 
+        // Cap the number of entries to prevent excessive server-side processing.
+        const MAX_WANT_ENTRIES: usize = 10_000;
+        if req.want.len() > MAX_WANT_ENTRIES {
+            return Err(Status::invalid_argument(format!(
+                "too many want entries (max {MAX_WANT_ENTRIES})"
+            )));
+        }
+
         self.state.metrics.negotiate_requests_total.inc();
         self.state
             .metrics
@@ -153,14 +161,8 @@ impl CacheService for NegotiateService {
             }
         }
 
-        // Build download plan: topological sort by references, with
-        // critical path prioritization if a target is specified.
-        let target = if req.target_hash.is_empty() {
-            None
-        } else {
-            Some(req.target_hash.as_str())
-        };
-        let download_plan = build_download_plan(&available, &have_set, target);
+        // Build download plan: topological sort by references.
+        let download_plan = build_download_plan(&available, &have_set);
 
         // If client supports CAS and backend has CAS data, include path mappings.
         let ca_path_mappings = if req.supports_cas && self.state.storage.supports_cas() {
@@ -222,6 +224,26 @@ impl CacheService for NegotiateService {
 
         let req = request.into_inner();
 
+        // Cap request sizes to prevent excessive server-side processing.
+        const MAX_CHUNK_WANT: usize = 10_000;
+        const MAX_CHUNK_HAVE: usize = 10_000;
+        const MAX_HAVE_CHUNKS: usize = 500_000;
+        if req.want.len() > MAX_CHUNK_WANT {
+            return Err(Status::invalid_argument(format!(
+                "too many want entries (max {MAX_CHUNK_WANT})"
+            )));
+        }
+        if req.have.len() > MAX_CHUNK_HAVE {
+            return Err(Status::invalid_argument(format!(
+                "too many have entries (max {MAX_CHUNK_HAVE})"
+            )));
+        }
+        if req.have_chunks.len() > MAX_HAVE_CHUNKS {
+            return Err(Status::invalid_argument(format!(
+                "too many have_chunks entries (max {MAX_HAVE_CHUNKS})"
+            )));
+        }
+
         // Build the set of chunk digests the client already has.
         let have_digests: std::collections::HashSet<[u8; 32]> = req
             .have_chunks
@@ -255,17 +277,17 @@ impl CacheService for NegotiateService {
             }
         }
 
-        // Walk the Merkle trees to find missing chunks and collect directory/file
-        // metadata needed for client-side NAR reassembly.
+        // Walk the Merkle trees in a single pass to find missing chunks and
+        // collect directory/file metadata needed for client-side NAR reassembly.
         let (missing_chunks, directories, file_chunk_mappings) = if let Some(castore) = self
             .state
             .storage
             .as_any()
             .downcast_ref::<crate::storage::castore::CastoreBackend>()
         {
-            let chunks = castore
-                .walk_missing_chunks(&want_hashes, &have_digests)
-                .map_err(|e| Status::internal(format!("chunk walk failed: {e}")))?;
+            let (chunks, dirs_raw, file_maps_raw) = castore
+                .walk_cas_trees(&want_hashes, &have_digests)
+                .map_err(|e| Status::internal(format!("CAS tree walk failed: {e}")))?;
 
             let missing: Vec<ChunkDownload> = chunks
                 .into_iter()
@@ -288,10 +310,7 @@ impl CacheService for NegotiateService {
                 })
                 .collect();
 
-            // Collect directory data for client-side NAR reassembly.
-            let dirs = castore
-                .collect_directories(&want_hashes)
-                .map_err(|e| Status::internal(format!("directory collection failed: {e}")))?
+            let dirs = dirs_raw
                 .into_iter()
                 .map(|(digest, dir)| CaDirectoryData {
                     digest: Some(B3Digest {
@@ -301,12 +320,7 @@ impl CacheService for NegotiateService {
                 })
                 .collect();
 
-            // Collect file-to-chunk mappings.
-            let mappings = castore
-                .collect_file_chunk_mappings(&want_hashes)
-                .map_err(|e| {
-                    Status::internal(format!("file chunk mapping collection failed: {e}"))
-                })?
+            let mappings = file_maps_raw
                 .into_iter()
                 .map(|(file_digest, chunks)| FileChunkMapping {
                     file_digest: Some(B3Digest {
@@ -439,33 +453,7 @@ impl CacheService for NegotiateService {
 /// Paths are grouped into batches. Within each batch, paths can be downloaded
 /// in parallel. Batches must be processed in order (dependencies before
 /// dependents).
-///
-/// When `target` is set, the target's transitive runtime dependencies are
-/// identified and placed in earlier batches (critical path prioritization).
-fn build_download_plan(
-    entries: &[PathManifestEntry],
-    have: &HashSet<&str>,
-    target: Option<&str>,
-) -> DownloadPlan {
-    // Build hash → entry index lookup and compute the critical path set.
-    let entry_hashes: Vec<String> = entries
-        .iter()
-        .map(|e| {
-            e.store_path
-                .rsplit('/')
-                .next()
-                .and_then(|b| b.split('-').next())
-                .unwrap_or("")
-                .to_owned()
-        })
-        .collect();
-
-    let critical_set = if let Some(target_hash) = target {
-        compute_critical_path(entries, &entry_hashes, target_hash)
-    } else {
-        HashSet::new()
-    };
-
+fn build_download_plan(entries: &[PathManifestEntry], have: &HashSet<&str>) -> DownloadPlan {
     // Track which paths have been assigned to a batch.
     let mut assigned: HashSet<usize> = HashSet::new();
     // Track which hashes are "resolved" (available for dependents).
@@ -474,7 +462,6 @@ fn build_download_plan(
     let mut batches = Vec::new();
 
     // Iteratively find paths whose references are all resolved.
-    // Within each batch, sort critical path entries first.
     loop {
         let mut batch_paths = Vec::new();
 
@@ -483,6 +470,7 @@ fn build_download_plan(
                 continue;
             }
 
+            // Check if all references are resolved.
             let all_resolved = entry.references.iter().all(|r| {
                 let ref_hash = r.rsplit('/').next().and_then(|b| b.split('-').next());
                 match ref_hash {
@@ -492,42 +480,48 @@ fn build_download_plan(
             });
 
             if all_resolved {
-                batch_paths.push((
-                    entry_hashes[i].clone(),
-                    critical_set.contains(&entry_hashes[i]),
-                ));
+                let hash = entry
+                    .store_path
+                    .rsplit('/')
+                    .next()
+                    .and_then(|b| b.split('-').next())
+                    .unwrap_or("")
+                    .to_owned();
+                batch_paths.push(hash);
                 assigned.insert(i);
             }
         }
 
         if batch_paths.is_empty() {
-            for (i, _entry) in entries.iter().enumerate() {
+            // Remaining paths have circular deps or missing refs — dump them all.
+            for (i, entry) in entries.iter().enumerate() {
                 if !assigned.contains(&i) {
-                    batch_paths.push((
-                        entry_hashes[i].clone(),
-                        critical_set.contains(&entry_hashes[i]),
-                    ));
+                    let hash = entry
+                        .store_path
+                        .rsplit('/')
+                        .next()
+                        .and_then(|b| b.split('-').next())
+                        .unwrap_or("")
+                        .to_owned();
+                    batch_paths.push(hash);
                 }
             }
             if !batch_paths.is_empty() {
-                // Sort: critical paths first.
-                batch_paths.sort_by_key(|a| std::cmp::Reverse(a.1));
                 batches.push(DownloadBatch {
-                    paths: batch_paths.into_iter().map(|(h, _)| h).collect(),
+                    paths: batch_paths,
                     priority: batches.len() as u32,
                 });
             }
             break;
         }
 
-        for (h, _) in &batch_paths {
+        // Mark batch paths as resolved for the next iteration.
+        for h in &batch_paths {
             resolved.insert(h.clone());
         }
 
-        // Sort: critical paths first within the batch.
-        batch_paths.sort_by_key(|a| std::cmp::Reverse(a.1));
         batches.push(DownloadBatch {
-            paths: batch_paths.into_iter().map(|(h, _)| h).collect(),
+            paths: batch_paths,
             priority: batches.len() as u32,
         });
 
@@ -539,50 +533,13 @@ fn build_download_plan(
     DownloadPlan { batches }
 }
 
-/// Compute the set of store path hashes that are on the critical path:
-/// the target and its transitive runtime dependencies.
-fn compute_critical_path(
-    entries: &[PathManifestEntry],
-    entry_hashes: &[String],
-    target_hash: &str,
-) -> HashSet<String> {
-    let mut critical = HashSet::new();
-
-    // Build a reference map: hash → references (as hashes).
-    let ref_map: HashMap<&str, Vec<&str>> = entries
-        .iter()
-        .zip(entry_hashes.iter())
-        .map(|(entry, hash)| {
-            let refs: Vec<&str> = entry
-                .references
-                .iter()
-                .filter_map(|r| r.rsplit('/').next().and_then(|b| b.split('-').next()))
-                .collect();
-            (hash.as_str(), refs)
-        })
-        .collect();
-
-    // BFS from the target to find all transitive deps.
-    let mut queue = vec![target_hash];
-    while let Some(hash) = queue.pop() {
-        if !critical.insert(hash.to_owned()) {
-            continue;
-        }
-        if let Some(refs) = ref_map.get(hash) {
-            for r in refs {
-                if !critical.contains(*r) {
-                    queue.push(r);
-                }
-            }
-        }
-    }
-
-    critical
-}
-
 /// Maximum delta-to-full ratio: only offer a delta if it's smaller than this
 /// fraction of the full NAR size.
 const DELTA_MAX_RATIO: f64 = 0.80;
+
+/// Maximum number of delta computations per negotiate request to bound
+/// CPU and memory usage from untrusted clients.
+const MAX_DELTAS_PER_REQUEST: usize = 32;
 
 /// Scan available paths for delta transfer opportunities against the client's
 /// `have` set. For each match, compress the new NAR using the old NAR as a zstd
@@ -607,7 +564,12 @@ fn compute_deltas(
         return;
     }
 
+    let mut deltas_computed = 0usize;
+
     for entry in available.iter_mut() {
+        if deltas_computed >= MAX_DELTAS_PER_REQUEST {
+            break;
+        }
         let Some(target_pname) = extract_pname(&entry.store_path) else {
             continue;
         };
@@ -657,6 +619,8 @@ fn compute_deltas(
             state
                 .delta_cache
                 .insert(base_hash.clone(), target_hash, delta);
+
+            deltas_computed += 1;
 
             tracing::debug!(
                 "Delta available for {}: {} -> {} bytes (base: {base_hash})",

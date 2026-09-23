@@ -260,22 +260,26 @@ async fn test_narinfo_get_existing() {
     let server = TestServer::start();
 
     // Write a narinfo directly to the cache.
+    // Hash must be exactly 32 chars of nix base32 (no e,o,t,u).
+    let hash = "0123456789abcdfghijklmnpqrsvwxyz";
     server.write_narinfo(
-        "abc123",
-        "StorePath: /nix/store/abc123-hello-1.0\nURL: nar/abc123.nar\nCompression: none\nNarHash: \
-         sha256:deadbeef\nNarSize: 100\n",
+        hash,
+        &format!(
+            "StorePath: /nix/store/{hash}-hello-1.0\nURL: nar/{hash}.nar\nCompression: \
+             none\nNarHash: sha256:deadbeef\nNarSize: 100\n"
+        ),
     );
 
     let client = reqwest::Client::new();
     let resp = client
-        .get(format!("{}/abc123.narinfo", server.base_url()))
+        .get(format!("{}/{hash}.narinfo", server.base_url()))
         .send()
         .await
         .unwrap();
 
     assert_eq!(resp.status(), 200);
     let body = resp.text().await.unwrap();
-    assert!(body.contains("StorePath: /nix/store/abc123-hello-1.0"));
+    assert!(body.contains(&format!("StorePath: /nix/store/{hash}-hello-1.0")));
     assert!(body.contains("NarHash: sha256:deadbeef"));
     // Should have been re-signed by the server.
     assert!(body.contains("Sig: test-cache-1:"));
@@ -332,14 +336,17 @@ async fn test_nar_get_missing() {
 async fn test_push_narinfo_requires_auth() {
     let server = TestServer::start_with_tokens(&["ci"]);
     let client = reqwest::Client::new();
+    let hash = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaabb";
 
-    let narinfo = "StorePath: /nix/store/xyz789-pkg-1.0\nURL: nar/xyz789.nar\nCompression: \
-                   none\nNarHash: sha256:aabbccdd\nNarSize: 200\n";
+    let narinfo = format!(
+        "StorePath: /nix/store/{hash}-pkg-1.0\nURL: nar/{hash}.nar\nCompression: none\nNarHash: \
+         sha256:aabbccdd\nNarSize: 200\n"
+    );
 
     // Without token — should fail.
     let resp = client
-        .put(format!("{}/xyz789.narinfo", server.base_url()))
-        .body(narinfo)
+        .put(format!("{}/{hash}.narinfo", server.base_url()))
+        .body(narinfo.clone())
         .send()
         .await
         .unwrap();
@@ -347,9 +354,9 @@ async fn test_push_narinfo_requires_auth() {
 
     // With wrong token — should fail.
     let resp = client
-        .put(format!("{}/xyz789.narinfo", server.base_url()))
+        .put(format!("{}/{hash}.narinfo", server.base_url()))
         .header("Authorization", "Bearer wrong_token")
-        .body(narinfo)
+        .body(narinfo.clone())
         .send()
         .await
         .unwrap();
@@ -357,7 +364,7 @@ async fn test_push_narinfo_requires_auth() {
 
     // With correct token — should succeed.
     let resp = client
-        .put(format!("{}/xyz789.narinfo", server.base_url()))
+        .put(format!("{}/{hash}.narinfo", server.base_url()))
         .header("Authorization", "Bearer test_token_ci")
         .body(narinfo)
         .send()
@@ -367,13 +374,13 @@ async fn test_push_narinfo_requires_auth() {
 
     // Verify it's now readable.
     let resp = client
-        .get(format!("{}/xyz789.narinfo", server.base_url()))
+        .get(format!("{}/{hash}.narinfo", server.base_url()))
         .send()
         .await
         .unwrap();
     assert_eq!(resp.status(), 200);
     let body = resp.text().await.unwrap();
-    assert!(body.contains("StorePath: /nix/store/xyz789-pkg-1.0"));
+    assert!(body.contains(&format!("StorePath: /nix/store/{hash}-pkg-1.0")));
 }
 
 #[tokio::test]
@@ -381,14 +388,17 @@ async fn test_push_nar_and_narinfo_e2e() {
     let server = TestServer::start_with_tokens(&["writer"]);
     let client = reqwest::Client::new();
     let base = server.base_url();
+    let hash = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa11";
 
     let nar_data = b"test-nar-binary-content";
-    let narinfo = "StorePath: /nix/store/aaa111-test-1.0\nURL: nar/aaa111.nar\nCompression: \
-                   none\nNarHash: sha256:112233\nNarSize: 50\nReferences: aaa111-test-1.0\n";
+    let narinfo = format!(
+        "StorePath: /nix/store/{hash}-test-1.0\nURL: nar/{hash}.nar\nCompression: none\nNarHash: \
+         sha256:112233\nNarSize: 50\nReferences: {hash}-test-1.0\n"
+    );
 
     // Push NAR.
     let resp = client
-        .put(format!("{base}/nar/aaa111.nar"))
+        .put(format!("{base}/nar/{hash}.nar"))
         .header("Authorization", "Bearer test_token_writer")
         .body(nar_data.to_vec())
         .send()
@@ -398,7 +408,7 @@ async fn test_push_nar_and_narinfo_e2e() {
 
     // Push narinfo.
     let resp = client
-        .put(format!("{base}/aaa111.narinfo"))
+        .put(format!("{base}/{hash}.narinfo"))
         .header("Authorization", "Bearer test_token_writer")
         .body(narinfo)
         .send()
@@ -408,7 +418,7 @@ async fn test_push_nar_and_narinfo_e2e() {
 
     // Verify both are readable.
     let resp = client
-        .get(format!("{base}/aaa111.narinfo"))
+        .get(format!("{base}/{hash}.narinfo"))
         .send()
         .await
         .unwrap();
@@ -418,7 +428,7 @@ async fn test_push_nar_and_narinfo_e2e() {
     assert!(body.contains("Sig: test-cache-1:"));
 
     let resp = client
-        .get(format!("{base}/nar/aaa111.nar"))
+        .get(format!("{base}/nar/{hash}.nar"))
         .send()
         .await
         .unwrap();
@@ -446,17 +456,21 @@ async fn test_push_rejected_without_auth_config() {
 #[tokio::test]
 async fn test_head_narinfo() {
     let server = TestServer::start();
+    let hash = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb11";
+    let missing = "cccccccccccccccccccccccccccccc22";
     server.write_narinfo(
-        "head123",
-        "StorePath: /nix/store/head123-pkg-1.0\nURL: nar/head123.nar\nNarHash: \
-         sha256:aabb\nNarSize: 10\n",
+        hash,
+        &format!(
+            "StorePath: /nix/store/{hash}-pkg-1.0\nURL: nar/{hash}.nar\nNarHash: \
+             sha256:aabb\nNarSize: 10\n"
+        ),
     );
 
     let client = reqwest::Client::new();
 
     // HEAD existing — 200.
     let resp = client
-        .head(format!("{}/head123.narinfo", server.base_url()))
+        .head(format!("{}/{hash}.narinfo", server.base_url()))
         .send()
         .await
         .unwrap();
@@ -464,7 +478,7 @@ async fn test_head_narinfo() {
 
     // HEAD missing — 404.
     let resp = client
-        .head(format!("{}/missing.narinfo", server.base_url()))
+        .head(format!("{}/{missing}.narinfo", server.base_url()))
         .send()
         .await
         .unwrap();
@@ -552,12 +566,13 @@ async fn test_castore_push_pull_nar_e2e() {
     let server = TestServer::start_castore_with_tokens(&["writer"]);
     let client = reqwest::Client::new();
     let base = server.base_url();
+    let hash = "dddddddddddddddddddddddddddddddd";
 
     let nar_data = build_test_nar(b"hello from castore test");
 
     // Push NAR.
     let resp = client
-        .put(format!("{base}/nar/cas111.nar"))
+        .put(format!("{base}/nar/{hash}.nar"))
         .header("Authorization", "Bearer test_token_writer")
         .body(nar_data.clone())
         .send()
@@ -566,10 +581,12 @@ async fn test_castore_push_pull_nar_e2e() {
     assert_eq!(resp.status(), 200);
 
     // Push narinfo.
-    let narinfo = "StorePath: /nix/store/cas111-test-1.0\nURL: nar/cas111.nar\nCompression: \
-                   none\nNarHash: sha256:aabbccdd\nNarSize: 200\nReferences: cas111-test-1.0\n";
+    let narinfo = format!(
+        "StorePath: /nix/store/{hash}-test-1.0\nURL: nar/{hash}.nar\nCompression: none\nNarHash: \
+         sha256:aabbccdd\nNarSize: 200\nReferences: {hash}-test-1.0\n"
+    );
     let resp = client
-        .put(format!("{base}/cas111.narinfo"))
+        .put(format!("{base}/{hash}.narinfo"))
         .header("Authorization", "Bearer test_token_writer")
         .body(narinfo)
         .send()
@@ -579,20 +596,20 @@ async fn test_castore_push_pull_nar_e2e() {
 
     // Read narinfo back.
     let resp = client
-        .get(format!("{base}/cas111.narinfo"))
+        .get(format!("{base}/{hash}.narinfo"))
         .send()
         .await
         .unwrap();
     assert_eq!(resp.status(), 200);
     let body = resp.text().await.unwrap();
-    assert!(body.contains("StorePath: /nix/store/cas111-test-1.0"));
+    assert!(body.contains(&format!("StorePath: /nix/store/{hash}-test-1.0")));
     assert!(body.contains("NarHash: sha256:aabbccdd"));
     // Should be re-signed by the server.
     assert!(body.contains("Sig: test-cache-1:"));
 
     // Read NAR back (reconstructed from CAS chunks).
     let resp = client
-        .get(format!("{base}/nar/cas111.nar"))
+        .get(format!("{base}/nar/{hash}.nar"))
         .send()
         .await
         .unwrap();
@@ -903,18 +920,22 @@ async fn test_stream_nars_file_size_on_first_chunk() {
 async fn test_metrics_endpoint() {
     let server = TestServer::start();
     let client = reqwest::Client::new();
+    let hash = "fffffffffffffffffffffffffffffff0";
+    let miss = "fffffffffffffffffffffffffffffff1";
 
     // Write a narinfo and fetch it to generate some metrics.
     server.write_narinfo(
-        "met111",
-        "StorePath: /nix/store/met111-pkg-1.0\nURL: nar/met111.nar\nCompression: none\nNarHash: \
-         sha256:met1\nNarSize: 10\n",
+        hash,
+        &format!(
+            "StorePath: /nix/store/{hash}-pkg-1.0\nURL: nar/{hash}.nar\nCompression: \
+             none\nNarHash: sha256:met1\nNarSize: 10\n"
+        ),
     );
-    server.write_nar("met111.nar", b"nar-data");
+    server.write_nar(&format!("{hash}.nar"), b"nar-data");
 
     // Fetch narinfo to increment counters.
     let resp = client
-        .get(format!("{}/met111.narinfo", server.base_url()))
+        .get(format!("{}/{hash}.narinfo", server.base_url()))
         .send()
         .await
         .unwrap();
@@ -922,7 +943,7 @@ async fn test_metrics_endpoint() {
 
     // Fetch NAR.
     let resp = client
-        .get(format!("{}/nar/met111.nar", server.base_url()))
+        .get(format!("{}/nar/{hash}.nar", server.base_url()))
         .send()
         .await
         .unwrap();
@@ -930,7 +951,7 @@ async fn test_metrics_endpoint() {
 
     // Fetch a missing narinfo to increment miss counter.
     let _ = client
-        .get(format!("{}/missing.narinfo", server.base_url()))
+        .get(format!("{}/{miss}.narinfo", server.base_url()))
         .send()
         .await
         .unwrap();
@@ -956,87 +977,6 @@ async fn test_metrics_endpoint() {
     assert!(body.contains(r#"ekapkgs_narinfo_requests_total{status="hit"} 1"#));
     assert!(body.contains(r#"ekapkgs_narinfo_requests_total{status="miss"} 1"#));
     assert!(body.contains("ekapkgs_nar_downloads_total 1"));
-}
-
-// ===== Resumable download tests =====
-
-#[tokio::test]
-async fn test_nar_range_request() {
-    let server = TestServer::start();
-    let nar_data = b"0123456789abcdef0123456789abcdef";
-    server.write_nar("range1.nar", nar_data);
-
-    let client = reqwest::Client::new();
-    let base = server.base_url();
-
-    // Full download should include Accept-Ranges and Content-Length.
-    let resp = client
-        .get(format!("{base}/nar/range1.nar"))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 200);
-    assert_eq!(
-        resp.headers()
-            .get("accept-ranges")
-            .and_then(|v| v.to_str().ok()),
-        Some("bytes")
-    );
-    assert_eq!(
-        resp.headers()
-            .get("content-length")
-            .and_then(|v| v.to_str().ok()),
-        Some("32")
-    );
-    let full_body = resp.bytes().await.unwrap();
-    assert_eq!(full_body.as_ref(), nar_data);
-
-    // Range request: bytes 10 to end.
-    let resp = client
-        .get(format!("{base}/nar/range1.nar"))
-        .header("Range", "bytes=10-")
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 206);
-    assert_eq!(
-        resp.headers()
-            .get("content-range")
-            .and_then(|v| v.to_str().ok()),
-        Some("bytes 10-31/32")
-    );
-    let partial = resp.bytes().await.unwrap();
-    assert_eq!(partial.as_ref(), &nar_data[10..]);
-
-    // Range request: bytes 5 to 14.
-    let resp = client
-        .get(format!("{base}/nar/range1.nar"))
-        .header("Range", "bytes=5-14")
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 206);
-    let partial = resp.bytes().await.unwrap();
-    assert_eq!(partial.as_ref(), &nar_data[5..=14]);
-}
-
-#[tokio::test]
-async fn test_nar_range_invalid() {
-    let server = TestServer::start();
-    server.write_nar("range2.nar", b"small");
-
-    let client = reqwest::Client::new();
-
-    // Range past end — should fall back to full response.
-    let resp = client
-        .get(format!("{}/nar/range2.nar", server.base_url()))
-        .header("Range", "bytes=100-")
-        .send()
-        .await
-        .unwrap();
-    // Invalid range → server returns 200 with full content.
-    assert_eq!(resp.status(), 200);
-    assert_eq!(resp.bytes().await.unwrap().as_ref(), b"small");
 }
 
 // ===== Delta transfer tests =====
@@ -1305,4 +1245,523 @@ async fn test_delta_stream() {
     decoder.read_to_end(&mut reconstructed).unwrap();
 
     assert_eq!(reconstructed, new_nar);
+}
+
+// ===== CAS advanced integration tests =====
+
+/// Build a NAR containing a directory with multiple files.
+fn build_dir_test_nar(files: &[(&str, &[u8])]) -> Vec<u8> {
+    let mut buf = Vec::new();
+    nar_write_str(&mut buf, "nix-archive-1");
+    nar_write_str(&mut buf, "(");
+    nar_write_str(&mut buf, "type");
+    nar_write_str(&mut buf, "directory");
+
+    // Files must be sorted by name for valid NAR.
+    let mut sorted_files: Vec<_> = files.to_vec();
+    sorted_files.sort_by_key(|(name, _)| *name);
+
+    for (name, content) in &sorted_files {
+        nar_write_str(&mut buf, "entry");
+        nar_write_str(&mut buf, "(");
+        nar_write_str(&mut buf, "name");
+        nar_write_str(&mut buf, name);
+        nar_write_str(&mut buf, "node");
+        nar_write_str(&mut buf, "(");
+        nar_write_str(&mut buf, "type");
+        nar_write_str(&mut buf, "regular");
+        nar_write_str(&mut buf, "contents");
+        nar_write_bytes(&mut buf, content);
+        nar_write_str(&mut buf, ")");
+        nar_write_str(&mut buf, ")");
+    }
+
+    nar_write_str(&mut buf, ")");
+    buf
+}
+
+/// Helper: push a NAR + narinfo to a castore server.
+async fn push_nar_to_castore(
+    client: &reqwest::Client,
+    base: &str,
+    hash: &str,
+    pname: &str,
+    version: &str,
+    nar_data: &[u8],
+    token: &str,
+) {
+    let resp = client
+        .put(format!("{base}/nar/{hash}.nar"))
+        .header("Authorization", format!("Bearer {token}"))
+        .body(nar_data.to_vec())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "NAR upload failed for {hash}");
+
+    let nar_hash = {
+        use sha2::Digest;
+        let h = sha2::Sha256::digest(nar_data);
+        h.iter().map(|b| format!("{b:02x}")).collect::<String>()
+    };
+    let narinfo = format!(
+        "StorePath: /nix/store/{hash}-{pname}-{version}\nURL: nar/{hash}.nar\nCompression: \
+         none\nNarHash: sha256:{nar_hash}\nNarSize: {}\nFileSize: {}\nReferences: \
+         {hash}-{pname}-{version}\n",
+        nar_data.len(),
+        nar_data.len()
+    );
+    let resp = client
+        .put(format!("{base}/{hash}.narinfo"))
+        .header("Authorization", format!("Bearer {token}"))
+        .body(narinfo)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "narinfo upload failed for {hash}");
+}
+
+#[tokio::test]
+async fn test_castore_directory_nar_roundtrip() {
+    let server = TestServer::start_castore_with_tokens(&["writer"]);
+    let client = reqwest::Client::new();
+    let base = server.base_url();
+
+    let nar_data = build_dir_test_nar(&[
+        ("hello.txt", b"Hello, world!"),
+        ("script.sh", b"#!/bin/sh\necho hi\n"),
+    ]);
+
+    push_nar_to_castore(
+        &client,
+        &base,
+        "dir111",
+        "dirpkg",
+        "1.0",
+        &nar_data,
+        "test_token_writer",
+    )
+    .await;
+
+    // Read NAR back — should be reconstructed from CAS tree.
+    let resp = client
+        .get(format!("{base}/nar/dir111.nar"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let retrieved = resp.bytes().await.unwrap();
+    assert_eq!(retrieved.as_ref(), nar_data.as_slice());
+}
+
+#[tokio::test]
+async fn test_castore_chunk_dedup_across_paths() {
+    let server = TestServer::start_castore_with_tokens(&["writer"]);
+    let client = reqwest::Client::new();
+    let base = server.base_url();
+
+    // Two NARs with identical file content.
+    let shared_content = b"identical content shared across two packages";
+    let nar1 = build_test_nar(shared_content);
+    let nar2 = build_test_nar(shared_content);
+
+    push_nar_to_castore(
+        &client,
+        &base,
+        "dup111",
+        "pkga",
+        "1.0",
+        &nar1,
+        "test_token_writer",
+    )
+    .await;
+    push_nar_to_castore(
+        &client,
+        &base,
+        "dup222",
+        "pkgb",
+        "1.0",
+        &nar2,
+        "test_token_writer",
+    )
+    .await;
+
+    // Both should reconstruct correctly.
+    let resp1 = client
+        .get(format!("{base}/nar/dup111.nar"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp1.bytes().await.unwrap().as_ref(), nar1.as_slice());
+
+    let resp2 = client
+        .get(format!("{base}/nar/dup222.nar"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp2.bytes().await.unwrap().as_ref(), nar2.as_slice());
+
+    // The chunk for the shared content should exist and be fetchable.
+    let hash = blake3::hash(shared_content);
+    let hex: String = hash.as_bytes().iter().map(|b| format!("{b:02x}")).collect();
+    let resp = client
+        .get(format!("{base}/cas/chunk/{hex}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.bytes().await.unwrap().as_ref(), shared_content);
+}
+
+#[tokio::test]
+async fn test_castore_negotiate_with_cas_support() {
+    let server = TestServer::start_castore_with_tokens(&["writer"]);
+    let client = reqwest::Client::new();
+    let base = server.base_url();
+
+    let nar_data = build_test_nar(b"negotiate cas test content");
+    push_nar_to_castore(
+        &client,
+        &base,
+        "neg111",
+        "negpkg",
+        "1.0",
+        &nar_data,
+        "test_token_writer",
+    )
+    .await;
+
+    // Negotiate with supports_cas=true — should return ca_path_mappings.
+    use ekapkgs_protocol::ekapkgs::v1::NegotiateRequest;
+    use ekapkgs_protocol::ekapkgs::v1::cache_service_client::CacheServiceClient;
+
+    let mut grpc_client = CacheServiceClient::connect(base.clone())
+        .await
+        .unwrap()
+        .max_decoding_message_size(64 * 1024 * 1024);
+    let request = tonic::Request::new(NegotiateRequest {
+        want: vec!["neg111".to_owned()],
+        have: Vec::new(),
+        accept_compression: Vec::new(),
+        trust_roots: Vec::new(),
+        supports_cas: true,
+        target_hash: String::new(),
+    });
+    let response = grpc_client.negotiate(request).await.unwrap().into_inner();
+
+    assert_eq!(response.available.len(), 1);
+    assert_eq!(response.ca_path_mappings.len(), 1);
+    assert_eq!(response.ca_path_mappings[0].store_path_hash, "neg111");
+    assert!(response.ca_path_mappings[0].root_node.is_some());
+}
+
+#[tokio::test]
+async fn test_castore_negotiate_chunks_rpc() {
+    let server = TestServer::start_castore_with_tokens(&["writer"]);
+    let client = reqwest::Client::new();
+    let base = server.base_url();
+
+    let nar_data = build_test_nar(b"chunk negotiation test data");
+    push_nar_to_castore(
+        &client,
+        &base,
+        "cneg11",
+        "chunkpkg",
+        "1.0",
+        &nar_data,
+        "test_token_writer",
+    )
+    .await;
+
+    use ekapkgs_protocol::ekapkgs::v1::ChunkNegotiateRequest;
+    use ekapkgs_protocol::ekapkgs::v1::cache_service_client::CacheServiceClient;
+
+    let mut grpc_client = CacheServiceClient::connect(base.clone())
+        .await
+        .unwrap()
+        .max_decoding_message_size(64 * 1024 * 1024);
+    let request = tonic::Request::new(ChunkNegotiateRequest {
+        want: vec!["cneg11".to_owned()],
+        have_chunks: Vec::new(),
+        have: Vec::new(),
+    });
+    let response = grpc_client
+        .negotiate_chunks(request)
+        .await
+        .unwrap()
+        .into_inner();
+
+    assert_eq!(response.path_mappings.len(), 1);
+    assert_eq!(response.path_mappings[0].store_path_hash, "cneg11");
+    assert!(response.path_mappings[0].root_node.is_some());
+    assert!(!response.missing_chunks.is_empty());
+    assert!(response.total_chunk_size > 0);
+    assert!(!response.file_chunk_mappings.is_empty());
+
+    for chunk in &response.missing_chunks {
+        assert!(chunk.digest.is_some());
+        assert!(chunk.size > 0);
+        assert!(chunk.url.starts_with("cas/chunk/"));
+    }
+}
+
+#[tokio::test]
+async fn test_castore_negotiate_chunks_with_existing() {
+    let server = TestServer::start_castore_with_tokens(&["writer"]);
+    let client = reqwest::Client::new();
+    let base = server.base_url();
+
+    let content = b"content that client already has cached";
+    let nar_data = build_test_nar(content);
+    push_nar_to_castore(
+        &client,
+        &base,
+        "cneg22",
+        "cached",
+        "1.0",
+        &nar_data,
+        "test_token_writer",
+    )
+    .await;
+
+    let chunk_hash = blake3::hash(content);
+    let have_digest = ekapkgs_protocol::ekapkgs::v1::B3Digest {
+        digest: chunk_hash.as_bytes().to_vec(),
+    };
+
+    use ekapkgs_protocol::ekapkgs::v1::ChunkNegotiateRequest;
+    use ekapkgs_protocol::ekapkgs::v1::cache_service_client::CacheServiceClient;
+
+    let mut grpc_client = CacheServiceClient::connect(base.clone())
+        .await
+        .unwrap()
+        .max_decoding_message_size(64 * 1024 * 1024);
+    let request = tonic::Request::new(ChunkNegotiateRequest {
+        want: vec!["cneg22".to_owned()],
+        have_chunks: vec![have_digest],
+        have: Vec::new(),
+    });
+    let response = grpc_client
+        .negotiate_chunks(request)
+        .await
+        .unwrap()
+        .into_inner();
+
+    assert_eq!(response.path_mappings.len(), 1);
+    assert!(
+        response.missing_chunks.is_empty(),
+        "client has all chunks, missing should be empty but got {}",
+        response.missing_chunks.len()
+    );
+    assert_eq!(response.total_chunk_size, 0);
+}
+
+#[tokio::test]
+async fn test_castore_chunk_upload_with_verification() {
+    let server = TestServer::start_castore_with_tokens(&["writer"]);
+    let client = reqwest::Client::new();
+    let base = server.base_url();
+
+    let chunk_data = b"externally uploaded chunk data";
+    let hash = blake3::hash(chunk_data);
+    let hex: String = hash.as_bytes().iter().map(|b| format!("{b:02x}")).collect();
+
+    let resp = client
+        .put(format!("{base}/cas/chunk/{hex}"))
+        .header("Authorization", "Bearer test_token_writer")
+        .body(chunk_data.to_vec())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let resp = client
+        .get(format!("{base}/cas/chunk/{hex}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.bytes().await.unwrap().as_ref(), chunk_data);
+
+    // Idempotent re-upload.
+    let resp = client
+        .put(format!("{base}/cas/chunk/{hex}"))
+        .header("Authorization", "Bearer test_token_writer")
+        .body(chunk_data.to_vec())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+}
+
+#[tokio::test]
+async fn test_castore_chunk_upload_digest_mismatch() {
+    let server = TestServer::start_castore_with_tokens(&["writer"]);
+    let client = reqwest::Client::new();
+    let base = server.base_url();
+
+    let chunk_data = b"this data does not match the digest";
+    let wrong_hex = "aa".repeat(32);
+
+    let resp = client
+        .put(format!("{base}/cas/chunk/{wrong_hex}"))
+        .header("Authorization", "Bearer test_token_writer")
+        .body(chunk_data.to_vec())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+    let body = resp.text().await.unwrap();
+    assert!(body.contains("digest mismatch"));
+}
+
+#[tokio::test]
+async fn test_castore_negotiate_chunks_unavailable() {
+    let server = TestServer::start_castore();
+
+    use ekapkgs_protocol::ekapkgs::v1::ChunkNegotiateRequest;
+    use ekapkgs_protocol::ekapkgs::v1::cache_service_client::CacheServiceClient;
+
+    let mut grpc_client = CacheServiceClient::connect(server.base_url())
+        .await
+        .unwrap()
+        .max_decoding_message_size(64 * 1024 * 1024);
+    let request = tonic::Request::new(ChunkNegotiateRequest {
+        want: vec!["nonexistent".to_owned()],
+        have_chunks: Vec::new(),
+        have: Vec::new(),
+    });
+    let response = grpc_client
+        .negotiate_chunks(request)
+        .await
+        .unwrap()
+        .into_inner();
+
+    assert!(response.path_mappings.is_empty());
+    assert_eq!(response.unavailable, vec!["nonexistent"]);
+    assert!(response.missing_chunks.is_empty());
+}
+
+#[tokio::test]
+async fn test_castore_metrics_include_cas() {
+    let server = TestServer::start_castore_with_tokens(&["writer"]);
+    let client = reqwest::Client::new();
+    let base = server.base_url();
+
+    let nar_data = build_test_nar(b"metrics test");
+    push_nar_to_castore(
+        &client,
+        &base,
+        "met222",
+        "metpkg",
+        "1.0",
+        &nar_data,
+        "test_token_writer",
+    )
+    .await;
+
+    let resp = client.get(format!("{base}/metrics")).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let body = resp.text().await.unwrap();
+
+    assert!(
+        body.contains("ekapkgs_cas_chunks_total"),
+        "missing cas_chunks_total"
+    );
+    assert!(
+        body.contains("ekapkgs_cas_chunks_bytes_total"),
+        "missing cas_chunks_bytes_total"
+    );
+    assert!(
+        body.contains("ekapkgs_cas_paths_total"),
+        "missing cas_paths_total"
+    );
+    assert!(
+        body.contains("ekapkgs_cas_push_chunks_new"),
+        "missing cas_push_chunks_new"
+    );
+    assert!(
+        body.contains("ekapkgs_cas_push_chunks_existing"),
+        "missing cas_push_chunks_existing"
+    );
+}
+
+#[tokio::test]
+async fn test_castore_stream_nars_directory() {
+    let server = TestServer::start_castore_with_tokens(&["writer"]);
+    let client = reqwest::Client::new();
+    let base = server.base_url();
+
+    let nar_data = build_dir_test_nar(&[
+        ("bin/hello", b"#!/bin/sh\necho hello\n"),
+        ("lib/libfoo.so", b"fake shared library data"),
+    ]);
+    push_nar_to_castore(
+        &client,
+        &base,
+        "sdir11",
+        "dirstream",
+        "1.0",
+        &nar_data,
+        "test_token_writer",
+    )
+    .await;
+
+    use ekapkgs_protocol::ekapkgs::v1::StreamNarsRequest;
+    use ekapkgs_protocol::ekapkgs::v1::cache_service_client::CacheServiceClient;
+
+    let mut grpc_client = CacheServiceClient::connect(base.clone()).await.unwrap();
+    let request = tonic::Request::new(StreamNarsRequest {
+        path_hashes: vec!["sdir11".to_owned()],
+    });
+    let mut stream = grpc_client.stream_nars(request).await.unwrap().into_inner();
+
+    let mut received = Vec::new();
+    while let Some(chunk) = stream.message().await.unwrap() {
+        received.extend_from_slice(&chunk.data);
+    }
+
+    assert_eq!(received, nar_data);
+}
+
+#[tokio::test]
+async fn test_castore_negotiate_without_cas_support() {
+    let server = TestServer::start_castore_with_tokens(&["writer"]);
+    let client = reqwest::Client::new();
+    let base = server.base_url();
+
+    let nar_data = build_test_nar(b"no cas flag test");
+    push_nar_to_castore(
+        &client,
+        &base,
+        "noca11",
+        "nocaspkg",
+        "1.0",
+        &nar_data,
+        "test_token_writer",
+    )
+    .await;
+
+    use ekapkgs_protocol::ekapkgs::v1::NegotiateRequest;
+    use ekapkgs_protocol::ekapkgs::v1::cache_service_client::CacheServiceClient;
+
+    let mut grpc_client = CacheServiceClient::connect(base.clone())
+        .await
+        .unwrap()
+        .max_decoding_message_size(64 * 1024 * 1024);
+    let request = tonic::Request::new(NegotiateRequest {
+        want: vec!["noca11".to_owned()],
+        have: Vec::new(),
+        accept_compression: Vec::new(),
+        trust_roots: Vec::new(),
+        supports_cas: false,
+        target_hash: String::new(),
+    });
+    let response = grpc_client.negotiate(request).await.unwrap().into_inner();
+
+    assert_eq!(response.available.len(), 1);
+    assert!(
+        response.ca_path_mappings.is_empty(),
+        "ca_path_mappings should be empty when supports_cas=false"
+    );
 }

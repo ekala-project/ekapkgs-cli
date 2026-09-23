@@ -124,7 +124,9 @@ fn parse_nar_obj(reader: &mut NarReader<'_>) -> color_eyre::Result<NarNode> {
 
 fn parse_regular(reader: &mut NarReader<'_>) -> color_eyre::Result<NarNode> {
     let mut executable = false;
-    // Read fields — could be "executable" then "contents", or just "contents".
+    // Read fields — could be "executable" then "contents", just "contents",
+    // or neither (empty file with no contents field — closing ")" follows
+    // immediately).
     loop {
         let field = reader.read_string()?;
         match field.as_str() {
@@ -136,6 +138,16 @@ fn parse_regular(reader: &mut NarReader<'_>) -> color_eyre::Result<NarNode> {
             "contents" => {
                 let data = reader.read_str()?.to_vec();
                 return Ok(NarNode::Regular { executable, data });
+            },
+            ")" => {
+                // Empty file with no contents field. Rewind past the ")"
+                // so the outer parse_nar_obj can consume it.
+                // A ")" string is: 8 bytes (length=1) + 1 byte + 7 pad = 16 bytes.
+                reader.pos -= 16;
+                return Ok(NarNode::Regular {
+                    executable,
+                    data: Vec::new(),
+                });
             },
             other => bail!("unexpected field in regular file: {other:?}"),
         }
@@ -297,6 +309,27 @@ mod tests {
         let nar = write_nar(&node);
         let parsed = parse_nar(&nar).unwrap();
         assert_eq!(node, parsed);
+    }
+
+    #[test]
+    fn parse_empty_file_without_contents_field() {
+        // Build a NAR manually where a regular file has no "contents" field —
+        // just `( type regular )`. This is valid per the NAR spec.
+        let mut buf = Vec::new();
+        write_str(&mut buf, "nix-archive-1");
+        write_str(&mut buf, "(");
+        write_str(&mut buf, "type");
+        write_str(&mut buf, "regular");
+        write_str(&mut buf, ")");
+
+        let parsed = parse_nar(&buf).unwrap();
+        assert_eq!(
+            parsed,
+            NarNode::Regular {
+                executable: false,
+                data: Vec::new(),
+            }
+        );
     }
 
     #[test]

@@ -17,6 +17,11 @@ pub async fn get_log(
     headers: HeaderMap,
     Path(drv): Path<String>,
 ) -> Response {
+    // Reject path traversal attempts.
+    if drv.contains('/') || drv.contains('\\') || drv.contains("..") || drv.contains('\0') {
+        return not_found();
+    }
+
     // Extract the derivation hash from the first 32 chars.
     // The drv path basename looks like: {hash}-{name}.drv
     let drv_name = drv
