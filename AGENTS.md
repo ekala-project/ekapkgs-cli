@@ -1,6 +1,6 @@
 # Agent Guide for ekapkgs-cli
 
-Nix CLI wrapper with a negotiated binary cache protocol. Two binaries: `ekapkgs` (client) and `ekapkgs-serve` (server). Resolves entire closures in a single gRPC round trip instead of ~3N HTTP requests. Also provides `system` (nixos-rebuild replacement), `home` (home-manager replacement), `search` (package/option/file search), `closure sbom` (SBOM generation), and `registry` (flake registry management) commands.
+Nix CLI wrapper with a negotiated binary cache protocol. Two binaries: `ekapkgs` (client) and `ekapkgs-serve` (server). Resolves entire closures in a single gRPC round trip instead of ~3N HTTP requests. Also provides `system` (nixos-rebuild replacement), `home` (home-manager replacement), `search` (package/option/file search), `closure sbom` (SBOM generation), `registry` (flake registry management), and `template` (core-pkgs package expression generation) commands.
 
 ## Project Structure
 
@@ -315,6 +315,36 @@ Hidden internal commands used by hooks: `_profile-bin`, `_is-trusted`, `_fingerp
 - `env allow` stores `blake3(manifest contents)` — any manifest edit invalidates trust
 - `compute_fingerprint()` hashes mtimes of `.ekapkgs-env.toml`, `flake.nix`, `flake.lock` — cheap per-prompt staleness check
 - Inside a child shell, fingerprint changes trigger `_render-env` + re-source (live reload without exiting)
+
+### Package Templates (`ekapkgs template`)
+
+Generates core-pkgs-compatible Nix package expressions. Subcommands: `stdenv`, `cmake`, `meson`, `rust`, `go`, `python`, `auto`.
+
+Each template produces a complete `callPackage`-compatible expression following core-pkgs conventions:
+- Always uses `finalAttrs:` pattern (e.g., `stdenv.mkDerivation (finalAttrs: { ... })`)
+- Uses `tag` instead of `rev` in fetchers (e.g., `tag = "v${finalAttrs.version}";`)
+- No `maintainers` in meta — core-pkgs does not use `meta.maintainers`
+- CMake templates include `cmake.configurePhaseHook` in `nativeBuildInputs` and use `cmakeEntries` (structured attr-set)
+- Meson templates include `meson.configurePhaseHook` and `ninja` in `nativeBuildInputs` and use `mesonEntries`
+- Python templates use `pyproject = true`, `build-system`, and `pythonImportsCheck`
+- Rust templates use `cargoHash` (defaults to placeholder hash)
+- Go templates use `vendorHash` and include `mainProgram`
+
+Features:
+- `--from-url` fetches metadata (description, license, version) from GitHub API and prefetches source hash via `nix-prefetch-url`
+- `--stdout` prints to stdout instead of writing a file
+- `--pname`, `--version`, `--description`, `--license` override metadata
+- `auto` subcommand detects project type from indicator files (Cargo.toml, go.mod, pyproject.toml, meson.build, CMakeLists.txt, etc.)
+
+#### Code structure
+
+The template command is implemented as a module directory at `commands/template/`:
+- `mod.rs` — `execute()` dispatcher, URL metadata fetching, file output
+- `types.rs` — `TemplateKind` enum, `Fetcher` enum, `ExpressionInfo` struct
+- `expression.rs` — `generate()` function with per-template renderers, shared helpers for fetch blocks and meta blocks
+- `detect.rs` — `detect_template()` scans directory for indicator files in priority order
+- `url.rs` — `parse_url()` for GitHub/GitLab URL parsing, `fetch_github_metadata()` using reqwest (via inline tokio runtime)
+- `prefetch.rs` — `prefetch_source_hash()` using `nix-prefetch-url --unpack` + `nix hash to-sri`
 
 ### Flake Registry (`ekapkgs registry`)
 

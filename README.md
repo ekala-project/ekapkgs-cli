@@ -266,6 +266,28 @@ rev = "abc123def456"
 nixpkgs = "github:NixOS/nixpkgs/nixos-24.05"
 ```
 
+### Package templates
+
+Generate core-pkgs-compatible Nix package expressions from templates.
+Supports auto-detection from source files and GitHub URL metadata
+fetching with source hash prefetching.
+
+```
+ekapkgs template rust --stdout                 # print Rust template to stdout
+ekapkgs template python default.nix            # write Python template to file
+ekapkgs template auto                          # auto-detect from source files
+ekapkgs template go --from-url github.com/user/repo   # fetch metadata from GitHub
+ekapkgs template cmake --pname mylib --version 1.0.0  # override metadata
+ekapkgs template meson --license lgpl21Plus            # set license
+```
+
+Available templates: `stdenv`, `cmake`, `meson`, `rust`, `go`, `python`, `auto`.
+
+Generated expressions use core-pkgs conventions: `finalAttrs` pattern,
+`tag` instead of `rev` in fetchers, `cmakeEntries`/`mesonEntries` for
+structured build options, `pyproject = true` with `build-system` for
+Python, and no `maintainers` in meta.
+
 ### Search
 
 Search packages, configuration options, or files. Indexes are cached
