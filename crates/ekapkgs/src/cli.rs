@@ -190,6 +190,12 @@ pub enum Command {
         flake: String,
     },
 
+    /// Generate Nix package expressions for core-pkgs.
+    Template {
+        #[command(subcommand)]
+        command: TemplateCommand,
+    },
+
     /// Generate shell completions.
     Completions {
         /// Shell to generate completions for.
@@ -1278,6 +1284,82 @@ pub enum SearchCommand {
         #[arg(long)]
         remote: Option<String>,
     },
+}
+
+#[derive(Subcommand)]
+pub enum TemplateCommand {
+    /// Generate a stdenv (autotools/make) package expression.
+    Stdenv {
+        #[command(flatten)]
+        opts: TemplateOpts,
+    },
+
+    /// Generate a CMake package expression.
+    Cmake {
+        #[command(flatten)]
+        opts: TemplateOpts,
+    },
+
+    /// Generate a Meson package expression.
+    Meson {
+        #[command(flatten)]
+        opts: TemplateOpts,
+    },
+
+    /// Generate a Rust package expression (buildRustPackage).
+    Rust {
+        #[command(flatten)]
+        opts: TemplateOpts,
+    },
+
+    /// Generate a Go package expression (buildGoModule).
+    Go {
+        #[command(flatten)]
+        opts: TemplateOpts,
+    },
+
+    /// Generate a Python package expression (buildPythonPackage).
+    Python {
+        #[command(flatten)]
+        opts: TemplateOpts,
+    },
+
+    /// Auto-detect the project type from source files.
+    Auto {
+        #[command(flatten)]
+        opts: TemplateOpts,
+    },
+}
+
+#[derive(clap::Args)]
+pub struct TemplateOpts {
+    /// Output path for the generated expression.
+    #[arg(default_value = "default.nix")]
+    pub path: String,
+
+    /// Package name.
+    #[arg(long)]
+    pub pname: Option<String>,
+
+    /// Package version.
+    #[arg(long)]
+    pub version: Option<String>,
+
+    /// Short description for meta.description.
+    #[arg(long)]
+    pub description: Option<String>,
+
+    /// Fetch source from a URL (GitHub/GitLab).
+    #[arg(long)]
+    pub from_url: Option<String>,
+
+    /// Print to stdout instead of writing a file.
+    #[arg(long)]
+    pub stdout: bool,
+
+    /// License (nixpkgs short name, e.g., `mit`, `gpl3Plus`).
+    #[arg(long)]
+    pub license: Option<String>,
 }
 
 #[derive(Clone, clap::ValueEnum)]
