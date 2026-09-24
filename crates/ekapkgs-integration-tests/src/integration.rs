@@ -4,6 +4,7 @@
 //! endpoints. They require `cargo build` to have been run first (or they build
 //! inline via `cargo_bin`).
 
+use std::net::TcpStream;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 
@@ -49,6 +50,19 @@ fn cargo_bin(name: &str) -> PathBuf {
     path.push("debug");
     path.push(name);
     path
+}
+
+/// Poll until the server is accepting TCP connections on the given port.
+/// Gives up after 10 seconds and panics.
+fn wait_for_ready(port: u16) {
+    let addr = format!("127.0.0.1:{port}");
+    for _ in 0..100 {
+        if TcpStream::connect(&addr).is_ok() {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    panic!("Server did not become ready on {addr} within 10 seconds");
 }
 
 /// Set up a filesystem cache directory with a signing key and start the server.
@@ -150,8 +164,7 @@ secret_key_file = "{}"
                 )
             });
 
-        // Give the server a moment to start.
-        std::thread::sleep(std::time::Duration::from_millis(500));
+        wait_for_ready(port);
 
         Self {
             child,
@@ -233,7 +246,7 @@ secret_key_file = "{}"
                 )
             });
 
-        std::thread::sleep(std::time::Duration::from_millis(500));
+        wait_for_ready(port);
 
         Self {
             child,
