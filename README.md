@@ -1,9 +1,19 @@
 # ekapkgs-cli
 
-Nix CLI wrapper with a negotiated binary cache protocol. Resolves entire
-closures in a single round trip instead of one HTTP request per store path.
+A unified Nix CLI that replaces several standalone tools with a single
+binary. Two binaries: `ekapkgs` (client) and `ekapkgs-serve` (server).
 
-Two binaries: `ekapkgs` (client) and `ekapkgs-serve` (server).
+`ekapkgs` combines the functionality of:
+
+- **nix** — build, run, shell, develop, flake operations with integrated caching
+- **nixos-rebuild** — `ekapkgs system` for system configuration management with auto-rollback
+- **home-manager** — `ekapkgs home` for per-user dotfiles, packages, and services
+- **nix-index** — `ekapkgs search` for packages, options, and file search with cached indexes
+- **nix-prefetch / nix-init** — `ekapkgs template` for generating Nix expressions with GitHub metadata fetching
+- **nix copy / cachix** — `ekapkgs cache` with a negotiated binary cache protocol (single round trip)
+- **nix-env / devenv** — `ekapkgs env` for per-directory dev environments with shell hook activation
+- **nix registry** — `ekapkgs registry` for flake registry management
+- **syft / trivy** — `ekapkgs closure sbom` for CycloneDX SBOM generation from Nix closures
 
 ## Why
 
