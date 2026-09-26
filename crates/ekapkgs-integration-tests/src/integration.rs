@@ -4,7 +4,6 @@
 //! endpoints. They require `cargo build` to have been run first (or they build
 //! inline via `cargo_bin`).
 
-use std::net::TcpStream;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 
@@ -40,6 +39,10 @@ const HASH_NOCA: &str = "n0n0n0n0n0n0n0n0n0n0n0n0n0n0n0n0";
 const HASH_CASTST: &str = "dddddddddddddddddddddddddddddd11";
 const HASH_EXISTS: &str = "11111111111111111111111111111111";
 const HASH_PUSH: &str = "pppppppppppppppppppppppppppppppp";
+const HASH_BLOOM: &str = "b100b100b100b100b100b100b100b100";
+const HASH_PNEG1: &str = "p1p1p1p1p1p1p1p1p1p1p1p1p1p1p1p1";
+const HASH_PNEG2: &str = "p2p2p2p2p2p2p2p2p2p2p2p2p2p2p2p2";
+const HASH_NEST: &str = "n3n3n3n3n3n3n3n3n3n3n3n3n3n3n3n3";
 
 /// Find the built binary in the target directory.
 fn cargo_bin(name: &str) -> PathBuf {
@@ -52,17 +55,24 @@ fn cargo_bin(name: &str) -> PathBuf {
     path
 }
 
-/// Poll until the server is accepting TCP connections on the given port.
-/// Gives up after 10 seconds and panics.
-fn wait_for_ready(port: u16) {
-    let addr = format!("127.0.0.1:{port}");
+/// Wait for the server to write its actual port to a file, then return it.
+/// The server binds to port 0 and writes the real port to `EKAPKGS_PORT_FILE`.
+/// This avoids the TOCTOU race of `find_free_port()`.
+fn wait_for_port(port_file: &std::path::Path) -> u16 {
     for _ in 0..100 {
-        if TcpStream::connect(&addr).is_ok() {
-            return;
+        if let Ok(contents) = std::fs::read_to_string(port_file) {
+            if let Ok(port) = contents.trim().parse::<u16>() {
+                if port > 0 {
+                    return port;
+                }
+            }
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
-    panic!("Server did not become ready on {addr} within 10 seconds");
+    panic!(
+        "Server did not write port to {} within 10 seconds",
+        port_file.display()
+    );
 }
 
 /// Set up a filesystem cache directory with a signing key and start the server.
@@ -147,13 +157,12 @@ secret_key_file = "{}"
 
         std::fs::write(&config_path, &config).unwrap();
 
-        // Find a free port.
-        let port = find_free_port();
-
+        let port_file = token_dir.path().join("port");
         let bin = cargo_bin("ekapkgs-serve");
         let child = Command::new(&bin)
             .args(["--config", config_path.to_str().unwrap()])
-            .args(["--bind", &format!("127.0.0.1:{port}")])
+            .args(["--bind", "127.0.0.1:0"])
+            .env("EKAPKGS_PORT_FILE", &port_file)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
@@ -164,7 +173,7 @@ secret_key_file = "{}"
                 )
             });
 
-        wait_for_ready(port);
+        let port = wait_for_port(&port_file);
 
         Self {
             child,
@@ -230,12 +239,12 @@ secret_key_file = "{}"
 
         std::fs::write(&config_path, &config).unwrap();
 
-        let port = find_free_port();
-
+        let port_file = token_dir.path().join("port");
         let bin = cargo_bin("ekapkgs-serve");
         let child = Command::new(&bin)
             .args(["--config", config_path.to_str().unwrap()])
-            .args(["--bind", &format!("127.0.0.1:{port}")])
+            .args(["--bind", "127.0.0.1:0"])
+            .env("EKAPKGS_PORT_FILE", &port_file)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
@@ -246,7 +255,7 @@ secret_key_file = "{}"
                 )
             });
 
-        wait_for_ready(port);
+        let port = wait_for_port(&port_file);
 
         Self {
             child,
@@ -273,11 +282,6 @@ impl Drop for TestServer {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
-}
-
-fn find_free_port() -> u16 {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    listener.local_addr().unwrap().port()
 }
 
 // ===== Tests =====
@@ -1837,4 +1841,365 @@ async fn test_castore_negotiate_without_cas_support() {
         response.ca_path_mappings.is_empty(),
         "ca_path_mappings should be empty when supports_cas=false"
     );
+}
+
+// ===== New CAS feature integration tests =====
+
+#[tokio::test]
+async fn test_castore_negotiate_chunks_with_bloom_filter() {
+    let server = TestServer::start_castore_with_tokens(&["writer"]);
+    let client = reqwest::Client::new();
+    let base = server.base_url();
+
+    let content = b"bloom filter negotiation test data";
+    let nar_data = build_test_nar(content);
+    push_nar_to_castore(
+        &client,
+        &base,
+        HASH_BLOOM,
+        "bloompkg",
+        "1.0",
+        &nar_data,
+        "test_token_writer",
+    )
+    .await;
+
+    // Build a bloom filter containing the chunk digest.
+    let chunk_hash = blake3::hash(content);
+    let chunk_digest: [u8; 32] = *chunk_hash.as_bytes();
+
+    use ekapkgs_nix::bloom::BloomFilter;
+    let mut bf = BloomFilter::new(100);
+    bf.insert(&chunk_digest);
+    let bloom_bytes = bf.into_bytes();
+    let num_hashes = {
+        let bf2 = BloomFilter::new(100);
+        bf2.num_hashes()
+    };
+
+    use ekapkgs_protocol::ekapkgs::v1::ChunkNegotiateRequest;
+    use ekapkgs_protocol::ekapkgs::v1::cache_service_client::CacheServiceClient;
+
+    let mut grpc_client = CacheServiceClient::connect(base.clone())
+        .await
+        .unwrap()
+        .max_decoding_message_size(64 * 1024 * 1024);
+
+    // With bloom filter claiming we have the chunk — missing_chunks should be empty.
+    let request = tonic::Request::new(ChunkNegotiateRequest {
+        want: vec![HASH_BLOOM.to_owned()],
+        have_chunks: Vec::new(),
+        have: Vec::new(),
+        have_chunks_bloom: bloom_bytes,
+        bloom_num_hashes: num_hashes,
+    });
+    let response = grpc_client
+        .negotiate_chunks(request)
+        .await
+        .unwrap()
+        .into_inner();
+
+    assert_eq!(response.path_mappings.len(), 1);
+    assert!(
+        response.missing_chunks.is_empty(),
+        "bloom filter should indicate client has all chunks, but got {} missing",
+        response.missing_chunks.len()
+    );
+    assert_eq!(response.total_chunk_size, 0);
+
+    // With empty bloom filter — should report chunks as missing.
+    let empty_bf = BloomFilter::new(100);
+    let empty_bytes = empty_bf.into_bytes();
+    let request = tonic::Request::new(ChunkNegotiateRequest {
+        want: vec![HASH_BLOOM.to_owned()],
+        have_chunks: Vec::new(),
+        have: Vec::new(),
+        have_chunks_bloom: empty_bytes,
+        bloom_num_hashes: num_hashes,
+    });
+    let response = grpc_client
+        .negotiate_chunks(request)
+        .await
+        .unwrap()
+        .into_inner();
+
+    assert!(
+        !response.missing_chunks.is_empty(),
+        "empty bloom filter should report missing chunks"
+    );
+    assert!(response.total_chunk_size > 0);
+}
+
+#[tokio::test]
+async fn test_castore_push_negotiate_rpc() {
+    let server = TestServer::start_castore_with_tokens(&["writer"]);
+    let client = reqwest::Client::new();
+    let base = server.base_url();
+
+    // Push a path first so the server has CAS data.
+    let content = b"push negotiate test data";
+    let nar_data = build_test_nar(content);
+    push_nar_to_castore(
+        &client,
+        &base,
+        HASH_PNEG1,
+        "pushpkg",
+        "1.0",
+        &nar_data,
+        "test_token_writer",
+    )
+    .await;
+
+    use ekapkgs_protocol::ekapkgs::v1::cache_service_client::CacheServiceClient;
+    use ekapkgs_protocol::ekapkgs::v1::{
+        B3Digest, CaDirectoryData, CaNode, PushNegotiateRequest,
+    };
+
+    let mut grpc_client = CacheServiceClient::connect(base.clone())
+        .await
+        .unwrap()
+        .max_decoding_message_size(64 * 1024 * 1024);
+
+    // PushNegotiate for a path that already exists — should return already_exists=true.
+    let request = tonic::Request::new(PushNegotiateRequest {
+        store_path_hash: HASH_PNEG1.to_owned(),
+        root_node: Some(CaNode { node: None }),
+        directories: Vec::new(),
+        file_chunk_mappings: Vec::new(),
+    });
+    let response = grpc_client
+        .push_negotiate(request)
+        .await
+        .unwrap()
+        .into_inner();
+
+    assert!(
+        response.already_exists,
+        "push negotiate for existing path should return already_exists=true"
+    );
+    assert!(response.missing_chunks.is_empty());
+
+    // PushNegotiate for a path that doesn't exist — should return missing chunks.
+    // Decompose a NAR to get real CAS metadata.
+    use ekapkgs_nix::decompose::decompose_nar;
+    use ekapkgs_nix::nar::parse_nar;
+
+    let new_content = b"new package data for push negotiate";
+    let new_nar = build_test_nar(new_content);
+    let nar_node = parse_nar(&new_nar).unwrap();
+    let result = decompose_nar(&nar_node);
+
+    let directories: Vec<CaDirectoryData> = result
+        .directories
+        .iter()
+        .map(|(digest, dir)| CaDirectoryData {
+            digest: Some(B3Digest {
+                digest: digest.to_vec(),
+            }),
+            directory: Some(dir.clone()),
+        })
+        .collect();
+
+    let request = tonic::Request::new(PushNegotiateRequest {
+        store_path_hash: HASH_PNEG2.to_owned(),
+        root_node: Some(result.root_node),
+        directories,
+        file_chunk_mappings: result.file_chunk_mappings,
+    });
+    let response = grpc_client
+        .push_negotiate(request)
+        .await
+        .unwrap()
+        .into_inner();
+
+    assert!(!response.already_exists);
+    assert!(
+        !response.missing_chunks.is_empty(),
+        "server should report missing chunks for new path"
+    );
+
+    // Upload the missing chunks, then the NAR + narinfo.
+    for missing in &response.missing_chunks {
+        let d: [u8; 32] = missing.digest.as_slice().try_into().unwrap();
+        let chunk_data = result
+            .chunks
+            .iter()
+            .find(|c| c.digest == d)
+            .expect("missing chunk should be in decompose result");
+        let hex: String = d.iter().map(|b| format!("{b:02x}")).collect();
+        let resp = client
+            .put(format!("{base}/cas/chunk/{hex}"))
+            .header("Authorization", "Bearer test_token_writer")
+            .body(chunk_data.data.clone())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+    }
+
+    push_nar_to_castore(
+        &client,
+        &base,
+        HASH_PNEG2,
+        "newpush",
+        "2.0",
+        &new_nar,
+        "test_token_writer",
+    )
+    .await;
+
+    // Verify the NAR can be retrieved.
+    let resp = client
+        .get(format!("{base}/nar/{HASH_PNEG2}.nar"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.bytes().await.unwrap().as_ref(), new_nar.as_slice());
+}
+
+#[tokio::test]
+async fn test_castore_push_negotiate_on_filesystem_backend() {
+    // PushNegotiate on a non-CAS server should return Unimplemented.
+    let server = TestServer::start();
+
+    use ekapkgs_protocol::ekapkgs::v1::cache_service_client::CacheServiceClient;
+    use ekapkgs_protocol::ekapkgs::v1::{CaNode, PushNegotiateRequest};
+
+    let mut grpc_client = CacheServiceClient::connect(server.base_url())
+        .await
+        .unwrap()
+        .max_decoding_message_size(64 * 1024 * 1024);
+
+    let request = tonic::Request::new(PushNegotiateRequest {
+        store_path_hash: HASH_MISS.to_owned(),
+        root_node: Some(CaNode { node: None }),
+        directories: Vec::new(),
+        file_chunk_mappings: Vec::new(),
+    });
+    let result = grpc_client.push_negotiate(request).await;
+
+    assert!(result.is_err());
+    let status = result.unwrap_err();
+    assert_eq!(status.code(), tonic::Code::Unimplemented);
+}
+
+#[tokio::test]
+async fn test_castore_nested_directory_streaming() {
+    let server = TestServer::start_castore_with_tokens(&["writer"]);
+    let client = reqwest::Client::new();
+    let base = server.base_url();
+
+    // Build a NAR with nested directories: top/sub/file.txt, top/link -> sub
+    let mut buf = Vec::new();
+    nar_write_str(&mut buf, "nix-archive-1");
+    nar_write_str(&mut buf, "(");
+    nar_write_str(&mut buf, "type");
+    nar_write_str(&mut buf, "directory");
+
+    // entry: sub (directory containing file.txt)
+    nar_write_str(&mut buf, "entry");
+    nar_write_str(&mut buf, "(");
+    nar_write_str(&mut buf, "name");
+    nar_write_str(&mut buf, "sub");
+    nar_write_str(&mut buf, "node");
+    nar_write_str(&mut buf, "(");
+    nar_write_str(&mut buf, "type");
+    nar_write_str(&mut buf, "directory");
+    // sub/file.txt
+    nar_write_str(&mut buf, "entry");
+    nar_write_str(&mut buf, "(");
+    nar_write_str(&mut buf, "name");
+    nar_write_str(&mut buf, "file.txt");
+    nar_write_str(&mut buf, "node");
+    nar_write_str(&mut buf, "(");
+    nar_write_str(&mut buf, "type");
+    nar_write_str(&mut buf, "regular");
+    nar_write_str(&mut buf, "contents");
+    nar_write_bytes(&mut buf, b"nested file content for streaming test");
+    nar_write_str(&mut buf, ")");
+    nar_write_str(&mut buf, ")");
+    nar_write_str(&mut buf, ")"); // close sub dir
+    nar_write_str(&mut buf, ")"); // close sub entry
+
+    // entry: symlink -> sub
+    nar_write_str(&mut buf, "entry");
+    nar_write_str(&mut buf, "(");
+    nar_write_str(&mut buf, "name");
+    nar_write_str(&mut buf, "symlink");
+    nar_write_str(&mut buf, "node");
+    nar_write_str(&mut buf, "(");
+    nar_write_str(&mut buf, "type");
+    nar_write_str(&mut buf, "symlink");
+    nar_write_str(&mut buf, "target");
+    nar_write_str(&mut buf, "sub");
+    nar_write_str(&mut buf, ")");
+    nar_write_str(&mut buf, ")");
+
+    nar_write_str(&mut buf, ")"); // close top dir
+
+    let nar_data = buf;
+    push_nar_to_castore(
+        &client,
+        &base,
+        HASH_NEST,
+        "nestedpkg",
+        "1.0",
+        &nar_data,
+        "test_token_writer",
+    )
+    .await;
+
+    // Verify NAR roundtrip via HTTP GET (uses streaming CAS reassembly).
+    let resp = client
+        .get(format!("{base}/nar/{HASH_NEST}.nar"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.bytes().await.unwrap().as_ref(), nar_data.as_slice());
+
+    // Also verify via gRPC streaming.
+    use ekapkgs_protocol::ekapkgs::v1::StreamNarsRequest;
+    use ekapkgs_protocol::ekapkgs::v1::cache_service_client::CacheServiceClient;
+
+    let mut grpc_client = CacheServiceClient::connect(base.clone()).await.unwrap();
+    let request = tonic::Request::new(StreamNarsRequest {
+        path_hashes: vec![HASH_NEST.to_owned()],
+    });
+    let mut stream = grpc_client.stream_nars(request).await.unwrap().into_inner();
+
+    let mut received = Vec::new();
+    while let Some(chunk) = stream.message().await.unwrap() {
+        received.extend_from_slice(&chunk.data);
+    }
+    assert_eq!(received, nar_data);
+
+    // Verify chunk negotiate returns directories and file mappings.
+    use ekapkgs_protocol::ekapkgs::v1::ChunkNegotiateRequest;
+
+    let mut grpc_client = CacheServiceClient::connect(base.clone())
+        .await
+        .unwrap()
+        .max_decoding_message_size(64 * 1024 * 1024);
+    let request = tonic::Request::new(ChunkNegotiateRequest {
+        want: vec![HASH_NEST.to_owned()],
+        have_chunks: Vec::new(),
+        have: Vec::new(),
+        have_chunks_bloom: Vec::new(),
+        bloom_num_hashes: 0,
+    });
+    let response = grpc_client
+        .negotiate_chunks(request)
+        .await
+        .unwrap()
+        .into_inner();
+
+    assert_eq!(response.path_mappings.len(), 1);
+    assert!(
+        !response.directories.is_empty(),
+        "nested directory NAR should produce directory metadata"
+    );
+    assert!(!response.file_chunk_mappings.is_empty());
+    assert!(!response.missing_chunks.is_empty());
 }
