@@ -15,7 +15,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use ekapkgs_nix::bloom::BloomFilter;
-
 use ekapkgs_nix::nar::{ChunkReader, NarDirectoryEntry, NarNode, parse_nar, write_nar_streaming};
 use ekapkgs_protocol::ekapkgs::v1::{
     B3Digest, CaDirectory, CaDirectoryEntry, CaDirectoryNode, CaFileNode, CaNode, CaSymlinkNode,
@@ -1407,9 +1406,7 @@ mod tests {
 
         // With empty have set, all chunks should be missing.
         let empty = ChunkHaveCheck::Exact(HashSet::new());
-        let (missing, dirs, file_maps) = backend
-            .walk_cas_trees(&["walk123"], &empty)
-            .unwrap();
+        let (missing, dirs, file_maps) = backend.walk_cas_trees(&["walk123"], &empty).unwrap();
         assert!(!missing.is_empty());
         // A single file has no directories.
         assert!(dirs.is_empty());
