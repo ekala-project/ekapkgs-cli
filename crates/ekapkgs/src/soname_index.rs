@@ -34,8 +34,8 @@ impl SonameIndex {
                 crate::commands::search::try_download_index(url, "sonames")?
             } else {
                 return Err(color_eyre::eyre::eyre!(
-                    "No soname index available. Configure index_url in config.toml \
-                     or provide a sonames.json.zst index file."
+                    "No soname index available. Configure index_url in config.toml or provide a \
+                     sonames.json.zst index file."
                 ));
             }
         } else {

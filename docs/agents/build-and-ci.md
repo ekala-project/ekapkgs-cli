@@ -52,8 +52,8 @@ Before submitting changes:
 
 - [ ] `cargo check --workspace` passes
 - [ ] `cargo clippy --workspace -- -D warnings` passes (no warnings)
-- [ ] `cargo fmt --all -- --check` passes
 - [ ] `cargo test --workspace` passes
 - [ ] If proto files changed, generated code builds correctly
 - [ ] If adding dependencies, they are declared at workspace level in root `Cargo.toml`
 - [ ] If adding a feature or command, update `CHANGELOG.md` under the appropriate section (Client/Server)
+- [ ] `nix fmt .` — run as the final step to format all files (Rust, Nix, etc.)
