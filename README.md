@@ -14,6 +14,7 @@ binary. Two binaries: `ekapkgs` (client) and `ekapkgs-serve` (server).
 - **nix-env / devenv** — `ekapkgs env` for per-directory dev environments with shell hook activation
 - **nix registry** — `ekapkgs registry` for flake registry management
 - **syft / trivy** — `ekapkgs closure sbom` for CycloneDX SBOM generation from Nix closures
+- **nix-ld + FHS** — `ekapkgs fuse` for on-demand `/usr/lib` shared library serving via FUSE
 
 ## Why
 
@@ -312,6 +313,29 @@ ekapkgs search update                      # regenerate indexes
 ekapkgs search update --remote https://...  # download pre-built indexes
 ```
 
+### On-demand shared libraries (FUSE)
+
+Mount a FUSE filesystem at `/usr/lib` to serve shared libraries on-demand
+from a Nix binary cache. Designed for use with nix-ld so unpatched binaries
+with `/usr/lib` on their RPATH can transparently load Nix-provided `.so`
+files without pre-installing packages.
+
+When a process opens a library (e.g. `libxml2.so.2`), the FUSE layer
+resolves the soname to a Nix package via a CI-generated index, downloads
+the package if needed, and serves the file from `/nix/store`.
+
+```
+sudo ekapkgs fuse mount                    # mount at /usr/lib (requires root)
+sudo ekapkgs fuse mount --foreground       # stay in foreground (for systemd)
+sudo ekapkgs fuse mount --mountpoint /opt/lib  # custom mount point
+ekapkgs fuse status                        # check if mounted
+sudo ekapkgs fuse unmount                  # unmount
+```
+
+Requires a soname index (`sonames.json.zst`) available via `index_url` in
+the client config. Transitive dependencies of Nix-built libraries use
+per-DSO resolution caches and do not hit `/usr/lib`.
+
 ### Remote deployment
 
 ```
@@ -413,10 +437,10 @@ as gRPC. Plain `nix build --substituters http://your-server` works unchanged.
 
 ## Building
 
-Requires Rust 1.85+ and `protoc`:
+Requires Rust 1.85+, `protoc`, and `libfuse3-dev`:
 
 ```
-nix shell nixpkgs#gcc nixpkgs#protobuf
+nix shell nixpkgs#gcc nixpkgs#protobuf nixpkgs#fuse3
 cargo build --workspace
 cargo test --workspace
 ```

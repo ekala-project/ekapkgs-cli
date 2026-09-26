@@ -3,6 +3,7 @@
   fenix,
   pkg-config,
   protobuf,
+  fuse3,
 }:
 
 stdenv.mkDerivation {
@@ -18,5 +19,9 @@ stdenv.mkDerivation {
       "rustc"
       "rustfmt-preview"
     ])
+  ];
+
+  buildInputs = [
+    fuse3
   ];
 }

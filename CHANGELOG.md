@@ -75,6 +75,14 @@
 - `doctor` command checking nix, store, caches, and disk space
 - `cache warm` command computing closure diffs between flake.lock versions for CI/CD pre-warming
 - `cache push --sources-only` for low-bandwidth links transferring derivation graphs and FODs instead of built NARs
+- `fuse mount/unmount/status` commands for on-demand `/usr/lib` FUSE layer
+  - Mounts a read-only FUSE filesystem serving shared libraries from a Nix binary cache
+  - Soname index (`sonames.json.zst`) maps library names to Nix packages with `meta.priority` conflict resolution
+  - On-demand download via existing 3-tier negotiate flow (CAS chunks → gRPC streaming → HTTP batch)
+  - Per-store-hash download deduplication for concurrent library loads from the same package
+  - Designed for use with nix-ld; transitive deps use per-DSO resolution caches and bypass `/usr/lib`
+  - Requires root for system-wide mount with `allow_other`
+  - Index behind `Arc<RwLock>` for future SIGHUP-based live reload
 - `substituter` local proxy implementing nix binary cache protocol with batched narinfo queries
   - Critical path prioritization downloading target binary and runtime deps first for faster time-to-first-run
 - Build progress monitor with live DAG display
