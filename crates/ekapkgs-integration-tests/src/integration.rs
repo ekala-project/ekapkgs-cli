@@ -1551,6 +1551,8 @@ async fn test_castore_negotiate_chunks_rpc() {
         want: vec![HASH_CNEG1.to_owned()],
         have_chunks: Vec::new(),
         have: Vec::new(),
+        have_chunks_bloom: Vec::new(),
+        bloom_num_hashes: 0,
     });
     let response = grpc_client
         .negotiate_chunks(request)
@@ -1607,6 +1609,8 @@ async fn test_castore_negotiate_chunks_with_existing() {
         want: vec![HASH_CNEG2.to_owned()],
         have_chunks: vec![have_digest],
         have: Vec::new(),
+        have_chunks_bloom: Vec::new(),
+        bloom_num_hashes: 0,
     });
     let response = grpc_client
         .negotiate_chunks(request)
@@ -1697,6 +1701,8 @@ async fn test_castore_negotiate_chunks_unavailable() {
         want: vec![HASH_MISS.to_owned()],
         have_chunks: Vec::new(),
         have: Vec::new(),
+        have_chunks_bloom: Vec::new(),
+        bloom_num_hashes: 0,
     });
     let response = grpc_client
         .negotiate_chunks(request)

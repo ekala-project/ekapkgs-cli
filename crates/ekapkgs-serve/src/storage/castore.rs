@@ -14,6 +14,8 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
+use ekapkgs_nix::bloom::BloomFilter;
+
 use ekapkgs_nix::nar::{NarDirectoryEntry, NarNode, parse_nar, write_nar};
 use ekapkgs_protocol::ekapkgs::v1::{
     B3Digest, CaDirectory, CaDirectoryEntry, CaDirectoryNode, CaFileNode, CaNode, CaSymlinkNode,
@@ -35,6 +37,25 @@ type CasTreeWalkResult = (Vec<ChunkMeta>, Vec<([u8; 32], CaDirectory)>, FileChun
 const CHUNK_MIN: u32 = 16 * 1024; // 16 KiB
 const CHUNK_AVG: u32 = 64 * 1024; // 64 KiB
 const CHUNK_MAX: u32 = 256 * 1024; // 256 KiB
+
+/// Represents the client's set of already-cached chunk digests.
+///
+/// Either an exact hash set (from the flat `have_chunks` list) or a
+/// probabilistic bloom filter (compact, ~1% FPR).
+pub enum ChunkHaveCheck {
+    Exact(HashSet<[u8; 32]>),
+    Bloom(BloomFilter),
+}
+
+impl ChunkHaveCheck {
+    /// Returns `true` if the client (probably) already has this chunk.
+    pub fn contains(&self, digest: &[u8; 32]) -> bool {
+        match self {
+            Self::Exact(set) => set.contains(digest),
+            Self::Bloom(bf) => bf.maybe_contains(digest),
+        }
+    }
+}
 
 pub struct CastoreBackend {
     root: PathBuf,
@@ -95,7 +116,7 @@ impl CastoreBackend {
     pub fn walk_cas_trees(
         &self,
         want_hashes: &[&str],
-        have_digests: &HashSet<[u8; 32]>,
+        have_digests: &ChunkHaveCheck,
     ) -> color_eyre::Result<CasTreeWalkResult> {
         let mut missing_chunks = Vec::new();
         let mut chunk_seen = HashSet::new();
@@ -673,7 +694,7 @@ impl CastoreBackend {
     fn walk_cas_node(
         &self,
         ca_node: &CaNode,
-        have: &HashSet<[u8; 32]>,
+        have: &ChunkHaveCheck,
         chunk_seen: &mut HashSet<[u8; 32]>,
         missing_chunks: &mut Vec<ChunkMeta>,
         dir_seen: &mut HashSet<[u8; 32]>,
@@ -1327,7 +1348,7 @@ mod tests {
 
         // With empty have set, all chunks should be missing.
         let (missing, dirs, file_maps) = backend
-            .walk_cas_trees(&["walk123"], &HashSet::new())
+            .walk_cas_trees(&["walk123"], &ChunkHaveCheck::Exact(HashSet::new()))
             .unwrap();
         assert!(!missing.is_empty());
         // A single file has no directories.
@@ -1344,7 +1365,9 @@ mod tests {
                     .and_then(|d| d.digest.as_slice().try_into().ok())
             })
             .collect();
-        let (missing2, ..) = backend.walk_cas_trees(&["walk123"], &have).unwrap();
+        let (missing2, ..) = backend
+            .walk_cas_trees(&["walk123"], &ChunkHaveCheck::Exact(have))
+            .unwrap();
         assert!(missing2.is_empty());
     }
 

@@ -59,9 +59,15 @@ message ChunkNegotiateRequest {
   // Store path hashes the client needs.
   repeated string want = 1;
   // Blake3 digests of chunks the client already has locally.
+  // Deprecated: use have_chunks_bloom for large chunk sets.
   repeated B3Digest have_chunks = 2;
   // Store path hashes the client already has (for reference resolution).
   repeated string have = 3;
+  // Bloom filter of chunk digests the client has locally.
+  // When non-empty, the server uses this instead of have_chunks.
+  bytes have_chunks_bloom = 4;
+  // Number of hash functions used in the bloom filter.
+  uint32 bloom_num_hashes = 5;
 }
 
 // Chunk-level negotiation response.
