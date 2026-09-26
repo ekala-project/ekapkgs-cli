@@ -160,7 +160,7 @@ pub fn prefetch_closure_with_target(
 /// Three-tier import: CAS chunks → gRPC streaming → HTTP batch.
 ///
 /// Returns the number of paths imported.
-async fn import_with_fallback(
+pub(crate) async fn import_with_fallback(
     server_url: &str,
     response: &ekapkgs_protocol::ekapkgs::v1::NegotiateResponse,
     want_hashes: Vec<String>,

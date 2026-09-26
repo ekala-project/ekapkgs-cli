@@ -9,12 +9,13 @@ mod drv_diff;
 mod dry_run;
 mod env;
 mod flake;
+mod fuse;
 mod home;
 mod log;
 mod registry;
 mod run;
 mod sbom;
-mod search;
+pub(crate) mod search;
 mod shell;
 mod store;
 mod substituter;
@@ -62,6 +63,7 @@ pub fn run(command: Command) -> color_eyre::Result<()> {
             flake,
         } => wtf::execute(&command_name, &args, &flake),
         Command::Template { command } => template::execute(command),
+        Command::Fuse { command } => fuse::execute(command),
         Command::Completions { .. } => unreachable!("handled in main"),
     }
 }

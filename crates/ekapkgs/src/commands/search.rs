@@ -37,7 +37,7 @@ pub fn execute(command: SearchCommand) -> color_eyre::Result<()> {
 // Index cache infrastructure
 // ---------------------------------------------------------------------------
 
-fn cache_dir() -> color_eyre::Result<PathBuf> {
+pub(crate) fn cache_dir() -> color_eyre::Result<PathBuf> {
     let dir = directories::ProjectDirs::from("", "", "ekapkgs")
         .map(|d| d.cache_dir().to_path_buf())
         .unwrap_or_else(|| {
@@ -49,11 +49,11 @@ fn cache_dir() -> color_eyre::Result<PathBuf> {
     Ok(index_dir)
 }
 
-fn index_path(name: &str) -> color_eyre::Result<PathBuf> {
+pub(crate) fn index_path(name: &str) -> color_eyre::Result<PathBuf> {
     Ok(cache_dir()?.join(format!("{name}.json.zst")))
 }
 
-fn write_index(name: &str, data: &[u8]) -> color_eyre::Result<()> {
+pub(crate) fn write_index(name: &str, data: &[u8]) -> color_eyre::Result<()> {
     let path = index_path(name)?;
     let compressed = zstd::encode_all(data, 3)?;
     std::fs::write(&path, compressed)?;
@@ -61,7 +61,7 @@ fn write_index(name: &str, data: &[u8]) -> color_eyre::Result<()> {
     Ok(())
 }
 
-fn read_index(name: &str) -> color_eyre::Result<Option<Vec<u8>>> {
+pub(crate) fn read_index(name: &str) -> color_eyre::Result<Option<Vec<u8>>> {
     let path = index_path(name)?;
     if !path.exists() {
         return Ok(None);
@@ -99,7 +99,7 @@ where
 
 /// Try to download a single index from a remote URL. Returns the
 /// decompressed data on success.
-fn try_download_index(base_url: &str, name: &str) -> color_eyre::Result<Vec<u8>> {
+pub(crate) fn try_download_index(base_url: &str, name: &str) -> color_eyre::Result<Vec<u8>> {
     let url = format!("{base_url}/{name}.json.zst");
     let spinner = ekapkgs_ui::progress::spinner(&format!("Downloading {name} index..."));
     let rt = tokio::runtime::Runtime::new()?;

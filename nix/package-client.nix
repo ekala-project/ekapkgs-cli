@@ -2,6 +2,8 @@
   lib,
   rustPlatform,
   protobuf,
+  pkg-config,
+  fuse3,
   nix,
   makeWrapper,
 }:
@@ -29,7 +31,12 @@ rustPlatform.buildRustPackage {
 
   nativeBuildInputs = [
     protobuf
+    pkg-config
     makeWrapper
+  ];
+
+  buildInputs = [
+    fuse3
   ];
 
   doCheck = false;
