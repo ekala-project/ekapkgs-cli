@@ -14,7 +14,9 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use ekapkgs_nix::nar::{NarDirectoryEntry, NarNode, parse_nar, write_nar};
+use ekapkgs_nix::bloom::BloomFilter;
+
+use ekapkgs_nix::nar::{ChunkReader, NarDirectoryEntry, NarNode, parse_nar, write_nar_streaming};
 use ekapkgs_protocol::ekapkgs::v1::{
     B3Digest, CaDirectory, CaDirectoryEntry, CaDirectoryNode, CaFileNode, CaNode, CaSymlinkNode,
     ChunkMeta,
@@ -35,6 +37,25 @@ type CasTreeWalkResult = (Vec<ChunkMeta>, Vec<([u8; 32], CaDirectory)>, FileChun
 const CHUNK_MIN: u32 = 16 * 1024; // 16 KiB
 const CHUNK_AVG: u32 = 64 * 1024; // 64 KiB
 const CHUNK_MAX: u32 = 256 * 1024; // 256 KiB
+
+/// Represents the client's set of already-cached chunk digests.
+///
+/// Either an exact hash set (from the flat `have_chunks` list) or a
+/// probabilistic bloom filter (compact, ~1% FPR).
+pub enum ChunkHaveCheck {
+    Exact(HashSet<[u8; 32]>),
+    Bloom(BloomFilter),
+}
+
+impl ChunkHaveCheck {
+    /// Returns `true` if the client (probably) already has this chunk.
+    pub fn contains(&self, digest: &[u8; 32]) -> bool {
+        match self {
+            Self::Exact(set) => set.contains(digest),
+            Self::Bloom(bf) => bf.maybe_contains(digest),
+        }
+    }
+}
 
 pub struct CastoreBackend {
     root: PathBuf,
@@ -89,13 +110,12 @@ impl CastoreBackend {
     /// Walk the Merkle trees for the requested store paths in a single pass,
     /// collecting missing chunks, directory data, and file-to-chunk mappings.
     ///
-    /// This replaces the three separate tree walks previously done by
-    /// `walk_missing_chunks`, `collect_directories`, and
-    /// `collect_file_chunk_mappings`.
+    /// `have` can be either an exact set of digests (from the flat
+    /// `have_chunks` list) or a bloom filter (compact, ~1% FPR).
     pub fn walk_cas_trees(
         &self,
         want_hashes: &[&str],
-        have_digests: &HashSet<[u8; 32]>,
+        have: &ChunkHaveCheck,
     ) -> color_eyre::Result<CasTreeWalkResult> {
         let mut missing_chunks = Vec::new();
         let mut chunk_seen = HashSet::new();
@@ -108,7 +128,7 @@ impl CastoreBackend {
             if let Some(root) = self.get_root_node(hash)? {
                 self.walk_cas_node(
                     &root,
-                    have_digests,
+                    have,
                     &mut chunk_seen,
                     &mut missing_chunks,
                     &mut dir_seen,
@@ -128,11 +148,8 @@ impl CastoreBackend {
     }
 
     // --- GC methods ---
-    // These are public API for the GC subsystem. They are tested below but
-    // not yet wired into the server's GC background loop.
 
     /// Update `last_access` for a batch of store path hashes.
-    #[allow(dead_code)]
     pub fn update_access(&self, hashes: &[String]) {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -152,7 +169,6 @@ impl CastoreBackend {
     }
 
     /// Return total bytes stored in chunks.
-    #[allow(dead_code)]
     pub fn total_chunk_bytes(&self) -> color_eyre::Result<u64> {
         let db = self.db.lock().expect("db lock");
         let total: i64 = db.query_row("SELECT COALESCE(SUM(size), 0) FROM chunks", [], |row| {
@@ -162,7 +178,6 @@ impl CastoreBackend {
     }
 
     /// Return total number of CAS paths stored.
-    #[allow(dead_code)]
     pub fn total_paths(&self) -> color_eyre::Result<u64> {
         let db = self.db.lock().expect("db lock");
         let count: i64 = db.query_row("SELECT COUNT(*) FROM cas_paths", [], |row| row.get(0))?;
@@ -177,7 +192,6 @@ impl CastoreBackend {
     ///
     /// Directories are left in SQLite (they are small and will be
     /// overwritten naturally on future ingests).
-    #[allow(dead_code)]
     pub fn evict_path(&self, hash: &str) -> color_eyre::Result<u64> {
         let db = self.db.lock().expect("db lock");
         let tx = db.unchecked_transaction()?;
@@ -358,7 +372,6 @@ impl CastoreBackend {
     }
 
     /// List paths ordered by last access time (oldest first), for GC.
-    #[allow(dead_code)]
     pub fn paths_by_access_asc(&self) -> color_eyre::Result<Vec<(String, u64)>> {
         let db = self.db.lock().expect("db lock");
         let mut stmt =
@@ -572,6 +585,10 @@ impl CastoreBackend {
     }
 
     /// Reconstruct a NarNode tree from a CaNode root.
+    ///
+    /// Superseded by `write_nar_streaming()` + `ChunkReader` for production
+    /// use. Retained for potential future use and test convenience.
+    #[allow(dead_code)]
     fn reconstruct_node(&self, ca_node: &CaNode) -> color_eyre::Result<NarNode> {
         let node = ca_node
             .node
@@ -673,7 +690,7 @@ impl CastoreBackend {
     fn walk_cas_node(
         &self,
         ca_node: &CaNode,
-        have: &HashSet<[u8; 32]>,
+        have: &ChunkHaveCheck,
         chunk_seen: &mut HashSet<[u8; 32]>,
         missing_chunks: &mut Vec<ChunkMeta>,
         dir_seen: &mut HashSet<[u8; 32]>,
@@ -929,9 +946,11 @@ impl StorageBackend for CastoreBackend {
             return Ok(None);
         };
 
-        // Reconstruct the NAR from the CAS tree.
-        let nar_node = self.reconstruct_node(&root_node)?;
-        Ok(Some(write_nar(&nar_node)))
+        // Stream the NAR directly from CAS chunks — only one file's data is
+        // in memory at a time.
+        let mut buf = Vec::new();
+        write_nar_streaming(&mut buf, &root_node, self)?;
+        Ok(Some(buf))
     }
 
     fn put_narinfo(&self, hash: &str, content: &str) -> color_eyre::Result<bool> {
@@ -1019,6 +1038,65 @@ impl StorageBackend for CastoreBackend {
 
     fn get_cas_root(&self, hash: &str) -> color_eyre::Result<Option<Vec<u8>>> {
         Ok(self.get_root_node(hash)?.map(|n| n.encode_to_vec()))
+    }
+}
+
+impl ChunkReader for CastoreBackend {
+    fn read_file_data(&self, file_digest: &[u8; 32]) -> color_eyre::Result<Vec<u8>> {
+        self.read_file_data(file_digest)
+    }
+
+    fn load_directory(
+        &self,
+        digest: &[u8; 32],
+    ) -> color_eyre::Result<ekapkgs_protocol::ekapkgs::v1::CaDirectory> {
+        self.load_directory(digest)
+    }
+}
+
+/// Delegate all `StorageBackend` methods to the inner `CastoreBackend` so
+/// an `Arc<CastoreBackend>` can be stored in `Box<dyn StorageBackend>` while
+/// the GC loop holds a clone of the same `Arc`.
+impl StorageBackend for std::sync::Arc<CastoreBackend> {
+    fn as_any(&self) -> &dyn std::any::Any {
+        // Return the inner CastoreBackend so downcast_ref works.
+        &**self
+    }
+
+    fn has_narinfo(&self, hash: &str) -> color_eyre::Result<bool> {
+        (**self).has_narinfo(hash)
+    }
+
+    fn get_narinfo(&self, hash: &str) -> color_eyre::Result<Option<NarInfo>> {
+        (**self).get_narinfo(hash)
+    }
+
+    fn get_narinfo_text(&self, hash: &str) -> color_eyre::Result<Option<String>> {
+        (**self).get_narinfo_text(hash)
+    }
+
+    fn get_nar(&self, file_path: &str) -> color_eyre::Result<Option<Vec<u8>>> {
+        (**self).get_nar(file_path)
+    }
+
+    fn put_narinfo(&self, hash: &str, content: &str) -> color_eyre::Result<bool> {
+        (**self).put_narinfo(hash, content)
+    }
+
+    fn put_nar(&self, file_path: &str, data: &[u8]) -> color_eyre::Result<bool> {
+        (**self).put_nar(file_path, data)
+    }
+
+    fn supports_cas(&self) -> bool {
+        (**self).supports_cas()
+    }
+
+    fn get_chunk(&self, digest: &[u8]) -> color_eyre::Result<Option<Vec<u8>>> {
+        (**self).get_chunk(digest)
+    }
+
+    fn get_cas_root(&self, hash: &str) -> color_eyre::Result<Option<Vec<u8>>> {
+        (**self).get_cas_root(hash)
     }
 }
 
@@ -1133,6 +1211,8 @@ fn sha256_hash(data: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
+    use ekapkgs_nix::nar::write_nar;
+
     use super::*;
 
     fn setup_backend() -> (tempfile::TempDir, CastoreBackend) {
@@ -1326,9 +1406,8 @@ mod tests {
         backend.put_nar("nar/walk123.nar", &nar_data).unwrap();
 
         // With empty have set, all chunks should be missing.
-        let (missing, dirs, file_maps) = backend
-            .walk_cas_trees(&["walk123"], &HashSet::new())
-            .unwrap();
+        let empty = ChunkHaveCheck::Exact(HashSet::new());
+        let (missing, dirs, file_maps) = backend.walk_cas_trees(&["walk123"], &empty).unwrap();
         assert!(!missing.is_empty());
         // A single file has no directories.
         assert!(dirs.is_empty());
@@ -1344,7 +1423,8 @@ mod tests {
                     .and_then(|d| d.digest.as_slice().try_into().ok())
             })
             .collect();
-        let (missing2, ..) = backend.walk_cas_trees(&["walk123"], &have).unwrap();
+        let have_check = ChunkHaveCheck::Exact(have);
+        let (missing2, ..) = backend.walk_cas_trees(&["walk123"], &have_check).unwrap();
         assert!(missing2.is_empty());
     }
 

@@ -5,7 +5,8 @@ use ekapkgs_protocol::ekapkgs::v1::cache_service_server::CacheService;
 use ekapkgs_protocol::ekapkgs::v1::{
     B3Digest, CaDirectoryData, CaPathMapping, ChunkDownload, ChunkMeta, ChunkNegotiateRequest,
     ChunkNegotiateResponse, Compression, DownloadBatch, DownloadPlan, FileChunkMapping, NarChunk,
-    NegotiateRequest, NegotiateResponse, PathManifestEntry, StreamNarsRequest,
+    NegotiateRequest, NegotiateResponse, PathManifestEntry, PushNegotiateRequest,
+    PushNegotiateResponse, StreamNarsRequest,
 };
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
@@ -244,12 +245,30 @@ impl CacheService for NegotiateService {
             )));
         }
 
-        // Build the set of chunk digests the client already has.
-        let have_digests: std::collections::HashSet<[u8; 32]> = req
-            .have_chunks
-            .iter()
-            .filter_map(|d| d.digest.as_slice().try_into().ok())
-            .collect();
+        // Build the chunk membership check from either bloom filter or flat list.
+        let have_check = if !req.have_chunks_bloom.is_empty() {
+            // Client sent a compact bloom filter.
+            const MAX_BLOOM_BYTES: usize = 16 * 1024 * 1024; // 16 MiB
+            if req.have_chunks_bloom.len() > MAX_BLOOM_BYTES {
+                return Err(Status::invalid_argument(format!(
+                    "bloom filter too large ({} bytes, max {MAX_BLOOM_BYTES})",
+                    req.have_chunks_bloom.len()
+                )));
+            }
+            let bf = ekapkgs_nix::bloom::BloomFilter::from_bytes(
+                &req.have_chunks_bloom,
+                req.bloom_num_hashes,
+            );
+            crate::storage::castore::ChunkHaveCheck::Bloom(bf)
+        } else {
+            // Client sent a flat list of digests.
+            let set: std::collections::HashSet<[u8; 32]> = req
+                .have_chunks
+                .iter()
+                .filter_map(|d| d.digest.as_slice().try_into().ok())
+                .collect();
+            crate::storage::castore::ChunkHaveCheck::Exact(set)
+        };
 
         let mut path_mappings = Vec::new();
         let mut unavailable = Vec::new();
@@ -286,7 +305,7 @@ impl CacheService for NegotiateService {
             .downcast_ref::<crate::storage::castore::CastoreBackend>()
         {
             let (chunks, dirs_raw, file_maps_raw) = castore
-                .walk_cas_trees(&want_hashes, &have_digests)
+                .walk_cas_trees(&want_hashes, &have_check)
                 .map_err(|e| Status::internal(format!("CAS tree walk failed: {e}")))?;
 
             let missing: Vec<ChunkDownload> = chunks
@@ -445,6 +464,62 @@ impl CacheService for NegotiateService {
         });
 
         Ok(Response::new(ReceiverStream::new(rx)))
+    }
+
+    async fn push_negotiate(
+        &self,
+        request: Request<PushNegotiateRequest>,
+    ) -> Result<Response<PushNegotiateResponse>, Status> {
+        if !self.state.storage.supports_cas() {
+            return Err(Status::unimplemented("CAS storage not configured"));
+        }
+
+        let req = request.into_inner();
+        let hash = &req.store_path_hash;
+
+        // Check if the server already has this path.
+        match self.state.storage.has_narinfo(hash) {
+            Ok(true) => {
+                return Ok(Response::new(PushNegotiateResponse {
+                    missing_chunks: Vec::new(),
+                    already_exists: true,
+                }));
+            },
+            Ok(false) => {},
+            Err(e) => {
+                return Err(Status::internal(format!(
+                    "failed to check narinfo for {hash}: {e}"
+                )));
+            },
+        }
+
+        // Collect all chunk digests from the client's tree metadata.
+        let mut all_chunk_digests = Vec::new();
+        for mapping in &req.file_chunk_mappings {
+            for chunk in &mapping.chunks {
+                if let Some(digest) = &chunk.digest {
+                    all_chunk_digests.push(digest.clone());
+                }
+            }
+        }
+
+        // Check which chunks the server already has.
+        let mut missing = Vec::new();
+        for digest in &all_chunk_digests {
+            let d: [u8; 32] = match digest.digest.as_slice().try_into() {
+                Ok(d) => d,
+                Err(_) => continue,
+            };
+            match self.state.storage.get_chunk(&d) {
+                Ok(Some(_)) => {}, // Server has it.
+                Ok(None) | Err(_) => missing.push(digest.clone()),
+            }
+        }
+
+        Ok(Response::new(PushNegotiateResponse {
+            missing_chunks: missing,
+            already_exists: false,
+        }))
     }
 }
 

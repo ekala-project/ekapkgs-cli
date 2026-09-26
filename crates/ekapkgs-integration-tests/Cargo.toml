@@ -14,6 +14,7 @@ data-encoding.workspace = true
 ed25519-dalek.workspace = true
 blake3.workspace = true
 sha2.workspace = true
+ekapkgs-nix.workspace = true
 ekapkgs-protocol.workspace = true
 tonic.workspace = true
 zstd.workspace = true

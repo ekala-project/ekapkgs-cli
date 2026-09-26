@@ -219,59 +219,178 @@ fn parse_symlink(reader: &mut NarReader<'_>) -> color_eyre::Result<NarNode> {
 /// Write a `NarNode` tree to NAR format bytes.
 pub fn write_nar(node: &NarNode) -> Vec<u8> {
     let mut buf = Vec::new();
-    write_str(&mut buf, "nix-archive-1");
-    write_nar_obj(&mut buf, node);
+    write_nar_to(&mut buf, node);
     buf
 }
 
-fn write_nar_obj(buf: &mut Vec<u8>, node: &NarNode) {
-    write_str(buf, "(");
-    write_str(buf, "type");
+/// Write a `NarNode` tree in NAR format to any writer.
+///
+/// This avoids materializing the entire NAR in memory when the writer is
+/// something other than a `Vec<u8>` (e.g., a file, a streaming HTTP body).
+pub fn write_nar_to<W: std::io::Write>(w: &mut W, node: &NarNode) {
+    write_str_to(w, "nix-archive-1");
+    write_nar_obj_to(w, node);
+}
+
+fn write_nar_obj_to<W: std::io::Write>(w: &mut W, node: &NarNode) {
+    write_str_to(w, "(");
+    write_str_to(w, "type");
 
     match node {
         NarNode::Regular { executable, data } => {
-            write_str(buf, "regular");
+            write_str_to(w, "regular");
             if *executable {
-                write_str(buf, "executable");
-                write_str(buf, "");
+                write_str_to(w, "executable");
+                write_str_to(w, "");
             }
-            write_str(buf, "contents");
-            write_bytes(buf, data);
+            write_str_to(w, "contents");
+            write_bytes_to(w, data);
         },
         NarNode::Directory { entries } => {
-            write_str(buf, "directory");
+            write_str_to(w, "directory");
             for entry in entries {
-                write_str(buf, "entry");
-                write_str(buf, "(");
-                write_str(buf, "name");
-                write_str(buf, &entry.name);
-                write_str(buf, "node");
-                write_nar_obj(buf, &entry.node);
-                write_str(buf, ")");
+                write_str_to(w, "entry");
+                write_str_to(w, "(");
+                write_str_to(w, "name");
+                write_str_to(w, &entry.name);
+                write_str_to(w, "node");
+                write_nar_obj_to(w, &entry.node);
+                write_str_to(w, ")");
             }
         },
         NarNode::Symlink { target } => {
-            write_str(buf, "symlink");
-            write_str(buf, "target");
-            write_str(buf, target);
+            write_str_to(w, "symlink");
+            write_str_to(w, "target");
+            write_str_to(w, target);
         },
     }
 
-    write_str(buf, ")");
+    write_str_to(w, ")");
 }
 
 /// Write a length-prefixed, padded string.
-fn write_str(buf: &mut Vec<u8>, s: &str) {
-    write_bytes(buf, s.as_bytes());
+fn write_str_to<W: std::io::Write>(w: &mut W, s: &str) {
+    write_bytes_to(w, s.as_bytes());
 }
 
 /// Write a length-prefixed, padded byte sequence.
-fn write_bytes(buf: &mut Vec<u8>, data: &[u8]) {
+fn write_bytes_to<W: std::io::Write>(w: &mut W, data: &[u8]) {
     let len = data.len() as u64;
-    buf.extend_from_slice(&len.to_le_bytes());
-    buf.extend_from_slice(data);
+    // These writes go to Vec<u8> or BufWriter and will not fail.
+    let _ = w.write_all(&len.to_le_bytes());
+    let _ = w.write_all(data);
     let pad = (8 - (data.len() % 8)) % 8;
-    buf.extend(std::iter::repeat_n(0u8, pad));
+    if pad > 0 {
+        let _ = w.write_all(&[0u8; 8][..pad]);
+    }
+}
+
+// --- Streaming CAS NAR writer ---
+
+/// Trait for reading chunk data on demand during streaming NAR writing.
+///
+/// Implementations can read from disk, network, or memory.
+pub trait ChunkReader {
+    /// Read the data for a file identified by its blake3 digest.
+    ///
+    /// Returns the concatenated chunk data for all chunks of this file.
+    fn read_file_data(&self, file_digest: &[u8; 32]) -> color_eyre::Result<Vec<u8>>;
+
+    /// Load a CAS directory by its blake3 digest.
+    fn load_directory(
+        &self,
+        digest: &[u8; 32],
+    ) -> color_eyre::Result<ekapkgs_protocol::ekapkgs::v1::CaDirectory>;
+}
+
+/// Write a NAR by walking a CaNode tree and reading chunks on demand.
+///
+/// Memory usage is proportional to tree depth rather than total content size:
+/// only one file's data is in memory at a time.
+pub fn write_nar_streaming<W: std::io::Write>(
+    w: &mut W,
+    root: &ekapkgs_protocol::ekapkgs::v1::CaNode,
+    reader: &dyn ChunkReader,
+) -> color_eyre::Result<()> {
+    write_str_to(w, "nix-archive-1");
+    write_cas_node_streaming(w, root, reader)
+}
+
+fn write_cas_node_streaming<W: std::io::Write>(
+    w: &mut W,
+    ca_node: &ekapkgs_protocol::ekapkgs::v1::CaNode,
+    reader: &dyn ChunkReader,
+) -> color_eyre::Result<()> {
+    use ekapkgs_protocol::ekapkgs::v1::ca_node::Node;
+
+    let node = ca_node
+        .node
+        .as_ref()
+        .ok_or_else(|| color_eyre::eyre::eyre!("CaNode has no node variant"))?;
+
+    write_str_to(w, "(");
+    write_str_to(w, "type");
+
+    match node {
+        Node::File(file) => {
+            let digest = file
+                .digest
+                .as_ref()
+                .ok_or_else(|| color_eyre::eyre::eyre!("CaFileNode missing digest"))?;
+            let file_digest: [u8; 32] = digest
+                .digest
+                .as_slice()
+                .try_into()
+                .map_err(|_| color_eyre::eyre::eyre!("invalid digest length"))?;
+
+            write_str_to(w, "regular");
+            if file.executable {
+                write_str_to(w, "executable");
+                write_str_to(w, "");
+            }
+            write_str_to(w, "contents");
+            // Read file data and write it. The data is freed after this scope.
+            let data = reader.read_file_data(&file_digest)?;
+            write_bytes_to(w, &data);
+        },
+
+        Node::Directory(dir) => {
+            let digest = dir
+                .digest
+                .as_ref()
+                .ok_or_else(|| color_eyre::eyre::eyre!("CaDirectoryNode missing digest"))?;
+            let dir_digest: [u8; 32] = digest
+                .digest
+                .as_slice()
+                .try_into()
+                .map_err(|_| color_eyre::eyre::eyre!("invalid digest length"))?;
+
+            write_str_to(w, "directory");
+            let ca_dir = reader.load_directory(&dir_digest)?;
+            let mut entries: Vec<_> = ca_dir.entries.iter().collect();
+            entries.sort_by(|a, b| a.name.cmp(&b.name));
+            for entry in entries {
+                write_str_to(w, "entry");
+                write_str_to(w, "(");
+                write_str_to(w, "name");
+                write_str_to(w, &entry.name);
+                write_str_to(w, "node");
+                if let Some(child) = &entry.node {
+                    write_cas_node_streaming(w, child, reader)?;
+                }
+                write_str_to(w, ")");
+            }
+        },
+
+        Node::Symlink(symlink) => {
+            write_str_to(w, "symlink");
+            write_str_to(w, "target");
+            write_str_to(w, &symlink.target);
+        },
+    }
+
+    write_str_to(w, ")");
+    Ok(())
 }
 
 #[cfg(test)]
@@ -316,11 +435,11 @@ mod tests {
         // Build a NAR manually where a regular file has no "contents" field —
         // just `( type regular )`. This is valid per the NAR spec.
         let mut buf = Vec::new();
-        write_str(&mut buf, "nix-archive-1");
-        write_str(&mut buf, "(");
-        write_str(&mut buf, "type");
-        write_str(&mut buf, "regular");
-        write_str(&mut buf, ")");
+        write_str_to(&mut buf, "nix-archive-1");
+        write_str_to(&mut buf, "(");
+        write_str_to(&mut buf, "type");
+        write_str_to(&mut buf, "regular");
+        write_str_to(&mut buf, ")");
 
         let parsed = parse_nar(&buf).unwrap();
         assert_eq!(

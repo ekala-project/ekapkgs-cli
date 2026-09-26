@@ -12,6 +12,8 @@
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
+use ekapkgs_nix::nar::ChunkReader;
+#[cfg(test)]
 use ekapkgs_nix::nar::{NarDirectoryEntry, NarNode};
 use ekapkgs_protocol::ekapkgs::v1::{CaDirectory, CaNode, ChunkNegotiateResponse};
 use prost::Message;
@@ -178,6 +180,10 @@ impl ChunkStore {
     ///
     /// Uses directory and file-chunk metadata stored in the local database,
     /// and chunk data from the local chunk store on disk.
+    ///
+    /// Note: production code now uses `write_nar_streaming()` with the
+    /// `ChunkReader` impl instead. This method is retained for tests.
+    #[cfg(test)]
     pub fn reconstruct_node(&self, ca_node: &CaNode) -> color_eyre::Result<NarNode> {
         let node = ca_node
             .node
@@ -438,11 +444,26 @@ impl ChunkStore {
     }
 }
 
+impl ChunkReader for ChunkStore {
+    fn read_file_data(&self, file_digest: &[u8; 32]) -> color_eyre::Result<Vec<u8>> {
+        self.read_file_data(file_digest)
+    }
+
+    fn load_directory(
+        &self,
+        digest: &[u8; 32],
+    ) -> color_eyre::Result<ekapkgs_protocol::ekapkgs::v1::CaDirectory> {
+        self.load_directory(digest)
+    }
+}
+
 // --- Database helpers ---
 
 fn open_db(path: &Path) -> color_eyre::Result<Connection> {
     let conn = Connection::open(path)?;
-    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
+    conn.execute_batch(
+        "PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;",
+    )?;
     Ok(conn)
 }
 
