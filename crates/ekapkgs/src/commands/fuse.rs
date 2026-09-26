@@ -331,9 +331,12 @@ impl LibFs {
 
         // Run the async download on the persistent runtime.
         let download_result = self.rt.block_on(async {
-            let response =
-                crate::negotiate::negotiate(&self.server_url, vec![store_hash.clone()], vec![])
-                    .await?;
+            let response = crate::negotiate::negotiate_closure(
+                &self.server_url,
+                vec![store_hash.clone()],
+                vec![],
+            )
+            .await?;
 
             if response.available.is_empty() {
                 return Err(color_eyre::eyre::eyre!(
