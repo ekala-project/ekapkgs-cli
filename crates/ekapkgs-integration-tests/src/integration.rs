@@ -1119,6 +1119,7 @@ async fn test_delta_negotiate() {
         trust_roots: Vec::new(),
         supports_cas: false,
         target_hash: String::new(),
+        expand_closure: false,
     });
     let response = grpc_client.negotiate(request).await.unwrap().into_inner();
 
@@ -1200,6 +1201,7 @@ async fn test_delta_http_download() {
         trust_roots: Vec::new(),
         supports_cas: false,
         target_hash: String::new(),
+        expand_closure: false,
     });
     let response = grpc_client.negotiate(request).await.unwrap().into_inner();
     let entry = &response.available[0];
@@ -1290,6 +1292,7 @@ async fn test_delta_stream() {
         trust_roots: Vec::new(),
         supports_cas: false,
         target_hash: String::new(),
+        expand_closure: false,
     });
     let response = grpc_client.negotiate(request).await.unwrap().into_inner();
     assert!(!response.available[0].delta_base_hash.is_empty());
@@ -1517,6 +1520,7 @@ async fn test_castore_negotiate_with_cas_support() {
         trust_roots: Vec::new(),
         supports_cas: true,
         target_hash: String::new(),
+        expand_closure: false,
     });
     let response = grpc_client.negotiate(request).await.unwrap().into_inner();
 
@@ -1833,6 +1837,7 @@ async fn test_castore_negotiate_without_cas_support() {
         trust_roots: Vec::new(),
         supports_cas: false,
         target_hash: String::new(),
+        expand_closure: false,
     });
     let response = grpc_client.negotiate(request).await.unwrap().into_inner();
 
