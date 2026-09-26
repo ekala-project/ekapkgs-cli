@@ -1,8 +1,13 @@
+use ekapkgs_nix::bloom::BloomFilter;
 use ekapkgs_protocol::ekapkgs::v1::cache_service_client::CacheServiceClient;
 use ekapkgs_protocol::ekapkgs::v1::{
     B3Digest, ChunkNegotiateRequest, ChunkNegotiateResponse, Compression, NarChunk,
     NegotiateRequest, NegotiateResponse, StreamNarsRequest,
 };
+
+/// Threshold above which we send a bloom filter instead of a flat list.
+/// At 1000 chunks × 34 bytes ≈ 34 KB (flat list) vs ~1.2 KB (bloom filter).
+const BLOOM_THRESHOLD: usize = 1_000;
 
 /// Send a negotiate request to the ekapkgs cache server.
 ///
@@ -43,6 +48,9 @@ pub async fn negotiate_with_target(
 }
 
 /// Send a chunk-level negotiate request to the ekapkgs cache server.
+///
+/// When the number of local chunks exceeds `BLOOM_THRESHOLD`, sends a compact
+/// bloom filter instead of the full list of digests.
 #[allow(dead_code)]
 pub async fn negotiate_chunks(
     server_url: &str,
@@ -55,14 +63,38 @@ pub async fn negotiate_chunks(
         .max_decoding_message_size(64 * 1024 * 1024)
         .max_encoding_message_size(64 * 1024 * 1024);
 
-    let request = tonic::Request::new(ChunkNegotiateRequest {
-        want,
-        have,
-        have_chunks: have_chunks
-            .into_iter()
-            .map(|d| B3Digest { digest: d.to_vec() })
-            .collect(),
-    });
+    let request = if have_chunks.len() > BLOOM_THRESHOLD {
+        let mut bf = BloomFilter::new(have_chunks.len());
+        for d in &have_chunks {
+            bf.insert(d);
+        }
+        let num_hashes = bf.num_hashes();
+        let bloom_bytes = bf.into_bytes();
+        tracing::debug!(
+            "Sending bloom filter ({} bytes, k={}) for {} chunks",
+            bloom_bytes.len(),
+            num_hashes,
+            have_chunks.len(),
+        );
+        tonic::Request::new(ChunkNegotiateRequest {
+            want,
+            have,
+            have_chunks: Vec::new(),
+            have_chunks_bloom: bloom_bytes,
+            bloom_num_hashes: num_hashes,
+        })
+    } else {
+        tonic::Request::new(ChunkNegotiateRequest {
+            want,
+            have,
+            have_chunks: have_chunks
+                .into_iter()
+                .map(|d| B3Digest { digest: d.to_vec() })
+                .collect(),
+            have_chunks_bloom: Vec::new(),
+            bloom_num_hashes: 0,
+        })
+    };
 
     let response = client.negotiate_chunks(request).await?;
     Ok(response.into_inner())

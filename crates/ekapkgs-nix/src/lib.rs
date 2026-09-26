@@ -1,3 +1,4 @@
+pub mod bloom;
 pub mod command;
 pub mod eval;
 pub mod installable;
