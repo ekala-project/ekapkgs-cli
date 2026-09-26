@@ -726,10 +726,7 @@ async fn cmd_serve(cli: Cli) -> color_eyre::Result<()> {
             "/ekapkgs.v1.CacheService/NegotiateChunks",
             grpc_service.clone(),
         )
-        .route_service(
-            "/ekapkgs.v1.CacheService/StreamNars",
-            grpc_service.clone(),
-        )
+        .route_service("/ekapkgs.v1.CacheService/StreamNars", grpc_service.clone())
         .route_service("/ekapkgs.v1.CacheService/PushNegotiate", grpc_service);
 
     // Check for systemd socket activation.

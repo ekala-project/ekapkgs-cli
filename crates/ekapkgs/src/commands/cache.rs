@@ -423,9 +423,7 @@ async fn try_cas_push(
     use ekapkgs_nix::decompose::decompose_nar;
     use ekapkgs_nix::nar::parse_nar;
     use ekapkgs_protocol::ekapkgs::v1::cache_service_client::CacheServiceClient;
-    use ekapkgs_protocol::ekapkgs::v1::{
-        B3Digest, CaDirectoryData, PushNegotiateRequest,
-    };
+    use ekapkgs_protocol::ekapkgs::v1::{B3Digest, CaDirectoryData, PushNegotiateRequest};
 
     // Parse the NAR and decompose into CAS format.
     let nar_node = parse_nar(nar_data)?;

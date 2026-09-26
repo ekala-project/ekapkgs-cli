@@ -1407,9 +1407,7 @@ mod tests {
 
         // With empty have set, all chunks should be missing.
         let empty = ChunkHaveCheck::Exact(HashSet::new());
-        let (missing, dirs, file_maps) = backend
-            .walk_cas_trees(&["walk123"], &empty)
-            .unwrap();
+        let (missing, dirs, file_maps) = backend.walk_cas_trees(&["walk123"], &empty).unwrap();
         assert!(!missing.is_empty());
         // A single file has no directories.
         assert!(dirs.is_empty());

@@ -123,7 +123,15 @@ pub fn init_cas(
     let metrics = gc_metrics;
 
     tokio::spawn(async move {
-        cas_gc_loop(event_rx, backend, max_size, target_size, gc_interval, metrics).await;
+        cas_gc_loop(
+            event_rx,
+            backend,
+            max_size,
+            target_size,
+            gc_interval,
+            metrics,
+        )
+        .await;
     });
 
     tracker
@@ -293,7 +301,9 @@ async fn gc_loop(
 
 fn open_db(path: &Path) -> color_eyre::Result<Connection> {
     let conn = Connection::open(path)?;
-    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;")?;
+    conn.execute_batch(
+        "PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;",
+    )?;
     Ok(conn)
 }
 

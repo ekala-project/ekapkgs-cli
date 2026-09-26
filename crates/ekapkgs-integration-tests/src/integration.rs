@@ -1951,9 +1951,7 @@ async fn test_castore_push_negotiate_rpc() {
     .await;
 
     use ekapkgs_protocol::ekapkgs::v1::cache_service_client::CacheServiceClient;
-    use ekapkgs_protocol::ekapkgs::v1::{
-        B3Digest, CaDirectoryData, CaNode, PushNegotiateRequest,
-    };
+    use ekapkgs_protocol::ekapkgs::v1::{B3Digest, CaDirectoryData, CaNode, PushNegotiateRequest};
 
     let mut grpc_client = CacheServiceClient::connect(base.clone())
         .await
