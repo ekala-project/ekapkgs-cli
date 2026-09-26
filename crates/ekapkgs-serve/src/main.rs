@@ -593,6 +593,7 @@ async fn cmd_serve(cli: Cli) -> color_eyre::Result<()> {
                 ));
             },
             config::StorageConfig::Castore { path, gc } => {
+                let backend = Arc::new(storage::castore::CastoreBackend::new(path)?);
                 let gc_t = if let Some(gc_raw) = gc {
                     let max_size = gc::parse_byte_size(&gc_raw.max_size)?;
                     let target_size = gc_raw
@@ -606,12 +607,16 @@ async fn cmd_serve(cli: Cli) -> color_eyre::Result<()> {
                         target_size,
                         gc_interval: std::time::Duration::from_secs(gc_raw.gc_interval_secs),
                     };
-                    Some(gc::init(&path, gc_config, Some(gc_metrics.clone()))?)
+                    Some(gc::init_cas(
+                        Arc::clone(&backend),
+                        gc_config,
+                        Some(gc_metrics.clone()),
+                    ))
                 } else {
                     None
                 };
                 gc_tracker = gc_t;
-                Box::new(storage::castore::CastoreBackend::new(path)?)
+                Box::new(backend) as Box<dyn storage::StorageBackend>
             },
         };
         // Load tokens: from token store + any legacy config tokens.
