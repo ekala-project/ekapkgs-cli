@@ -29,6 +29,10 @@ message NegotiateRequest {
   // When set, the server prioritizes the target and its transitive
   // runtime dependencies in the download plan.
   string target_hash = 6;
+  // When true, the server expands the `want` set to include the full
+  // transitive runtime closure (following narinfo references), excluding
+  // paths in `have`. Equivalent to `nix-store --realise` semantics.
+  bool expand_closure = 7;
 }
 
 message NegotiateResponse {
