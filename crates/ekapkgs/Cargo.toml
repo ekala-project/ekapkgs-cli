@@ -39,6 +39,7 @@ nucleo-matcher.workspace = true
 axum.workspace = true
 jiff.workspace = true
 which.workspace = true
+fuser.workspace = true
 
 [lints]
 workspace = true

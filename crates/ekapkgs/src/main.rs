@@ -10,6 +10,7 @@ mod negotiate;
 mod package_validate;
 mod prefetch;
 pub mod service_schema;
+mod soname_index;
 mod store_path_index;
 mod symlink_dir;
 

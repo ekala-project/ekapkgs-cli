@@ -23,3 +23,4 @@ Nix CLI wrapper with a negotiated binary cache protocol. Two binaries: `ekapkgs`
 - [env](docs/agents/cmd-env.md) — per-directory dev environments with automatic shell hook activation
 - [template](docs/agents/cmd-template.md) — core-pkgs Nix expression generator (stdenv, cmake, meson, rust, go, python, auto)
 - [registry](docs/agents/cmd-registry.md) — flake registry management (list, add, remove, pin, resolve)
+- [fuse](docs/agents/cmd-fuse.md) — on-demand `/usr/lib` FUSE layer serving shared libraries from Nix cache
