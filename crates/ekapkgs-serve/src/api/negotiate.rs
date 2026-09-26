@@ -5,7 +5,8 @@ use ekapkgs_protocol::ekapkgs::v1::cache_service_server::CacheService;
 use ekapkgs_protocol::ekapkgs::v1::{
     B3Digest, CaDirectoryData, CaPathMapping, ChunkDownload, ChunkMeta, ChunkNegotiateRequest,
     ChunkNegotiateResponse, Compression, DownloadBatch, DownloadPlan, FileChunkMapping, NarChunk,
-    NegotiateRequest, NegotiateResponse, PathManifestEntry, StreamNarsRequest,
+    NegotiateRequest, NegotiateResponse, PathManifestEntry, PushNegotiateRequest,
+    PushNegotiateResponse, StreamNarsRequest,
 };
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
@@ -463,6 +464,62 @@ impl CacheService for NegotiateService {
         });
 
         Ok(Response::new(ReceiverStream::new(rx)))
+    }
+
+    async fn push_negotiate(
+        &self,
+        request: Request<PushNegotiateRequest>,
+    ) -> Result<Response<PushNegotiateResponse>, Status> {
+        if !self.state.storage.supports_cas() {
+            return Err(Status::unimplemented("CAS storage not configured"));
+        }
+
+        let req = request.into_inner();
+        let hash = &req.store_path_hash;
+
+        // Check if the server already has this path.
+        match self.state.storage.has_narinfo(hash) {
+            Ok(true) => {
+                return Ok(Response::new(PushNegotiateResponse {
+                    missing_chunks: Vec::new(),
+                    already_exists: true,
+                }));
+            },
+            Ok(false) => {},
+            Err(e) => {
+                return Err(Status::internal(format!(
+                    "failed to check narinfo for {hash}: {e}"
+                )));
+            },
+        }
+
+        // Collect all chunk digests from the client's tree metadata.
+        let mut all_chunk_digests = Vec::new();
+        for mapping in &req.file_chunk_mappings {
+            for chunk in &mapping.chunks {
+                if let Some(digest) = &chunk.digest {
+                    all_chunk_digests.push(digest.clone());
+                }
+            }
+        }
+
+        // Check which chunks the server already has.
+        let mut missing = Vec::new();
+        for digest in &all_chunk_digests {
+            let d: [u8; 32] = match digest.digest.as_slice().try_into() {
+                Ok(d) => d,
+                Err(_) => continue,
+            };
+            match self.state.storage.get_chunk(&d) {
+                Ok(Some(_)) => {}, // Server has it.
+                Ok(None) | Err(_) => missing.push(digest.clone()),
+            }
+        }
+
+        Ok(Response::new(PushNegotiateResponse {
+            missing_chunks: missing,
+            already_exists: false,
+        }))
     }
 }
 
