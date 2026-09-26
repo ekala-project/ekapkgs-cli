@@ -149,11 +149,8 @@ impl CastoreBackend {
     }
 
     // --- GC methods ---
-    // These are public API for the GC subsystem. They are tested below but
-    // not yet wired into the server's GC background loop.
 
     /// Update `last_access` for a batch of store path hashes.
-    #[allow(dead_code)]
     pub fn update_access(&self, hashes: &[String]) {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -173,7 +170,6 @@ impl CastoreBackend {
     }
 
     /// Return total bytes stored in chunks.
-    #[allow(dead_code)]
     pub fn total_chunk_bytes(&self) -> color_eyre::Result<u64> {
         let db = self.db.lock().expect("db lock");
         let total: i64 = db.query_row("SELECT COALESCE(SUM(size), 0) FROM chunks", [], |row| {
@@ -183,7 +179,6 @@ impl CastoreBackend {
     }
 
     /// Return total number of CAS paths stored.
-    #[allow(dead_code)]
     pub fn total_paths(&self) -> color_eyre::Result<u64> {
         let db = self.db.lock().expect("db lock");
         let count: i64 = db.query_row("SELECT COUNT(*) FROM cas_paths", [], |row| row.get(0))?;
@@ -198,7 +193,6 @@ impl CastoreBackend {
     ///
     /// Directories are left in SQLite (they are small and will be
     /// overwritten naturally on future ingests).
-    #[allow(dead_code)]
     pub fn evict_path(&self, hash: &str) -> color_eyre::Result<u64> {
         let db = self.db.lock().expect("db lock");
         let tx = db.unchecked_transaction()?;
@@ -379,7 +373,6 @@ impl CastoreBackend {
     }
 
     /// List paths ordered by last access time (oldest first), for GC.
-    #[allow(dead_code)]
     pub fn paths_by_access_asc(&self) -> color_eyre::Result<Vec<(String, u64)>> {
         let db = self.db.lock().expect("db lock");
         let mut stmt =
@@ -1040,6 +1033,52 @@ impl StorageBackend for CastoreBackend {
 
     fn get_cas_root(&self, hash: &str) -> color_eyre::Result<Option<Vec<u8>>> {
         Ok(self.get_root_node(hash)?.map(|n| n.encode_to_vec()))
+    }
+}
+
+/// Delegate all `StorageBackend` methods to the inner `CastoreBackend` so
+/// an `Arc<CastoreBackend>` can be stored in `Box<dyn StorageBackend>` while
+/// the GC loop holds a clone of the same `Arc`.
+impl StorageBackend for std::sync::Arc<CastoreBackend> {
+    fn as_any(&self) -> &dyn std::any::Any {
+        // Return the inner CastoreBackend so downcast_ref works.
+        &**self
+    }
+
+    fn has_narinfo(&self, hash: &str) -> color_eyre::Result<bool> {
+        (**self).has_narinfo(hash)
+    }
+
+    fn get_narinfo(&self, hash: &str) -> color_eyre::Result<Option<NarInfo>> {
+        (**self).get_narinfo(hash)
+    }
+
+    fn get_narinfo_text(&self, hash: &str) -> color_eyre::Result<Option<String>> {
+        (**self).get_narinfo_text(hash)
+    }
+
+    fn get_nar(&self, file_path: &str) -> color_eyre::Result<Option<Vec<u8>>> {
+        (**self).get_nar(file_path)
+    }
+
+    fn put_narinfo(&self, hash: &str, content: &str) -> color_eyre::Result<bool> {
+        (**self).put_narinfo(hash, content)
+    }
+
+    fn put_nar(&self, file_path: &str, data: &[u8]) -> color_eyre::Result<bool> {
+        (**self).put_nar(file_path, data)
+    }
+
+    fn supports_cas(&self) -> bool {
+        (**self).supports_cas()
+    }
+
+    fn get_chunk(&self, digest: &[u8]) -> color_eyre::Result<Option<Vec<u8>>> {
+        (**self).get_chunk(digest)
+    }
+
+    fn get_cas_root(&self, hash: &str) -> color_eyre::Result<Option<Vec<u8>>> {
+        (**self).get_cas_root(hash)
     }
 }
 

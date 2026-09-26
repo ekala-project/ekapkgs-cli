@@ -6,6 +6,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use rusqlite::{Connection, params};
 use tokio::sync::mpsc;
 
+use crate::storage::castore::CastoreBackend;
+
 /// Parsed GC configuration with sizes as bytes.
 pub struct GcConfig {
     pub max_size: u64,
@@ -45,7 +47,8 @@ impl GcTracker {
     }
 }
 
-/// Initialize the GC system: create the tracker, database, and background task.
+/// Initialize the GC system for filesystem backends: create the tracker,
+/// database, and background task.
 ///
 /// Returns the tracker to put in AppState. The background task is spawned
 /// automatically and runs for the server's lifetime.
@@ -99,6 +102,144 @@ pub fn init(
     });
 
     Ok(tracker)
+}
+
+/// Initialize the GC system for the CAS backend.
+///
+/// Uses `CastoreBackend`'s own eviction and size tracking instead of the
+/// filesystem-oriented GC logic.
+#[allow(clippy::needless_pass_by_value)]
+pub fn init_cas(
+    backend: Arc<CastoreBackend>,
+    config: GcConfig,
+    gc_metrics: Option<GcMetrics>,
+) -> Arc<GcTracker> {
+    let (event_tx, event_rx) = mpsc::unbounded_channel();
+    let tracker = Arc::new(GcTracker { event_tx });
+
+    let max_size = config.max_size;
+    let target_size = config.target_size;
+    let gc_interval = config.gc_interval;
+    let metrics = gc_metrics;
+
+    tokio::spawn(async move {
+        cas_gc_loop(event_rx, backend, max_size, target_size, gc_interval, metrics).await;
+    });
+
+    tracker
+}
+
+/// CAS-specific GC background loop.
+///
+/// Uses the CastoreBackend's own LRU eviction and size tracking.
+async fn cas_gc_loop(
+    mut event_rx: mpsc::UnboundedReceiver<GcEvent>,
+    backend: Arc<CastoreBackend>,
+    max_size: u64,
+    target_size: u64,
+    gc_interval: Duration,
+    gc_metrics: Option<GcMetrics>,
+) {
+    let mut interval = tokio::time::interval(gc_interval);
+    let mut pending: Vec<String> = Vec::new();
+
+    loop {
+        tokio::select! {
+            Some(event) = event_rx.recv() => {
+                match event {
+                    GcEvent::Access { hash } => pending.push(hash),
+                }
+
+                if pending.len() >= 500 {
+                    let batch = std::mem::take(&mut pending);
+                    let be = Arc::clone(&backend);
+                    let _ = tokio::task::spawn_blocking(move || {
+                        be.update_access(&batch);
+                    }).await;
+                }
+            }
+
+            _ = interval.tick() => {
+                if !pending.is_empty() {
+                    let batch = std::mem::take(&mut pending);
+                    let be = Arc::clone(&backend);
+                    let _ = tokio::task::spawn_blocking(move || {
+                        be.update_access(&batch);
+                    }).await;
+                }
+
+                let be = Arc::clone(&backend);
+                let m = gc_metrics.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    if let Err(e) = cas_maybe_run_gc(&be, max_size, target_size, m.as_ref()) {
+                        tracing::error!("CAS GC failed: {e}");
+                    }
+                }).await;
+            }
+        }
+    }
+}
+
+/// Check total CAS size and run GC if over max_size.
+fn cas_maybe_run_gc(
+    backend: &CastoreBackend,
+    max_size: u64,
+    target_size: u64,
+    gc_metrics: Option<&GcMetrics>,
+) -> color_eyre::Result<()> {
+    let total = backend.total_chunk_bytes()?;
+    if total <= max_size {
+        return Ok(());
+    }
+
+    tracing::info!(
+        "CAS GC triggered: store is {} ({} over limit)",
+        format_bytes(total),
+        format_bytes(total - max_size),
+    );
+
+    let paths = backend.paths_by_access_asc()?;
+    let to_free = total.saturating_sub(target_size);
+    if to_free == 0 {
+        return Ok(());
+    }
+
+    let mut freed: u64 = 0;
+    let mut evicted: u64 = 0;
+
+    for (hash, _nar_size) in &paths {
+        if freed >= to_free {
+            break;
+        }
+        match backend.evict_path(hash) {
+            Ok(bytes) => {
+                freed += bytes;
+                evicted += 1;
+            },
+            Err(e) => {
+                tracing::warn!("CAS GC: failed to evict {hash}: {e}");
+            },
+        }
+    }
+
+    if let Some(m) = gc_metrics {
+        m.runs_total.inc();
+        m.paths_evicted_total.inc_by(evicted);
+        m.bytes_freed_total.inc_by(freed);
+        if let Ok(remaining) = backend.total_chunk_bytes() {
+            m.cache_size_bytes.set(remaining as i64);
+        }
+        if let Ok(count) = backend.total_paths() {
+            m.cache_paths_total.set(count as i64);
+        }
+    }
+
+    tracing::info!(
+        "CAS GC complete: evicted {evicted} paths, freed {}",
+        format_bytes(freed),
+    );
+
+    Ok(())
 }
 
 /// The main background loop: flushes access events and runs periodic GC.
