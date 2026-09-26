@@ -196,6 +196,12 @@ pub enum Command {
         command: TemplateCommand,
     },
 
+    /// Mount a FUSE filesystem at /usr/lib to serve shared libraries on-demand.
+    Fuse {
+        #[command(subcommand)]
+        command: FuseCommand,
+    },
+
     /// Generate shell completions.
     Completions {
         /// Shell to generate completions for.
@@ -1360,6 +1366,38 @@ pub struct TemplateOpts {
     /// License (nixpkgs short name, e.g., `mit`, `gpl3Plus`).
     #[arg(long)]
     pub license: Option<String>,
+}
+
+#[derive(Subcommand)]
+pub enum FuseCommand {
+    /// Mount the FUSE filesystem.
+    Mount {
+        /// Mount point.
+        #[arg(long, default_value = "/usr/lib")]
+        mountpoint: String,
+
+        /// Run in foreground (don't daemonize).
+        #[arg(long)]
+        foreground: bool,
+
+        /// Upstream cache URL (overrides config).
+        #[arg(long)]
+        upstream: Option<String>,
+    },
+
+    /// Unmount the FUSE filesystem.
+    Unmount {
+        /// Mount point to unmount.
+        #[arg(long, default_value = "/usr/lib")]
+        mountpoint: String,
+    },
+
+    /// Show status of the FUSE mount.
+    Status {
+        /// Mount point to check.
+        #[arg(long, default_value = "/usr/lib")]
+        mountpoint: String,
+    },
 }
 
 #[derive(Clone, clap::ValueEnum)]

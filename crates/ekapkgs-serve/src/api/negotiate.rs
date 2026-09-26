@@ -46,13 +46,21 @@ impl CacheService for NegotiateService {
 
         let have_set: HashSet<&str> = req.have.iter().map(std::string::String::as_str).collect();
 
+        // If expand_closure is set, BFS from the want hashes through
+        // narinfo references to collect the full transitive runtime closure.
+        let want_hashes = if req.expand_closure {
+            expand_closure_hashes(&req.want, &have_set, &self.state)
+        } else {
+            req.want.clone()
+        };
+
         let mut available = Vec::new();
         let mut unavailable = Vec::new();
         let mut total_download_size: u64 = 0;
         let mut total_nar_size: u64 = 0;
 
         // Query storage for each wanted path.
-        for hash in &req.want {
+        for hash in &want_hashes {
             match self.state.storage.get_narinfo(hash) {
                 Ok(Some(mut ni)) => {
                     // Re-sign with our key.
@@ -446,6 +454,65 @@ impl CacheService for NegotiateService {
 
         Ok(Response::new(ReceiverStream::new(rx)))
     }
+}
+
+/// Expand a set of store path hashes into their full transitive runtime closure
+/// by following narinfo references. Excludes hashes already in `have`.
+///
+/// Uses BFS with a visited set to avoid cycles and redundant queries.
+fn expand_closure_hashes(
+    seeds: &[String],
+    have: &HashSet<&str>,
+    state: &Arc<AppState>,
+) -> Vec<String> {
+    const MAX_CLOSURE_SIZE: usize = 50_000;
+
+    let mut visited: HashSet<String> = HashSet::new();
+    let mut queue: std::collections::VecDeque<String> = std::collections::VecDeque::new();
+    let mut result: Vec<String> = Vec::new();
+
+    // Seed the BFS with the initial want hashes.
+    for hash in seeds {
+        if !have.contains(hash.as_str()) && visited.insert(hash.clone()) {
+            queue.push_back(hash.clone());
+        }
+    }
+
+    while let Some(hash) = queue.pop_front() {
+        if result.len() >= MAX_CLOSURE_SIZE {
+            tracing::warn!(
+                "Closure expansion capped at {MAX_CLOSURE_SIZE} paths"
+            );
+            break;
+        }
+
+        // Query narinfo for this hash to discover its references.
+        let references = match state.storage.get_narinfo(&hash) {
+            Ok(Some(ni)) => ni.references,
+            Ok(None) | Err(_) => {
+                // Path not on this server — still include the hash so it
+                // shows up as unavailable in the response.
+                result.push(hash);
+                continue;
+            },
+        };
+
+        result.push(hash);
+
+        // Enqueue referenced hashes not already visited or in `have`.
+        for ref_path in &references {
+            let ref_hash = ref_path
+                .rsplit('/')
+                .next()
+                .and_then(|b| b.split('-').next())
+                .unwrap_or(ref_path);
+            if !have.contains(ref_hash) && visited.insert(ref_hash.to_owned()) {
+                queue.push_back(ref_hash.to_owned());
+            }
+        }
+    }
+
+    result
 }
 
 /// Build a topologically-sorted download plan.

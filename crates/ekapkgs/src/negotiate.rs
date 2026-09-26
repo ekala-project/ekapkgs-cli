@@ -17,6 +17,35 @@ pub async fn negotiate(
     negotiate_with_target(server_url, want, have, None).await
 }
 
+/// Send a negotiate request with closure expansion.
+///
+/// The server expands the `want` set to include the full transitive runtime
+/// closure (following narinfo references), excluding paths in `have`.
+/// Equivalent to `nix-store --realise` semantics.
+pub async fn negotiate_closure(
+    server_url: &str,
+    want: Vec<String>,
+    have: Vec<String>,
+) -> color_eyre::Result<NegotiateResponse> {
+    let mut client = CacheServiceClient::connect(server_url.to_owned())
+        .await?
+        .max_decoding_message_size(64 * 1024 * 1024)
+        .max_encoding_message_size(64 * 1024 * 1024);
+
+    let request = tonic::Request::new(NegotiateRequest {
+        want,
+        have,
+        accept_compression: vec![Compression::Zstd as i32, Compression::Xz as i32],
+        trust_roots: Vec::new(),
+        supports_cas: true,
+        target_hash: String::new(),
+        expand_closure: true,
+    });
+
+    let response = client.negotiate(request).await?;
+    Ok(response.into_inner())
+}
+
 /// Send a negotiate request with a target hash for critical path prioritization.
 pub async fn negotiate_with_target(
     server_url: &str,
@@ -36,6 +65,7 @@ pub async fn negotiate_with_target(
         trust_roots: Vec::new(),
         supports_cas: true,
         target_hash: target.unwrap_or_default().to_owned(),
+        expand_closure: false,
     });
 
     let response = client.negotiate(request).await?;
