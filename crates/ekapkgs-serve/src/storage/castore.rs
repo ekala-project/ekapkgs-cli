@@ -16,7 +16,7 @@ use std::sync::Mutex;
 
 use ekapkgs_nix::bloom::BloomFilter;
 
-use ekapkgs_nix::nar::{NarDirectoryEntry, NarNode, parse_nar, write_nar};
+use ekapkgs_nix::nar::{ChunkReader, NarDirectoryEntry, NarNode, parse_nar, write_nar_streaming};
 use ekapkgs_protocol::ekapkgs::v1::{
     B3Digest, CaDirectory, CaDirectoryEntry, CaDirectoryNode, CaFileNode, CaNode, CaSymlinkNode,
     ChunkMeta,
@@ -110,13 +110,12 @@ impl CastoreBackend {
     /// Walk the Merkle trees for the requested store paths in a single pass,
     /// collecting missing chunks, directory data, and file-to-chunk mappings.
     ///
-    /// This replaces the three separate tree walks previously done by
-    /// `walk_missing_chunks`, `collect_directories`, and
-    /// `collect_file_chunk_mappings`.
+    /// `have` can be either an exact set of digests (from the flat
+    /// `have_chunks` list) or a bloom filter (compact, ~1% FPR).
     pub fn walk_cas_trees(
         &self,
         want_hashes: &[&str],
-        have_digests: &ChunkHaveCheck,
+        have: &ChunkHaveCheck,
     ) -> color_eyre::Result<CasTreeWalkResult> {
         let mut missing_chunks = Vec::new();
         let mut chunk_seen = HashSet::new();
@@ -129,7 +128,7 @@ impl CastoreBackend {
             if let Some(root) = self.get_root_node(hash)? {
                 self.walk_cas_node(
                     &root,
-                    have_digests,
+                    have,
                     &mut chunk_seen,
                     &mut missing_chunks,
                     &mut dir_seen,
@@ -586,6 +585,10 @@ impl CastoreBackend {
     }
 
     /// Reconstruct a NarNode tree from a CaNode root.
+    ///
+    /// Superseded by `write_nar_streaming()` + `ChunkReader` for production
+    /// use. Retained for potential future use and test convenience.
+    #[allow(dead_code)]
     fn reconstruct_node(&self, ca_node: &CaNode) -> color_eyre::Result<NarNode> {
         let node = ca_node
             .node
@@ -943,9 +946,11 @@ impl StorageBackend for CastoreBackend {
             return Ok(None);
         };
 
-        // Reconstruct the NAR from the CAS tree.
-        let nar_node = self.reconstruct_node(&root_node)?;
-        Ok(Some(write_nar(&nar_node)))
+        // Stream the NAR directly from CAS chunks — only one file's data is
+        // in memory at a time.
+        let mut buf = Vec::new();
+        write_nar_streaming(&mut buf, &root_node, self)?;
+        Ok(Some(buf))
     }
 
     fn put_narinfo(&self, hash: &str, content: &str) -> color_eyre::Result<bool> {
@@ -1033,6 +1038,19 @@ impl StorageBackend for CastoreBackend {
 
     fn get_cas_root(&self, hash: &str) -> color_eyre::Result<Option<Vec<u8>>> {
         Ok(self.get_root_node(hash)?.map(|n| n.encode_to_vec()))
+    }
+}
+
+impl ChunkReader for CastoreBackend {
+    fn read_file_data(&self, file_digest: &[u8; 32]) -> color_eyre::Result<Vec<u8>> {
+        self.read_file_data(file_digest)
+    }
+
+    fn load_directory(
+        &self,
+        digest: &[u8; 32],
+    ) -> color_eyre::Result<ekapkgs_protocol::ekapkgs::v1::CaDirectory> {
+        self.load_directory(digest)
     }
 }
 
@@ -1193,6 +1211,8 @@ fn sha256_hash(data: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
+    use ekapkgs_nix::nar::write_nar;
+
     use super::*;
 
     fn setup_backend() -> (tempfile::TempDir, CastoreBackend) {
@@ -1386,8 +1406,9 @@ mod tests {
         backend.put_nar("nar/walk123.nar", &nar_data).unwrap();
 
         // With empty have set, all chunks should be missing.
+        let empty = ChunkHaveCheck::Exact(HashSet::new());
         let (missing, dirs, file_maps) = backend
-            .walk_cas_trees(&["walk123"], &ChunkHaveCheck::Exact(HashSet::new()))
+            .walk_cas_trees(&["walk123"], &empty)
             .unwrap();
         assert!(!missing.is_empty());
         // A single file has no directories.
@@ -1404,9 +1425,8 @@ mod tests {
                     .and_then(|d| d.digest.as_slice().try_into().ok())
             })
             .collect();
-        let (missing2, ..) = backend
-            .walk_cas_trees(&["walk123"], &ChunkHaveCheck::Exact(have))
-            .unwrap();
+        let have_check = ChunkHaveCheck::Exact(have);
+        let (missing2, ..) = backend.walk_cas_trees(&["walk123"], &have_check).unwrap();
         assert!(missing2.is_empty());
     }
 
