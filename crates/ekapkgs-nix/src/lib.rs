@@ -1,5 +1,6 @@
 pub mod bloom;
 pub mod command;
+pub mod decompose;
 pub mod eval;
 pub mod installable;
 pub mod manifest;

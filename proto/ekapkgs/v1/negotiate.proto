@@ -12,6 +12,9 @@ service CacheService {
   rpc NegotiateChunks(ChunkNegotiateRequest) returns (ChunkNegotiateResponse);
   // Stream NAR data for multiple paths over a single server-side stream.
   rpc StreamNars(StreamNarsRequest) returns (stream NarChunk);
+  // Push-side chunk negotiation: client sends its chunk manifest, server
+  // replies with which chunks are missing.
+  rpc PushNegotiate(PushNegotiateRequest) returns (PushNegotiateResponse);
 }
 
 message NegotiateRequest {
@@ -68,4 +71,24 @@ message NarChunk {
   uint64 file_size = 4;
   // True if the data is a zstd-dict-compressed delta rather than raw NAR bytes.
   bool is_delta = 5;
+}
+
+// Push negotiation: the client sends the CAS tree metadata for a store path,
+// and the server replies with which chunks it is missing.
+message PushNegotiateRequest {
+  // Store path hash being pushed.
+  string store_path_hash = 1;
+  // The CAS root node for this store path.
+  CaNode root_node = 2;
+  // All directories in the CAS tree.
+  repeated CaDirectoryData directories = 3;
+  // All file-to-chunk mappings.
+  repeated FileChunkMapping file_chunk_mappings = 4;
+}
+
+message PushNegotiateResponse {
+  // Chunk digests the server does not have and needs the client to upload.
+  repeated B3Digest missing_chunks = 1;
+  // True if the server already has this store path (no push needed).
+  bool already_exists = 2;
 }

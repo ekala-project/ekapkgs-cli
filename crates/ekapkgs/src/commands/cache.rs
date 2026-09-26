@@ -371,7 +371,12 @@ async fn push_single_path(
         narinfo.push_str(&format!("CA: {ca}\n"));
     }
 
-    // Upload NAR, then narinfo.
+    // Try CAS push first, fall back to full NAR upload.
+    if let Ok(true) = try_cas_push(client, base_url, token, hash, &nar_data, &narinfo).await {
+        return Ok(PushResult::Uploaded);
+    }
+
+    // Full NAR upload (fallback).
     let nar_upload_url = format!("{base_url}/{nar_url}");
     let mut req = client.put(&nar_upload_url).body(nar_data);
     if let Some(t) = token {
@@ -401,6 +406,129 @@ async fn push_single_path(
     }
 
     Ok(PushResult::Uploaded)
+}
+
+/// Attempt a CAS-based push for a single path.
+///
+/// Returns `Ok(true)` if the CAS push succeeded, `Ok(false)` if the server
+/// doesn't support it (caller should fall back to full NAR upload).
+async fn try_cas_push(
+    client: &reqwest::Client,
+    base_url: &str,
+    token: Option<&str>,
+    hash: &str,
+    nar_data: &[u8],
+    narinfo: &str,
+) -> color_eyre::Result<bool> {
+    use ekapkgs_nix::decompose::decompose_nar;
+    use ekapkgs_nix::nar::parse_nar;
+    use ekapkgs_protocol::ekapkgs::v1::cache_service_client::CacheServiceClient;
+    use ekapkgs_protocol::ekapkgs::v1::{
+        B3Digest, CaDirectoryData, PushNegotiateRequest,
+    };
+
+    // Parse the NAR and decompose into CAS format.
+    let nar_node = parse_nar(nar_data)?;
+    let result = decompose_nar(&nar_node);
+
+    // Build the push negotiate request.
+    let directories = result
+        .directories
+        .iter()
+        .map(|(digest, dir)| CaDirectoryData {
+            digest: Some(B3Digest {
+                digest: digest.to_vec(),
+            }),
+            directory: Some(dir.clone()),
+        })
+        .collect();
+
+    let grpc_url = base_url.to_owned();
+    let mut grpc_client = match CacheServiceClient::connect(grpc_url).await {
+        Ok(c) => c
+            .max_decoding_message_size(64 * 1024 * 1024)
+            .max_encoding_message_size(64 * 1024 * 1024),
+        Err(_) => return Ok(false),
+    };
+
+    let request = tonic::Request::new(PushNegotiateRequest {
+        store_path_hash: hash.to_owned(),
+        root_node: Some(result.root_node.clone()),
+        directories,
+        file_chunk_mappings: result.file_chunk_mappings.clone(),
+    });
+
+    let response = match grpc_client.push_negotiate(request).await {
+        Ok(r) => r.into_inner(),
+        Err(e) => {
+            if e.code() == tonic::Code::Unimplemented {
+                return Ok(false);
+            }
+            tracing::debug!("PushNegotiate failed: {e}");
+            return Ok(false);
+        },
+    };
+
+    if response.already_exists {
+        return Ok(true);
+    }
+
+    // Build a map from digest to chunk data for fast lookup.
+    let chunk_map: std::collections::HashMap<[u8; 32], &[u8]> = result
+        .chunks
+        .iter()
+        .map(|c| (c.digest, c.data.as_slice()))
+        .collect();
+
+    // Upload only missing chunks.
+    let missing_count = response.missing_chunks.len();
+    if missing_count > 0 {
+        tracing::debug!("Uploading {missing_count} missing chunks for {hash}");
+        for missing_digest in &response.missing_chunks {
+            let d: [u8; 32] = match missing_digest.digest.as_slice().try_into() {
+                Ok(d) => d,
+                Err(_) => continue,
+            };
+            let Some(data) = chunk_map.get(&d) else {
+                continue;
+            };
+            let hex: String = d.iter().map(|b| format!("{b:02x}")).collect();
+            let url = format!("{base_url}/cas/chunk/{hex}");
+            let mut req = client.put(&url).body(data.to_vec());
+            if let Some(t) = token {
+                req = req.header("Authorization", format!("Bearer {t}"));
+            }
+            let resp = req.send().await?;
+            if !resp.status().is_success() {
+                tracing::debug!("Chunk upload failed for {hex}, falling back to full NAR");
+                return Ok(false);
+            }
+        }
+    }
+
+    // Upload the full NAR (server will ingest it into CAS atomically).
+    let nar_url = format!("{base_url}/nar/{hash}.nar");
+    let mut req = client.put(&nar_url).body(nar_data.to_vec());
+    if let Some(t) = token {
+        req = req.header("Authorization", format!("Bearer {t}"));
+    }
+    let resp = req.send().await?;
+    if !resp.status().is_success() {
+        return Ok(false);
+    }
+
+    // Upload narinfo.
+    let narinfo_url = format!("{base_url}/{hash}.narinfo");
+    let mut req = client.put(&narinfo_url).body(narinfo.to_owned());
+    if let Some(t) = token {
+        req = req.header("Authorization", format!("Bearer {t}"));
+    }
+    let resp = req.send().await?;
+    if !resp.status().is_success() {
+        return Ok(false);
+    }
+
+    Ok(true)
 }
 
 fn resolve_store_paths(inputs: &[String]) -> color_eyre::Result<Vec<String>> {
