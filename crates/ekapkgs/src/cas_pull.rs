@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 
-use ekapkgs_nix::nar::write_nar;
+use ekapkgs_nix::nar::write_nar_streaming;
 use ekapkgs_protocol::ekapkgs::v1::PathManifestEntry;
 use futures::StreamExt;
 
@@ -172,18 +172,24 @@ pub async fn cas_pull(
             continue;
         };
 
-        // Reconstruct the NarNode tree from the CaNode tree.
-        let nar_node = match store.reconstruct_node(root_node) {
-            Ok(node) => node,
-            Err(e) => {
-                tracing::warn!("NAR reassembly failed for {hash}: {e}");
-                reassembly_bar.inc(1);
-                continue;
-            },
-        };
+        // Stream NAR directly from CAS chunks — only one file's data is
+        // in memory at a time.
+        let nar_path = staging_dir.path().join(&entry.url);
+        if let Some(parent) = nar_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
 
-        // Serialize to NAR bytes.
-        let nar_bytes = write_nar(&nar_node);
+        let nar_bytes = {
+            let mut buf = Vec::new();
+            match write_nar_streaming(&mut buf, root_node, &store) {
+                Ok(()) => buf,
+                Err(e) => {
+                    tracing::warn!("NAR reassembly failed for {hash}: {e}");
+                    reassembly_bar.inc(1);
+                    continue;
+                },
+            }
+        };
 
         // Verify the reassembled NAR hash matches the expected hash from the
         // manifest. This catches corrupted chunks, incorrect file-chunk
@@ -196,11 +202,6 @@ pub async fn cas_pull(
             continue;
         }
 
-        // Write NAR file to staging.
-        let nar_path = staging_dir.path().join(&entry.url);
-        if let Some(parent) = nar_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
         std::fs::write(&nar_path, &nar_bytes)?;
 
         // Write narinfo.
