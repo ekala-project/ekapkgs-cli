@@ -18,6 +18,94 @@ pub async fn version() -> impl IntoResponse {
     (StatusCode::OK, body)
 }
 
+/// GET /api/v1/cache-info — machine-readable cache metadata including public key.
+pub async fn cache_info(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let body = serde_json::json!({
+        "public_key": state.signer.public_key(),
+        "priority": state.priority,
+        "store_dir": state.store_dir,
+    });
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "application/json")],
+        body.to_string(),
+    )
+}
+
+/// POST /api/v1/tokens — mint a new push token (requires admin token).
+pub async fn create_token(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    let Some(admin_token) = &state.admin_token else {
+        return (StatusCode::FORBIDDEN, "token minting not configured").into_response();
+    };
+
+    let auth = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "));
+
+    match auth {
+        Some(token) if token == admin_token => {},
+        _ => {
+            return (StatusCode::UNAUTHORIZED, "invalid or missing admin token").into_response();
+        },
+    }
+
+    #[derive(Deserialize)]
+    struct MintRequest {
+        name: Option<String>,
+    }
+
+    let req: MintRequest = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(_) => {
+            return (StatusCode::BAD_REQUEST, "invalid JSON body").into_response();
+        },
+    };
+
+    let name = req.name.unwrap_or_else(|| "unnamed".to_owned());
+
+    let result = (|| -> color_eyre::Result<String> {
+        let mut store = crate::tokens::TokenStore::load(&state.token_store_path)?;
+        let token_value = store.create(
+            &name,
+            crate::tokens::Permissions {
+                read: true,
+                write: true,
+            },
+        )?;
+        store.save(&state.token_store_path)?;
+        Ok(token_value)
+    })();
+
+    match result {
+        Ok(token_value) => {
+            // Update in-memory tokens.
+            {
+                let mut tokens = state.write_tokens.write().await;
+                tokens.push(token_value.clone());
+            }
+            let body = serde_json::json!({
+                "token": token_value,
+                "name": name,
+            });
+            (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, "application/json")],
+                body.to_string(),
+            )
+                .into_response()
+        },
+        Err(e) => {
+            tracing::error!("Failed to mint token: {e}");
+            (StatusCode::INTERNAL_SERVER_ERROR, "failed to mint token").into_response()
+        },
+    }
+}
+
 /// GET /nix-cache-info
 pub async fn nix_cache_info(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let body = format!(

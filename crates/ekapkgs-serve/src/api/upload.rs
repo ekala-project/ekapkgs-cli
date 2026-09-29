@@ -47,14 +47,11 @@ fn is_valid_nar_filename(s: &str) -> bool {
 
 /// Validate the bearer token against the configured write tokens.
 #[allow(clippy::result_large_err)]
-pub fn check_auth(state: &AppState, headers: &HeaderMap) -> Result<(), Response> {
-    let tokens = match &state.write_tokens {
-        Some(t) if !t.is_empty() => t,
-        _ => {
-            // No auth configured — reject all writes.
-            return Err((StatusCode::FORBIDDEN, "push not enabled").into_response());
-        },
-    };
+pub async fn check_auth(state: &AppState, headers: &HeaderMap) -> Result<(), Response> {
+    let tokens = state.write_tokens.read().await;
+    if tokens.is_empty() {
+        return Err((StatusCode::FORBIDDEN, "push not enabled").into_response());
+    }
 
     let auth = headers
         .get("authorization")
@@ -74,7 +71,7 @@ pub async fn put_narinfo(
     Path(hash_narinfo): Path<String>,
     body: Bytes,
 ) -> Response {
-    if let Err(e) = check_auth(&state, &headers) {
+    if let Err(e) = check_auth(&state, &headers).await {
         return e;
     }
 
@@ -152,7 +149,7 @@ pub async fn put_nar(
     Path(file): Path<String>,
     body: Bytes,
 ) -> Response {
-    if let Err(e) = check_auth(&state, &headers) {
+    if let Err(e) = check_auth(&state, &headers).await {
         return e;
     }
 

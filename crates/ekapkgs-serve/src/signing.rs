@@ -1,5 +1,6 @@
 use ed25519_dalek::{Signer, SigningKey};
 use ekapkgs_protocol::ekapkgs::v1::{CertSignature, CertificateChain, SigningCertificate};
+use tracing::log::info;
 
 /// A nix-compatible narinfo signer.
 ///
@@ -15,6 +16,7 @@ impl NarInfoSigner {
     ///
     /// The file format is `key-name:base64-encoded-ed25519-secret-key`.
     pub fn from_file(path: &std::path::Path) -> color_eyre::Result<Self> {
+        info!("Loading key at {}", path.display());
         let contents = std::fs::read_to_string(path)?.trim().to_owned();
         let (name, key_b64) = contents
             .split_once(':')

@@ -1427,6 +1427,7 @@ dependencies = [
  "indicatif",
  "jiff",
  "nucleo-matcher",
+ "pkg-config",
  "prost",
  "reqwest",
  "rusqlite",
@@ -1507,6 +1508,7 @@ dependencies = [
  "clap-verbosity-flag",
  "color-eyre",
  "data-encoding",
+ "directories",
  "ed25519-dalek",
  "ekapkgs-nix",
  "ekapkgs-protocol",
@@ -1532,6 +1534,7 @@ dependencies = [
  "tower 0.5.3",
  "tower-http",
  "tracing",
+ "tracing-subscriber",
  "zstd",
 ]
 

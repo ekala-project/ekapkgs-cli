@@ -64,6 +64,7 @@ pub struct CastoreBackend {
 impl CastoreBackend {
     /// Create a new CAS backend rooted at the given directory.
     pub fn new(root: PathBuf) -> color_eyre::Result<Self> {
+        tracing::log::info!("Creating CAS store at directory {}", root.display());
         std::fs::create_dir_all(root.join("chunks"))?;
 
         let db_path = root.join("castore.db");
@@ -1102,6 +1103,7 @@ impl StorageBackend for std::sync::Arc<CastoreBackend> {
 // --- Database helpers ---
 
 fn open_db(path: &Path) -> color_eyre::Result<Connection> {
+    tracing::log::info!("Opening database at {}", path.display());
     let conn = Connection::open(path)?;
     conn.execute_batch(
         "PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;",

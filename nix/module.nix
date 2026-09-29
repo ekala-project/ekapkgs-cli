@@ -10,6 +10,8 @@ let
   settingsFormat = pkgs.formats.toml { };
 
   configFile = settingsFormat.generate "ekapkgs-serve.toml" cfg.settings;
+
+  storagePath = cfg.settings.storage.path or null;
 in
 {
   options.services.ekapkgs-serve = {
@@ -74,9 +76,15 @@ in
       default = false;
       description = "Whether to open the firewall for the server port.";
     };
+
   };
 
   config = lib.mkIf cfg.enable {
+    environment.systemPackages = [
+      cfg.package
+      pkgs.ekapkgs
+    ];
+
     users.users = lib.mkIf (cfg.user == "ekapkgs") {
       ekapkgs = {
         isSystemUser = true;
@@ -172,7 +180,8 @@ in
         ReadWritePaths = [
           "/nix/var/nix/daemon-socket"
           "/var/lib/${cfg.stateDirectory}"
-        ];
+        ]
+        ++ lib.optional (storagePath != null) storagePath;
       };
     };
 
