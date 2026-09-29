@@ -12,7 +12,6 @@ pub struct NixStoreBackend;
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct NixPathInfo {
-    path: String,
     nar_hash: String,
     nar_size: u64,
     #[serde(default)]
@@ -23,6 +22,13 @@ struct NixPathInfo {
     ca: Option<String>,
 }
 
+/// A resolved path info entry with the store path included.
+#[derive(Debug)]
+struct ResolvedPathInfo {
+    path: String,
+    info: NixPathInfo,
+}
+
 impl NixStoreBackend {
     pub fn new() -> Self {
         Self
@@ -30,25 +36,10 @@ impl NixStoreBackend {
 
     /// Resolve a hash prefix to a full store path using `nix path-info`.
     fn resolve_path(&self, hash: &str) -> color_eyre::Result<Option<String>> {
-        // nix path-info accepts a hash prefix and returns the full path.
-        // We use --json to parse the output.
-        let result = NixCommand::new(&["path-info", "--json"])
-            .arg(format!("/nix/store/{hash}"))
-            .output();
-
-        match result {
-            Ok(output) => {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                // nix path-info --json returns an array of path info objects
-                let infos: Vec<NixPathInfo> = serde_json::from_str(&stdout)?;
-                Ok(infos.into_iter().next().map(|i| i.path))
-            },
-            Err(ekapkgs_nix::NixError::Failed { .. }) => Ok(None),
-            Err(e) => Err(e.into()),
-        }
+        Ok(self.get_path_info(hash)?.map(|r| r.path))
     }
 
-    fn get_path_info(&self, hash: &str) -> color_eyre::Result<Option<NixPathInfo>> {
+    fn get_path_info(&self, hash: &str) -> color_eyre::Result<Option<ResolvedPathInfo>> {
         let result = NixCommand::new(&["path-info", "--json"])
             .arg(format!("/nix/store/{hash}"))
             .output();
@@ -56,8 +47,12 @@ impl NixStoreBackend {
         match result {
             Ok(output) => {
                 let stdout = String::from_utf8_lossy(&output.stdout);
-                let infos: Vec<NixPathInfo> = serde_json::from_str(&stdout)?;
-                Ok(infos.into_iter().next())
+                let infos: std::collections::HashMap<String, NixPathInfo> =
+                    serde_json::from_str(&stdout)?;
+                Ok(infos
+                    .into_iter()
+                    .next()
+                    .map(|(path, info)| ResolvedPathInfo { path, info }))
             },
             Err(ekapkgs_nix::NixError::Failed { .. }) => Ok(None),
             Err(e) => Err(e.into()),
@@ -75,24 +70,24 @@ impl StorageBackend for NixStoreBackend {
     }
 
     fn get_narinfo(&self, hash: &str) -> color_eyre::Result<Option<NarInfo>> {
-        let Some(info) = self.get_path_info(hash)? else {
+        let Some(resolved) = self.get_path_info(hash)? else {
             return Ok(None);
         };
 
         // Construct a NarInfo from the nix path-info JSON.
         // The URL is synthesized for on-the-fly NAR streaming.
         Ok(Some(NarInfo {
-            store_path: info.path,
+            store_path: resolved.path,
             url: format!("nar/{hash}.nar"),
             compression: "none".to_owned(),
             file_hash: String::new(),
             file_size: 0,
-            nar_hash: info.nar_hash,
-            nar_size: info.nar_size,
-            references: info.references,
-            deriver: info.deriver,
-            signatures: info.signatures,
-            ca: info.ca,
+            nar_hash: resolved.info.nar_hash,
+            nar_size: resolved.info.nar_size,
+            references: resolved.info.references,
+            deriver: resolved.info.deriver,
+            signatures: resolved.info.signatures,
+            ca: resolved.info.ca,
         }))
     }
 
