@@ -42,11 +42,20 @@ ekapkgs develop .#devShells.x86_64-linux.default
 ### Cache management
 
 ```
-ekapkgs cache push nixpkgs#hello           # upload closure to cache
-ekapkgs cache pull nixpkgs#firefox          # pre-fetch closure
-ekapkgs cache auth login URL --token TOKEN  # save push credentials
-ekapkgs cache auth status                   # show configured caches
+ekapkgs cache add mycache http://localhost:8080    # register a named cache
+ekapkgs cache list                                 # show configured caches
+ekapkgs cache remove mycache                       # remove a cache entry
+
+ekapkgs cache push mycache nixpkgs#hello           # push using cache name
+ekapkgs cache pull mycache nixpkgs#firefox          # pre-fetch closure
+
+ekapkgs cache auth login mycache --token TOKEN     # save push credentials
+ekapkgs cache auth token mycache --admin-token SECRET  # mint token from server
+ekapkgs cache auth status                          # show caches and auth status
 ```
+
+The `EKAPKGS_TOKEN` environment variable can be used for push authentication,
+which is useful in nix post-build hooks with a credentials file.
 
 ### Closure analysis
 
@@ -368,6 +377,7 @@ Config at `~/.config/ekapkgs/config.toml`:
 
 ```toml
 [[caches]]
+name = "mycache"
 url = "https://cache.ekapkgs.org"
 token = "ekap_..."
 priority = 10
@@ -382,11 +392,16 @@ ekapkgs-serve --signing-key cache-key.sec --storage nix-store
 # With config file
 ekapkgs-serve --config /etc/ekapkgs-serve/config.toml
 
-# Token management
-ekapkgs-serve token create ci-main          # prints token
+# Token management (offline — requires server restart)
+ekapkgs-serve token create ci-main
 ekapkgs-serve token create ci-pr --read-only
 ekapkgs-serve token list
 ekapkgs-serve token revoke ci-main
+
+# Dynamic token minting (on a running server, no restart)
+# Set EKAPKGS_ADMIN_TOKEN via env var or systemd EnvironmentFile
+EKAPKGS_ADMIN_TOKEN=secret ekapkgs-serve --signing-key key --storage /tmp/cache
+ekapkgs cache auth token mycache --admin-token secret
 
 # Certificate signing (optional)
 ekapkgs-serve generate-ca ekapkgs-root-ca-1

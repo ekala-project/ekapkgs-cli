@@ -7,6 +7,9 @@ edition.workspace = true
 name = "ekapkgs"
 path = "src/main.rs"
 
+[build-dependencies]
+pkg-config = "0.3.34"
+
 [dependencies]
 ekapkgs-protocol.workspace = true
 ekapkgs-nix.workspace = true

@@ -1,6 +1,7 @@
 use std::fmt;
 
 use tracing::Level;
+use tracing::metadata::LevelFilter;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::fmt::FormatFields;
 use tracing_subscriber::layer::SubscriberExt;
@@ -42,19 +43,12 @@ where
 
 /// Initialize the logging subscriber with the colored prefix formatter.
 ///
-/// Respects the `EKAPKGS_LOG` environment variable for filtering, defaulting
+/// Respects the `RUST_LOG` environment variable for filtering, defaulting
 /// to the level determined by the verbosity flag.
-pub fn init(verbosity: &clap_verbosity_flag::Verbosity) {
-    let filter = EnvFilter::try_from_env("EKAPKGS_LOG").unwrap_or_else(|_| {
-        let level = verbosity.log_level().map(|l| match l {
-            log::Level::Error => "error",
-            log::Level::Warn => "warn",
-            log::Level::Info => "info",
-            log::Level::Debug => "debug",
-            log::Level::Trace => "trace",
-        });
-        EnvFilter::new(level.unwrap_or("info"))
-    });
+pub fn init(_verbosity: &clap_verbosity_flag::Verbosity) {
+    let filter = EnvFilter::builder()
+        .with_default_directive(LevelFilter::INFO.into())
+        .from_env_lossy();
 
     let fmt_layer = tracing_subscriber::fmt::layer().event_format(PrefixFormatter);
 
