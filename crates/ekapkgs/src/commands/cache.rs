@@ -39,13 +39,25 @@ fn require_cache<'a>(
 /// (useful for systemd post-build hooks that don't have a user config).
 fn resolve_cache_for_action(
     config: &ClientConfig,
-    name: &str,
+    name: Option<&str>,
 ) -> color_eyre::Result<(String, Option<String>)> {
-    if let Some(cache) = config.resolve_cache(name) {
-        let token = config.push_token(&cache.url);
-        return Ok((cache.url.clone(), token));
+    // Explicit cache name/URL provided.
+    if let Some(name) = name {
+        if let Some(cache) = config.resolve_cache(name) {
+            let token = config.push_token(&cache.url);
+            return Ok((cache.url.clone(), token));
+        }
+        // Treat as a raw URL if not a registered name.
+        if name.contains("://") {
+            let token = config.push_token(name);
+            return Ok((name.to_owned(), token));
+        }
+        return Err(color_eyre::eyre::eyre!(
+            "cache {name:?} not found — add it with: ekapkgs cache add {name} <url>"
+        ));
     }
 
+    // No cache specified — try env var, then primary cache.
     if let Ok(url) = std::env::var("EKAPKGS_CACHE_URL") {
         if !url.is_empty() {
             let token = config.push_token(&url);
@@ -53,12 +65,15 @@ fn resolve_cache_for_action(
         }
     }
 
+    if let Some(cache) = config.primary_cache() {
+        let token = config.push_token(&cache.url);
+        return Ok((cache.url.clone(), token));
+    }
+
     Err(color_eyre::eyre::eyre!(
-        "cache {name:?} not found — add it with: ekapkgs cache add {name} <url>\n\
-         or set EKAPKGS_CACHE_URL"
+        "no cache configured — use --cache, set EKAPKGS_CACHE_URL, or run: ekapkgs cache add <name> <url>"
     ))
 }
-
 pub fn execute(command: CacheCommand) -> color_eyre::Result<()> {
     match command {
         CacheCommand::Add { name, url } => cmd_add(&name, &url),
@@ -70,12 +85,12 @@ pub fn execute(command: CacheCommand) -> color_eyre::Result<()> {
             sources_only,
         } => {
             if sources_only {
-                cmd_push_sources(&paths, &cache)
+                cmd_push_sources(&paths, cache.as_deref())
             } else {
-                cmd_push(&paths, &cache)
+                cmd_push(&paths, cache.as_deref())
             }
         },
-        CacheCommand::Pull { paths, cache } => cmd_pull(&paths, &cache),
+        CacheCommand::Pull { paths, cache } => cmd_pull(&paths, cache.as_deref()),
         CacheCommand::Warm {
             installable,
             from_flake_lock_diff,
@@ -95,7 +110,7 @@ pub fn execute(command: CacheCommand) -> color_eyre::Result<()> {
 
 // --- push ---
 
-fn cmd_push(paths: &[String], cache_name: &str) -> color_eyre::Result<()> {
+fn cmd_push(paths: &[String], cache_name: Option<&str>) -> color_eyre::Result<()> {
     let config = ClientConfig::load()?;
 
     let (server_url, token) = resolve_cache_for_action(&config, cache_name)?;
@@ -108,7 +123,43 @@ fn cmd_push(paths: &[String], cache_name: &str) -> color_eyre::Result<()> {
         return Ok(());
     }
 
-    tracing::info!("Pushing {} paths to {base_url}", store_paths.len());
+    // Compute total closure size up front.
+    let total_closure_size = closure_nar_size(&store_paths);
+
+    // Pre-push summary: "Pushing <first> (size) and N others (total) to <cache>"
+    let first_name = store_paths
+        .first()
+        .map(|p| store::parse_store_path_name(p))
+        .map(|(name, ver)| {
+            if ver.is_empty() {
+                name.to_owned()
+            } else {
+                format!("{name}-{ver}")
+            }
+        })
+        .unwrap_or_default();
+
+    let first_size = store_paths
+        .first()
+        .map(|p| single_nar_size(p))
+        .unwrap_or(0);
+
+    if store_paths.len() == 1 {
+        tracing::info!(
+            "Pushing {} ({}) to {base_url}",
+            first_name,
+            ekapkgs_ui::format::format_bytes(first_size),
+        );
+    } else {
+        let others = store_paths.len() - 1;
+        tracing::info!(
+            "Pushing {} ({}) and {} others ({} closure) to {base_url}",
+            first_name,
+            ekapkgs_ui::format::format_bytes(first_size),
+            others,
+            ekapkgs_ui::format::format_bytes(total_closure_size),
+        );
+    }
 
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {
@@ -130,11 +181,18 @@ fn cmd_push(paths: &[String], cache_name: &str) -> color_eyre::Result<()> {
         let mut success = 0u64;
         let mut skipped = 0u64;
         let mut failed = 0u64;
+        let mut total_nar = 0u64;
+        let mut total_uploaded = 0u64;
 
         for result in results {
             match result {
-                Ok(PushResult::Uploaded) => {
+                Ok(PushResult::Uploaded {
+                    nar_size,
+                    upload_size,
+                }) => {
                     success += 1;
+                    total_nar += nar_size;
+                    total_uploaded += upload_size;
                     bar.inc(1);
                 },
                 Ok(PushResult::AlreadyExists) => {
@@ -152,7 +210,11 @@ fn cmd_push(paths: &[String], cache_name: &str) -> color_eyre::Result<()> {
         bar.finish_and_clear();
 
         if success > 0 {
-            tracing::info!("{success} paths uploaded");
+            tracing::info!(
+                "{success} paths uploaded ({} uploaded, {} closure)",
+                ekapkgs_ui::format::format_bytes(total_uploaded),
+                ekapkgs_ui::format::format_bytes(total_nar),
+            );
         }
         if skipped > 0 {
             tracing::info!("{skipped} paths already on server");
@@ -167,9 +229,41 @@ fn cmd_push(paths: &[String], cache_name: &str) -> color_eyre::Result<()> {
     Ok(())
 }
 
+/// Get the total NAR size across all paths using `nix path-info`.
+fn closure_nar_size(paths: &[String]) -> u64 {
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Info {
+        #[serde(default)]
+        nar_size: u64,
+    }
+
+    let mut total = 0u64;
+    for chunk in paths.chunks(100) {
+        let mut cmd = NixCommand::new(&["path-info", "--json"]);
+        for p in chunk {
+            cmd = cmd.arg(p);
+        }
+        if let Ok(output) = cmd.output() {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            if let Ok(infos) =
+                serde_json::from_str::<std::collections::HashMap<String, Info>>(&stdout)
+            {
+                total += infos.values().map(|i| i.nar_size).sum::<u64>();
+            }
+        }
+    }
+    total
+}
+
+/// Get the NAR size of a single store path.
+fn single_nar_size(path: &str) -> u64 {
+    closure_nar_size(&[path.to_owned()])
+}
+
 // --- push --sources-only ---
 
-fn cmd_push_sources(paths: &[String], cache_name: &str) -> color_eyre::Result<()> {
+fn cmd_push_sources(paths: &[String], cache_name: Option<&str>) -> color_eyre::Result<()> {
     let config = ClientConfig::load()?;
 
     let (server_url, token) = resolve_cache_for_action(&config, cache_name)?;
@@ -303,7 +397,12 @@ fn cmd_push_sources(paths: &[String], cache_name: &str) -> color_eyre::Result<()
 }
 
 enum PushResult {
-    Uploaded,
+    Uploaded {
+        /// Uncompressed NAR size (closure contribution).
+        nar_size: u64,
+        /// Bytes actually transferred (NAR dump size).
+        upload_size: u64,
+    },
     AlreadyExists,
 }
 
@@ -387,9 +486,14 @@ async fn push_single_path(
         narinfo.push_str(&format!("CA: {ca}\n"));
     }
 
+    let upload_size = nar_data.len() as u64;
+
     // Try CAS push first, fall back to full NAR upload.
     if let Ok(true) = try_cas_push(client, base_url, token, hash, &nar_data, &narinfo).await {
-        return Ok(PushResult::Uploaded);
+        return Ok(PushResult::Uploaded {
+            nar_size: info.nar_size,
+            upload_size,
+        });
     }
 
     // Full NAR upload (fallback).
@@ -421,7 +525,10 @@ async fn push_single_path(
         ));
     }
 
-    Ok(PushResult::Uploaded)
+    Ok(PushResult::Uploaded {
+        nar_size: info.nar_size,
+        upload_size,
+    })
 }
 
 /// Attempt a CAS-based push for a single path.
@@ -595,7 +702,7 @@ fn resolve_store_paths(inputs: &[String]) -> color_eyre::Result<Vec<String>> {
 
 // --- pull ---
 
-fn cmd_pull(paths: &[String], cache_name: &str) -> color_eyre::Result<()> {
+fn cmd_pull(paths: &[String], cache_name: Option<&str>) -> color_eyre::Result<()> {
     let config = ClientConfig::load()?;
 
     let (server_url, _token) = resolve_cache_for_action(&config, cache_name)?;
@@ -730,17 +837,7 @@ fn cmd_warm(
 ) -> color_eyre::Result<()> {
     let config = ClientConfig::load()?;
 
-    let server_url = match cache_name {
-        Some(name) => resolve_cache_for_action(&config, name)?.0,
-        None => {
-            let cache = config.primary_cache().ok_or_else(|| {
-                color_eyre::eyre::eyre!(
-                    "no cache configured — use `ekapkgs cache add <name> <url>`"
-                )
-            })?;
-            cache.url.clone()
-        },
-    };
+    let (server_url, _token) = resolve_cache_for_action(&config, cache_name)?;
 
     // Resolve old and new flake.lock contents.
     let (old_lock_content, new_lock_content) = if let Some(diff_range) = from_flake_lock_diff {
