@@ -91,6 +91,8 @@ fn default_parallel() -> usize {
 #[allow(dead_code)] // trust fields used by cert verification
 #[derive(Debug, Deserialize, Clone)]
 pub struct CacheConfig {
+    /// Short name for the cache (e.g., "mycache").
+    pub name: String,
     pub url: String,
     pub trusted_key: Option<String>,
     pub trust_root: Option<String>,
@@ -138,8 +140,26 @@ impl ClientConfig {
             .min_by_key(|c| c.priority)
     }
 
+    /// Resolve a cache by name.
+    pub fn resolve_cache(&self, name: &str) -> Option<&CacheConfig> {
+        self.caches.iter().find(|c| c.name == name)
+    }
+
+    /// Resolve a cache by name (mutable).
+    pub fn resolve_cache_mut(&mut self, name: &str) -> Option<&mut CacheConfig> {
+        self.caches.iter_mut().find(|c| c.name == name)
+    }
+
     /// Get the push token for a given cache URL.
+    ///
+    /// Checks `EKAPKGS_TOKEN` env var first, then falls back to the
+    /// per-cache token in config.
     pub fn push_token(&self, url: &str) -> Option<String> {
+        if let Ok(token) = std::env::var("EKAPKGS_TOKEN") {
+            if !token.is_empty() {
+                return Some(token);
+            }
+        }
         self.caches
             .iter()
             .find(|c| c.url == url)

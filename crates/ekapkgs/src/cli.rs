@@ -212,14 +212,31 @@ pub enum Command {
 
 #[derive(Subcommand)]
 pub enum CacheCommand {
+    /// Register a named cache.
+    Add {
+        /// Short name for the cache (e.g., "mycache").
+        name: String,
+
+        /// Cache URL (e.g., "http://localhost:8080").
+        url: String,
+    },
+
+    /// Remove a named cache.
+    Remove {
+        /// Cache name to remove.
+        name: String,
+    },
+
+    /// List configured caches.
+    List,
+
     /// Push store paths or packages to a binary cache.
     Push {
+        /// Cache name (as configured via `cache add`).
+        cache: String,
+
         /// Store paths or installables to push.
         paths: Vec<String>,
-
-        /// Cache URL to push to (overrides config).
-        #[arg(long)]
-        cache: Option<String>,
 
         /// Transfer only sources and derivation graph (for low-bandwidth links).
         /// The remote machine rebuilds from source instead of receiving built NARs.
@@ -229,12 +246,11 @@ pub enum CacheCommand {
 
     /// Pull (pre-fetch) store paths from a binary cache.
     Pull {
+        /// Cache name (as configured via `cache add`).
+        cache: String,
+
         /// Store paths or installables to pull.
         paths: Vec<String>,
-
-        /// Cache URL to pull from (overrides config).
-        #[arg(long)]
-        cache: Option<String>,
     },
 
     /// Pre-warm the cache by downloading the closure diff between two flake.lock versions.
@@ -254,7 +270,7 @@ pub enum CacheCommand {
         #[arg(long)]
         new: Option<String>,
 
-        /// Cache URL (overrides config).
+        /// Cache name (overrides config).
         #[arg(long)]
         cache: Option<String>,
     },
@@ -270,7 +286,7 @@ pub enum CacheCommand {
 pub enum AuthCommand {
     /// Set a push token for a cache.
     Login {
-        /// Cache URL to authenticate with.
+        /// Cache name (as configured via `cache add`).
         cache: String,
 
         /// Bearer token for push access.
@@ -280,12 +296,26 @@ pub enum AuthCommand {
 
     /// Remove stored credentials for a cache.
     Logout {
-        /// Cache URL to remove credentials for.
+        /// Cache name.
         cache: String,
     },
 
     /// Show configured caches and auth status.
     Status,
+
+    /// Mint a new push token from the server (requires admin token).
+    Token {
+        /// Cache name (as configured via `cache add`).
+        cache: String,
+
+        /// Admin token for minting push tokens.
+        #[arg(long)]
+        admin_token: String,
+
+        /// Human-readable name for the minted token on the server.
+        #[arg(long)]
+        name: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]

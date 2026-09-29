@@ -100,8 +100,12 @@ pub async fn create_token(
                 .into_response()
         },
         Err(e) => {
-            tracing::error!("Failed to mint token: {e}");
-            (StatusCode::INTERNAL_SERVER_ERROR, "failed to mint token").into_response()
+            tracing::error!("Failed to mint token: {e:#}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to mint token: {e}"),
+            )
+                .into_response()
         },
     }
 }

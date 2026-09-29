@@ -75,6 +75,12 @@
 - `doctor` command checking nix, store, caches, and disk space
 - `cache warm` command computing closure diffs between flake.lock versions for CI/CD pre-warming
 - `cache push --sources-only` for low-bandwidth links transferring derivation graphs and FODs instead of built NARs
+- `cache add/remove/list` commands for managing named caches (cachix-style)
+  - `cache push mycache /nix/store/...` — push using cache name as positional arg
+  - `cache auth login/token` now operate on cache names, not URLs
+- `cache auth token` command to mint push tokens via HTTP (`POST /api/v1/tokens`)
+- `cache add` auto-discovers the server's public signing key via `GET /api/v1/cache-info`
+- `EKAPKGS_TOKEN` environment variable for push authentication (useful in nix post-build hooks)
 - `fuse mount/unmount/status` commands for on-demand `/usr/lib` FUSE layer
   - Mounts a read-only FUSE filesystem serving shared libraries from a Nix binary cache
   - Soname index (`sonames.json.zst`) maps library names to Nix packages with `meta.priority` conflict resolution
@@ -96,6 +102,12 @@
 - Delta transfers using zstd dictionary compression between NAR versions
 - gRPC NAR streaming for single-connection closure transfer
 - Content-addressed storage backend with chunk-level deduplication
+- `POST /api/v1/tokens` endpoint for minting push tokens via HTTP (gated by `EKAPKGS_ADMIN_TOKEN`)
+  - Compatible with systemd EnvironmentFile, sops-nix, and agenix
+  - Tokens persisted to `tokens.json` and immediately usable
+- `GET /api/v1/cache-info` endpoint returning public signing key
+- Dynamic write token management via `Arc<RwLock>` (no server restart needed)
+- Token store defaults to XDG data directory (`~/.local/share/ekapkgs-serve/tokens.json`)
 - Path traversal prevention and constant-time token comparison
   - Request body size limits and narinfo validation on push
   - Delta cache capped at 256 MiB to prevent unbounded memory growth

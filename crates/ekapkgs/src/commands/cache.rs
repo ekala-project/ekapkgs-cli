@@ -22,20 +22,60 @@ fn warn_insecure_token(url: &str, token: Option<&str>) {
     }
 }
 
+fn require_cache<'a>(
+    config: &'a ClientConfig,
+    name: &str,
+) -> color_eyre::Result<&'a crate::config::CacheConfig> {
+    config.resolve_cache(name).ok_or_else(|| {
+        color_eyre::eyre::eyre!(
+            "cache {name:?} not found — add it with: ekapkgs cache add {name} <url>"
+        )
+    })
+}
+
+/// Resolve cache URL and token for push/pull operations.
+///
+/// Checks config first, then falls back to `EKAPKGS_CACHE_URL` env var
+/// (useful for systemd post-build hooks that don't have a user config).
+fn resolve_cache_for_action(
+    config: &ClientConfig,
+    name: &str,
+) -> color_eyre::Result<(String, Option<String>)> {
+    if let Some(cache) = config.resolve_cache(name) {
+        let token = config.push_token(&cache.url);
+        return Ok((cache.url.clone(), token));
+    }
+
+    if let Ok(url) = std::env::var("EKAPKGS_CACHE_URL") {
+        if !url.is_empty() {
+            let token = config.push_token(&url);
+            return Ok((url, token));
+        }
+    }
+
+    Err(color_eyre::eyre::eyre!(
+        "cache {name:?} not found — add it with: ekapkgs cache add {name} <url>\n\
+         or set EKAPKGS_CACHE_URL"
+    ))
+}
+
 pub fn execute(command: CacheCommand) -> color_eyre::Result<()> {
     match command {
+        CacheCommand::Add { name, url } => cmd_add(&name, &url),
+        CacheCommand::Remove { name } => cmd_remove(&name),
+        CacheCommand::List => cmd_list(),
         CacheCommand::Push {
             paths,
             cache,
             sources_only,
         } => {
             if sources_only {
-                cmd_push_sources(&paths, cache.as_deref())
+                cmd_push_sources(&paths, &cache)
             } else {
-                cmd_push(&paths, cache.as_deref())
+                cmd_push(&paths, &cache)
             }
         },
-        CacheCommand::Pull { paths, cache } => cmd_pull(&paths, cache.as_deref()),
+        CacheCommand::Pull { paths, cache } => cmd_pull(&paths, &cache),
         CacheCommand::Warm {
             installable,
             from_flake_lock_diff,
@@ -55,22 +95,10 @@ pub fn execute(command: CacheCommand) -> color_eyre::Result<()> {
 
 // --- push ---
 
-fn cmd_push(paths: &[String], cache_url: Option<&str>) -> color_eyre::Result<()> {
+fn cmd_push(paths: &[String], cache_name: &str) -> color_eyre::Result<()> {
     let config = ClientConfig::load()?;
 
-    let server_url = match cache_url {
-        Some(url) => url.to_owned(),
-        None => {
-            let cache = config.primary_cache().ok_or_else(|| {
-                color_eyre::eyre::eyre!(
-                    "no cache configured — use --cache or configure in config.toml"
-                )
-            })?;
-            cache.url.clone()
-        },
-    };
-
-    let token = config.push_token(&server_url);
+    let (server_url, token) = resolve_cache_for_action(&config, cache_name)?;
     let base_url = server_url.trim_end_matches('/');
 
     let store_paths = resolve_store_paths(paths)?;
@@ -141,22 +169,10 @@ fn cmd_push(paths: &[String], cache_url: Option<&str>) -> color_eyre::Result<()>
 
 // --- push --sources-only ---
 
-fn cmd_push_sources(paths: &[String], cache_url: Option<&str>) -> color_eyre::Result<()> {
+fn cmd_push_sources(paths: &[String], cache_name: &str) -> color_eyre::Result<()> {
     let config = ClientConfig::load()?;
 
-    let server_url = match cache_url {
-        Some(url) => url.to_owned(),
-        None => {
-            let cache = config.primary_cache().ok_or_else(|| {
-                color_eyre::eyre::eyre!(
-                    "no cache configured — use --cache or configure in config.toml"
-                )
-            })?;
-            cache.url.clone()
-        },
-    };
-
-    let token = config.push_token(&server_url);
+    let (server_url, token) = resolve_cache_for_action(&config, cache_name)?;
     let base_url = server_url.trim_end_matches('/');
     warn_insecure_token(base_url, token.as_deref());
 
@@ -316,7 +332,6 @@ async fn push_single_path(
     #[derive(serde::Deserialize)]
     #[serde(rename_all = "camelCase")]
     struct PathInfo {
-        path: String,
         nar_hash: String,
         nar_size: u64,
         #[serde(default)]
@@ -326,8 +341,8 @@ async fn push_single_path(
         ca: Option<String>,
     }
 
-    let infos: Vec<PathInfo> = serde_json::from_str(&path_info_str)?;
-    let info = infos
+    let infos: std::collections::HashMap<String, PathInfo> = serde_json::from_str(&path_info_str)?;
+    let (path, info) = infos
         .into_iter()
         .next()
         .ok_or_else(|| color_eyre::eyre::eyre!("no path info for {store_path}"))?;
@@ -355,12 +370,13 @@ async fn push_single_path(
         .collect();
 
     let mut narinfo = String::new();
-    narinfo.push_str(&format!("StorePath: {}\n", info.path));
+    narinfo.push_str(&format!("StorePath: {}\n", path));
     narinfo.push_str(&format!("URL: {nar_url}\n"));
     narinfo.push_str("Compression: none\n");
+    narinfo.push_str(&format!("FileHash: {}\n", info.nar_hash));
+    narinfo.push_str(&format!("FileSize: {}\n", nar_data.len()));
     narinfo.push_str(&format!("NarHash: {}\n", info.nar_hash));
     narinfo.push_str(&format!("NarSize: {}\n", info.nar_size));
-    narinfo.push_str(&format!("FileSize: {}\n", nar_data.len()));
     if !refs.is_empty() {
         narinfo.push_str(&format!("References: {}\n", refs.join(" ")));
     }
@@ -539,12 +555,9 @@ fn resolve_store_paths(inputs: &[String]) -> color_eyre::Result<Vec<String>> {
                 .output()?;
             let stdout = String::from_utf8_lossy(&output.stdout);
 
-            #[derive(serde::Deserialize)]
-            struct PathEntry {
-                path: String,
-            }
-            let entries: Vec<PathEntry> = serde_json::from_str(&stdout)?;
-            paths.extend(entries.into_iter().map(|e| e.path));
+            let entries: std::collections::HashMap<String, serde_json::Value> =
+                serde_json::from_str(&stdout)?;
+            paths.extend(entries.into_keys());
         } else {
             tracing::info!("Building {input}...");
             let build_output = NixCommand::new(&["build"])
@@ -567,12 +580,9 @@ fn resolve_store_paths(inputs: &[String]) -> color_eyre::Result<Vec<String>> {
                         .output()?;
                     let closure_str = String::from_utf8_lossy(&closure_output.stdout);
 
-                    #[derive(serde::Deserialize)]
-                    struct PathEntry {
-                        path: String,
-                    }
-                    let entries: Vec<PathEntry> = serde_json::from_str(&closure_str)?;
-                    paths.extend(entries.into_iter().map(|e| e.path));
+                    let entries: std::collections::HashMap<String, serde_json::Value> =
+                        serde_json::from_str(&closure_str)?;
+                    paths.extend(entries.into_keys());
                 }
             }
         }
@@ -585,20 +595,10 @@ fn resolve_store_paths(inputs: &[String]) -> color_eyre::Result<Vec<String>> {
 
 // --- pull ---
 
-fn cmd_pull(paths: &[String], cache_url: Option<&str>) -> color_eyre::Result<()> {
+fn cmd_pull(paths: &[String], cache_name: &str) -> color_eyre::Result<()> {
     let config = ClientConfig::load()?;
 
-    let server_url = match cache_url {
-        Some(url) => url.to_owned(),
-        None => {
-            let cache = config.primary_cache().ok_or_else(|| {
-                color_eyre::eyre::eyre!(
-                    "no cache configured — use --cache or configure in config.toml"
-                )
-            })?;
-            cache.url.clone()
-        },
-    };
+    let (server_url, _token) = resolve_cache_for_action(&config, cache_name)?;
 
     // Resolve all inputs to closure paths and partition.
     let mut all_closure_paths = Vec::new();
@@ -726,16 +726,16 @@ fn cmd_warm(
     from_flake_lock_diff: Option<&str>,
     old_lock: Option<&str>,
     new_lock: Option<&str>,
-    cache_url: Option<&str>,
+    cache_name: Option<&str>,
 ) -> color_eyre::Result<()> {
     let config = ClientConfig::load()?;
 
-    let server_url = match cache_url {
-        Some(url) => url.to_owned(),
+    let server_url = match cache_name {
+        Some(name) => resolve_cache_for_action(&config, name)?.0,
         None => {
             let cache = config.primary_cache().ok_or_else(|| {
                 color_eyre::eyre::eyre!(
-                    "no cache configured — use --cache or configure in config.toml"
+                    "no cache configured — use `ekapkgs cache add <name> <url>`"
                 )
             })?;
             cache.url.clone()
@@ -967,27 +967,117 @@ fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> std::io::
     Ok(())
 }
 
+// --- cache management ---
+
+fn cmd_add(name: &str, url: &str) -> color_eyre::Result<()> {
+    let mut config = ClientConfig::load()?;
+
+    if config.resolve_cache(name).is_some() {
+        return Err(color_eyre::eyre::eyre!("cache {name:?} already exists"));
+    }
+
+    let base = url.trim_end_matches('/');
+
+    // Try to discover the public signing key from the server.
+    let trusted_key = match fetch_public_key(base) {
+        Ok(key) => {
+            tracing::info!("Discovered public key: {key}");
+            Some(key)
+        },
+        Err(e) => {
+            tracing::debug!("Could not discover public key: {e}");
+            None
+        },
+    };
+
+    config.caches.push(crate::config::CacheConfig {
+        name: name.to_owned(),
+        url: base.to_owned(),
+        trusted_key,
+        trust_root: None,
+        token: None,
+        priority: 10,
+        protocol: crate::config::CacheProtocol::Auto,
+    });
+
+    save_config(&config)?;
+    tracing::info!("Cache {name:?} added ({base})");
+    Ok(())
+}
+
+/// Fetch the public signing key from a cache server's API.
+fn fetch_public_key(base_url: &str) -> color_eyre::Result<String> {
+    let url = format!("{base_url}/api/v1/cache-info");
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(async {
+        let resp = reqwest::Client::new().get(&url).send().await?;
+        if !resp.status().is_success() {
+            return Err(color_eyre::eyre::eyre!(
+                "cache-info returned {}",
+                resp.status()
+            ));
+        }
+        let body: serde_json::Value = resp.json().await?;
+        body.get("public_key")
+            .and_then(|k| k.as_str())
+            .map(str::to_owned)
+            .ok_or_else(|| color_eyre::eyre::eyre!("no public_key in response"))
+    })
+}
+
+fn cmd_remove(name: &str) -> color_eyre::Result<()> {
+    let mut config = ClientConfig::load()?;
+    let before = config.caches.len();
+    config.caches.retain(|c| c.name != name);
+    if config.caches.len() == before {
+        tracing::info!("No cache found for {name:?}");
+    } else {
+        save_config(&config)?;
+        tracing::info!("Cache {name:?} removed");
+    }
+    Ok(())
+}
+
+fn cmd_list() -> color_eyre::Result<()> {
+    let config = ClientConfig::load()?;
+
+    if config.caches.is_empty() {
+        tracing::info!("No caches configured");
+        return Ok(());
+    }
+
+    for cache in &config.caches {
+        let auth_status = if cache.token.is_some() {
+            "authenticated"
+        } else {
+            "no token"
+        };
+        let protocol = format!("{:?}", cache.protocol).to_lowercase();
+        tracing::info!(
+            "{} → {} (priority={}, protocol={}, {})",
+            cache.name,
+            cache.url,
+            cache.priority,
+            protocol,
+            auth_status,
+        );
+    }
+
+    Ok(())
+}
+
 // --- auth ---
 
 fn cmd_auth(command: AuthCommand) -> color_eyre::Result<()> {
     match command {
         AuthCommand::Login { cache, token } => {
             let mut config = ClientConfig::load()?;
-
-            // Update or add the cache entry.
-            if let Some(entry) = config.caches.iter_mut().find(|c| c.url == cache) {
-                entry.token = Some(token);
-            } else {
-                config.caches.push(crate::config::CacheConfig {
-                    url: cache.clone(),
-                    trusted_key: None,
-                    trust_root: None,
-                    token: Some(token),
-                    priority: 10,
-                    protocol: crate::config::CacheProtocol::Auto,
-                });
-            }
-
+            let entry = config.resolve_cache_mut(&cache).ok_or_else(|| {
+                color_eyre::eyre::eyre!(
+                    "cache {cache:?} not found — add it with: ekapkgs cache add {cache} <url>"
+                )
+            })?;
+            entry.token = Some(token);
             save_config(&config)?;
             tracing::info!("Token saved for {cache}");
             Ok(())
@@ -995,45 +1085,78 @@ fn cmd_auth(command: AuthCommand) -> color_eyre::Result<()> {
 
         AuthCommand::Logout { cache } => {
             let mut config = ClientConfig::load()?;
-
-            if let Some(entry) = config.caches.iter_mut().find(|c| c.url == cache) {
+            if let Some(entry) = config.resolve_cache_mut(&cache) {
                 entry.token = None;
                 save_config(&config)?;
                 tracing::info!("Token removed for {cache}");
             } else {
-                tracing::info!("No credentials found for {cache}");
+                tracing::info!("No cache found for {cache:?}");
             }
-
             Ok(())
         },
 
-        AuthCommand::Status => {
+        AuthCommand::Status => cmd_list(),
+
+        AuthCommand::Token {
+            cache,
+            admin_token,
+            name,
+        } => {
             let config = ClientConfig::load()?;
+            let cache_entry = require_cache(&config, &cache)?;
+            let cache_url = cache_entry.url.clone();
 
-            if config.caches.is_empty() {
-                tracing::info!("No caches configured");
-                return Ok(());
-            }
+            let name = name.unwrap_or_else(|| {
+                std::fs::read_to_string("/etc/hostname")
+                    .ok()
+                    .map(|s| s.trim().to_owned())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| "unnamed".to_owned())
+            });
 
-            for cache in &config.caches {
-                let auth_status = if cache.token.is_some() {
-                    "authenticated"
-                } else {
-                    "no token"
-                };
-                let protocol = format!("{:?}", cache.protocol).to_lowercase();
-                tracing::info!(
-                    "{} (priority={}, protocol={}, {})",
-                    cache.url,
-                    cache.priority,
-                    protocol,
-                    auth_status,
-                );
-            }
+            let rt = tokio::runtime::Runtime::new()?;
+            let token_value =
+                rt.block_on(async { mint_token_http(&cache_url, &admin_token, &name).await })?;
 
+            let mut config = ClientConfig::load()?;
+            let entry = config
+                .resolve_cache_mut(&cache)
+                .ok_or_else(|| color_eyre::eyre::eyre!("cache {cache:?} not found"))?;
+            entry.token = Some(token_value.clone());
+            save_config(&config)?;
+            tracing::info!("Token minted and saved for {cache}");
             Ok(())
         },
     }
+}
+
+async fn mint_token_http(
+    cache_url: &str,
+    admin_token: &str,
+    name: &str,
+) -> color_eyre::Result<String> {
+    let url = format!("{}/api/v1/tokens", cache_url.trim_end_matches('/'));
+    let body = serde_json::json!({ "name": name });
+
+    let resp = reqwest::Client::new()
+        .post(&url)
+        .header("Authorization", format!("Bearer {admin_token}"))
+        .json(&body)
+        .send()
+        .await?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        return Err(color_eyre::eyre::eyre!("server error: {status} {text}"));
+    }
+
+    let parsed: serde_json::Value = resp.json().await?;
+    parsed
+        .get("token")
+        .and_then(|t| t.as_str())
+        .map(str::to_owned)
+        .ok_or_else(|| color_eyre::eyre::eyre!("no token in server response"))
 }
 
 fn save_config(config: &ClientConfig) -> color_eyre::Result<()> {
@@ -1056,6 +1179,7 @@ fn save_config(config: &ClientConfig) -> color_eyre::Result<()> {
 
     for cache in &config.caches {
         content.push_str("[[caches]]\n");
+        content.push_str(&format!("name = {:?}\n", cache.name));
         content.push_str(&format!("url = {:?}\n", cache.url));
         if let Some(ref key) = cache.trusted_key {
             content.push_str(&format!("trusted_key = {:?}\n", key));
