@@ -232,8 +232,9 @@ pub enum CacheCommand {
 
     /// Push store paths or packages to a binary cache.
     Push {
-        /// Cache name (as configured via `cache add`).
-        cache: String,
+        /// Cache name or URL. If omitted, uses the primary cache or EKAPKGS_CACHE_URL.
+        #[arg(long)]
+        cache: Option<String>,
 
         /// Store paths or installables to push.
         paths: Vec<String>,
@@ -246,8 +247,9 @@ pub enum CacheCommand {
 
     /// Pull (pre-fetch) store paths from a binary cache.
     Pull {
-        /// Cache name (as configured via `cache add`).
-        cache: String,
+        /// Cache name or URL. If omitted, uses the primary cache or EKAPKGS_CACHE_URL.
+        #[arg(long)]
+        cache: Option<String>,
 
         /// Store paths or installables to pull.
         paths: Vec<String>,
