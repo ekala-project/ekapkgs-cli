@@ -19,6 +19,7 @@ use config::Config;
 use ekapkgs_protocol::ekapkgs::v1::cache_service_server::CacheServiceServer;
 use signing::NarInfoSigner;
 use storage::StorageBackend;
+use tokio::sync::RwLock;
 
 #[derive(Parser)]
 #[command(name = "ekapkgs-serve", about = "ekapkgs binary cache server")]
@@ -115,7 +116,11 @@ pub struct AppState {
     /// Threshold: require this many valid cert signatures. 0 = no threshold.
     pub signing_threshold: u32,
     pub gc_tracker: Option<Arc<gc::GcTracker>>,
-    pub write_tokens: Option<Vec<String>>,
+    pub write_tokens: Arc<RwLock<Vec<String>>>,
+    /// Admin token for minting push tokens via POST /api/v1/tokens.
+    pub admin_token: Option<String>,
+    /// Path to token store file for persisting minted tokens.
+    pub token_store_path: PathBuf,
     pub delta_cache: DeltaCache,
     pub metrics: metrics::Metrics,
     /// Cache priority advertised in nix-cache-info.
@@ -254,6 +259,8 @@ fn build_http_router(
         .route("/health", get(api::compat::health))
         .route("/version", get(api::compat::version))
         .route("/nix-cache-info", get(api::compat::nix_cache_info))
+        .route("/api/v1/cache-info", get(api::compat::cache_info))
+        .route("/api/v1/tokens", axum::routing::post(api::compat::create_token))
         .route(
             "/{hash_narinfo}",
             get(api::compat::get_narinfo)
@@ -499,7 +506,7 @@ async fn cmd_serve(cli: Cli) -> color_eyre::Result<()> {
     let mut extra_signers: Vec<signing::CertSigner> = Vec::new();
     let mut threshold: u32 = 0;
     let gc_tracker: Option<Arc<gc::GcTracker>>;
-    let write_tokens: Option<Vec<String>>;
+    let write_tokens: Arc<RwLock<Vec<String>>>;
     let compression_config: config::CompressionConfig;
     let tls_cert_path: Option<PathBuf>;
     let tls_key_path: Option<PathBuf>;
@@ -507,6 +514,7 @@ async fn cmd_serve(cli: Cli) -> color_eyre::Result<()> {
     let mut request_timeout_secs: u64 = 30;
     let mut priority: u32 = 30;
     let mut store_dir: String = "/nix/store".to_owned();
+    let token_store_path: PathBuf;
     let server_metrics = metrics::Metrics::new();
 
     let gc_metrics = gc::GcMetrics {
@@ -519,9 +527,13 @@ async fn cmd_serve(cli: Cli) -> color_eyre::Result<()> {
 
     if let Some(config_path) = &cli.config {
         let config = Config::load(config_path)?;
+        let signing_key_file_path = cli
+            .signing_key
+            .as_ref()
+            .unwrap_or(&config.signing.secret_key_file);
         bind_addr = cli.bind.unwrap_or(config.server.bind);
         warn_insecure_key_permissions(&config.signing.secret_key_file);
-        signer = NarInfoSigner::from_file(&config.signing.secret_key_file)?;
+        signer = NarInfoSigner::from_file(signing_key_file_path)?;
         cert_signer = if let Some(ref cert_config) = config.signing.certificate {
             warn_insecure_key_permissions(&cert_config.private_key_file);
             Some(signing::CertSigner::from_files(
@@ -620,17 +632,13 @@ async fn cmd_serve(cli: Cli) -> color_eyre::Result<()> {
             },
         };
         // Load tokens: from token store + any legacy config tokens.
-        let store_path = tokens::default_store_path(Some(config_path));
-        let token_store = tokens::TokenStore::load(&store_path)?;
+        token_store_path = tokens::default_store_path(Some(config_path));
+        let token_store = tokens::TokenStore::load(&token_store_path)?;
         let mut all_tokens = token_store.write_tokens();
         if let Some(auth) = config.auth {
             all_tokens.extend(auth.write_tokens);
         }
-        write_tokens = if all_tokens.is_empty() {
-            None
-        } else {
-            Some(all_tokens)
-        };
+        write_tokens = Arc::new(RwLock::new(all_tokens));
         compression_config = config.compression;
         tls_cert_path = config.server.tls_cert_path;
         tls_key_path = config.server.tls_key_path;
@@ -648,14 +656,10 @@ async fn cmd_serve(cli: Cli) -> color_eyre::Result<()> {
         gc_tracker = None;
 
         // Load tokens from default location.
-        let store_path = tokens::default_store_path(cli.config.as_deref());
-        let token_store = tokens::TokenStore::load(&store_path)?;
+        token_store_path = tokens::default_store_path(cli.config.as_deref());
+        let token_store = tokens::TokenStore::load(&token_store_path)?;
         let all_tokens = token_store.write_tokens();
-        write_tokens = if all_tokens.is_empty() {
-            None
-        } else {
-            Some(all_tokens)
-        };
+        write_tokens = Arc::new(RwLock::new(all_tokens));
 
         compression_config = config::CompressionConfig::default();
         tls_cert_path = None;
@@ -676,6 +680,7 @@ async fn cmd_serve(cli: Cli) -> color_eyre::Result<()> {
         store_dir = nix_store;
     }
 
+    let admin_token = std::env::var("EKAPKGS_ADMIN_TOKEN").ok().filter(|s| !s.is_empty());
     let state = Arc::new(AppState {
         storage: storage_backend,
         signer,
@@ -684,6 +689,8 @@ async fn cmd_serve(cli: Cli) -> color_eyre::Result<()> {
         signing_threshold: threshold,
         gc_tracker,
         write_tokens,
+        admin_token,
+        token_store_path,
         delta_cache: DeltaCache::new(),
         metrics: server_metrics,
         priority,

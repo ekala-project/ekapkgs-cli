@@ -41,7 +41,7 @@ pub async fn put_chunk(
     Path(b3hex): Path<String>,
     body: Bytes,
 ) -> Response {
-    if let Err(e) = crate::api::upload::check_auth(&state, &headers) {
+    if let Err(e) = crate::api::upload::check_auth(&state, &headers).await {
         return e;
     }
 

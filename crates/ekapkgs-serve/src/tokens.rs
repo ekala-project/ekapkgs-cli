@@ -44,6 +44,9 @@ impl TokenStore {
 
     /// Save the token store to disk with restrictive permissions (0600).
     pub fn save(&self, path: &Path) -> color_eyre::Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
         let json = serde_json::to_string_pretty(self)?;
         write_secret_file(path, json.as_bytes())?;
         Ok(())
@@ -141,11 +144,22 @@ pub fn write_secret_file(path: &Path, data: &[u8]) -> color_eyre::Result<()> {
     Ok(())
 }
 
-/// Resolve the token store path from a config file path or default location.
+/// Resolve the token store path.
+///
+/// Priority: `$STATE_DIRECTORY` (systemd) > next to config file > XDG data dir.
 pub fn default_store_path(config_path: Option<&Path>) -> PathBuf {
-    if let Some(cfg) = config_path {
-        cfg.with_file_name("tokens.json")
-    } else {
-        PathBuf::from("/etc/ekapkgs-serve/tokens.json")
+    // systemd's StateDirectory sets this (e.g., /var/lib/ekapkgs-serve).
+    if let Ok(state_dir) = std::env::var("STATE_DIRECTORY") {
+        return PathBuf::from(state_dir).join("tokens.json");
     }
+
+    // When a config file is provided, keep tokens next to it.
+    if let Some(cfg) = config_path {
+        return cfg.with_file_name("tokens.json");
+    }
+
+    // No config file — use XDG data dir.
+    directories::ProjectDirs::from("", "", "ekapkgs-serve")
+        .map(|d| d.data_dir().join("tokens.json"))
+        .unwrap_or_else(|| PathBuf::from("/etc/ekapkgs-serve/tokens.json"))
 }
