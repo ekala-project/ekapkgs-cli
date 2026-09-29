@@ -25,8 +25,12 @@ impl NarInfo {
         s.push_str(&format!("StorePath: {}\n", self.store_path));
         s.push_str(&format!("URL: {}\n", self.url));
         s.push_str(&format!("Compression: {}\n", self.compression));
-        s.push_str(&format!("FileHash: {}\n", self.file_hash));
-        s.push_str(&format!("FileSize: {}\n", self.file_size));
+        if !self.file_hash.is_empty() {
+            s.push_str(&format!("FileHash: {}\n", self.file_hash));
+        }
+        if self.file_size > 0 {
+            s.push_str(&format!("FileSize: {}\n", self.file_size));
+        }
         s.push_str(&format!("NarHash: {}\n", self.nar_hash));
         s.push_str(&format!("NarSize: {}\n", self.nar_size));
         if !self.references.is_empty() {
