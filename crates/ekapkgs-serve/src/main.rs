@@ -260,7 +260,10 @@ fn build_http_router(
         .route("/version", get(api::compat::version))
         .route("/nix-cache-info", get(api::compat::nix_cache_info))
         .route("/api/v1/cache-info", get(api::compat::cache_info))
-        .route("/api/v1/tokens", axum::routing::post(api::compat::create_token))
+        .route(
+            "/api/v1/tokens",
+            axum::routing::post(api::compat::create_token),
+        )
         .route(
             "/{hash_narinfo}",
             get(api::compat::get_narinfo)
@@ -680,7 +683,9 @@ async fn cmd_serve(cli: Cli) -> color_eyre::Result<()> {
         store_dir = nix_store;
     }
 
-    let admin_token = std::env::var("EKAPKGS_ADMIN_TOKEN").ok().filter(|s| !s.is_empty());
+    let admin_token = std::env::var("EKAPKGS_ADMIN_TOKEN")
+        .ok()
+        .filter(|s| !s.is_empty());
     let state = Arc::new(AppState {
         storage: storage_backend,
         signer,

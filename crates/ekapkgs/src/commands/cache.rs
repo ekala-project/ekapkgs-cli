@@ -71,7 +71,8 @@ fn resolve_cache_for_action(
     }
 
     Err(color_eyre::eyre::eyre!(
-        "no cache configured — use --cache, set EKAPKGS_CACHE_URL, or run: ekapkgs cache add <name> <url>"
+        "no cache configured — use --cache, set EKAPKGS_CACHE_URL, or run: ekapkgs cache add \
+         <name> <url>"
     ))
 }
 pub fn execute(command: CacheCommand) -> color_eyre::Result<()> {
@@ -139,10 +140,7 @@ fn cmd_push(paths: &[String], cache_name: Option<&str>) -> color_eyre::Result<()
         })
         .unwrap_or_default();
 
-    let first_size = store_paths
-        .first()
-        .map(|p| single_nar_size(p))
-        .unwrap_or(0);
+    let first_size = store_paths.first().map(|p| single_nar_size(p)).unwrap_or(0);
 
     if store_paths.len() == 1 {
         tracing::info!(
