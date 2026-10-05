@@ -316,12 +316,6 @@ fn cmd_packages(command: HomePackagesCommand) -> color_eyre::Result<()> {
     }
 }
 
-fn packages_profile_path() -> color_eyre::Result<String> {
-    let home = std::env::var("HOME")
-        .map_err(|_| color_eyre::eyre::eyre!("HOME environment variable not set"))?;
-    Ok(format!("{home}/{PACKAGES_PROFILE}"))
-}
-
 fn packages_dir() -> color_eyre::Result<std::path::PathBuf> {
     let home = std::env::var("HOME")
         .map_err(|_| color_eyre::eyre::eyre!("HOME environment variable not set"))?;
@@ -552,8 +546,9 @@ fn cmd_packages_export(output: Option<&str>) -> color_eyre::Result<()> {
 fn cmd_packages_import(file: &str, merge: bool) -> color_eyre::Result<()> {
     let contents = std::fs::read_to_string(file)?;
     let imported: HomePackages = toml::from_str(&contents)?;
-    let profile = packages_profile_path()?;
     let (old_manifest, _lock) = HomePackages::load_locked()?;
+    let packages_dir = packages_dir()?;
+    let mut index = crate::store_path_index::StorePathIndex::load()?;
 
     let mut manifest = if merge {
         let mut current = old_manifest.clone();
@@ -569,45 +564,60 @@ fn cmd_packages_import(file: &str, merge: bool) -> color_eyre::Result<()> {
 
     // Preserve the version field.
     manifest.version = default_manifest_version();
-
-    // Remove packages from the nix profile that are in the old manifest
-    // but absent from the new one, so the profile doesn't accumulate
-    // stale entries.
-    let new_names: std::collections::HashSet<&str> =
-        manifest.packages.iter().map(|p| p.name.as_str()).collect();
-    for old_entry in &old_manifest.packages {
-        if !new_names.contains(old_entry.name.as_str()) {
-            tracing::info!("Removing {} from profile...", old_entry.name);
-            let _ = NixCommand::new(&["profile", "remove"])
-                .arg("--profile")
-                .arg(&profile)
-                .arg(&old_entry.name)
-                .stream();
-        }
-    }
-
     manifest.save()?;
 
-    // Sync the nix profile: install all packages from the manifest.
+    // Build and symlink each package, reusing the same fast/slow path
+    // as `packages add`.
     let mut installed = 0u32;
     for entry in &manifest.packages {
+        let name = &entry.name;
+
+        // Fast path: check the store path index.
+        if let Some(idx_entry) = index.lookup(name) {
+            if crate::store_path_index::StorePathIndex::path_exists_locally(&idx_entry.store_path) {
+                tracing::info!("Installing {name} (cached)...");
+                let _ =
+                    crate::symlink_dir::create_package_symlinks(&packages_dir, &idx_entry.store_path);
+                installed += 1;
+                continue;
+            }
+        }
+
+        // Slow path: resolve via nix build.
         let installable = manifest.resolve_installable(entry);
         tracing::info!("Installing {installable}...");
-        match NixCommand::new(&["profile", "install"])
-            .arg("--profile")
-            .arg(&profile)
+
+        match NixCommand::new(&["build"])
             .arg(&installable)
-            .stream()
+            .arg("--no-link")
+            .arg("--json")
+            .json::<Vec<BuildOutput>>()
         {
-            Ok(_) => installed += 1,
-            Err(e) => tracing::warn!("Failed to install {}: {e}", entry.name),
+            Ok(outputs) => {
+                if let Some(store_path) = outputs.first().and_then(|o| o.outputs.get("out").cloned())
+                {
+                    let _ = crate::symlink_dir::create_package_symlinks(&packages_dir, &store_path);
+                    index.add_from_build_output(name, &store_path);
+                    installed += 1;
+                }
+            },
+            Err(e) => tracing::warn!("Failed to install {name}: {e}"),
         }
     }
 
+    let _ = index.save();
+
+    // Reconcile to remove symlinks for packages no longer in the manifest.
+    let names: Vec<String> = manifest.packages.iter().map(|p| p.name.clone()).collect();
+    let _ = crate::symlink_dir::rebuild_symlink_dir(&packages_dir, &index, &names);
+
     println!(
-        "Imported {} package(s) ({installed} installed to profile)",
+        "Imported {} package(s) ({installed} resolved)",
         manifest.packages.len()
     );
+
+    // Schedule debounced background apply.
+    let _ = crate::background_apply::schedule_home_apply();
 
     Ok(())
 }
