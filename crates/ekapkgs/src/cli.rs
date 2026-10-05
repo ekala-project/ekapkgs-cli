@@ -573,10 +573,12 @@ pub enum RegistryCommand {
 pub enum HomeCommand {
     /// Build and activate the home configuration.
     Switch {
-        /// The installable for the home configuration
-        /// (e.g., `.#config.system.build.home`).
-        #[arg(default_value = ".#config.system.build.home")]
-        installable: String,
+        /// The installable for the home configuration.
+        ///
+        /// When omitted, tries `.#config.home.build.activationPackage`
+        /// (standalone eval) first, then falls back to
+        /// `.#config.system.build.home` (full system eval).
+        installable: Option<String>,
 
         /// Extra arguments passed through to nix build.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
@@ -585,10 +587,12 @@ pub enum HomeCommand {
 
     /// Build the home configuration without activating.
     Build {
-        /// The installable for the home configuration
-        /// (e.g., `.#config.system.build.home`).
-        #[arg(default_value = ".#config.system.build.home")]
-        installable: String,
+        /// The installable for the home configuration.
+        ///
+        /// When omitted, tries `.#config.home.build.activationPackage`
+        /// (standalone eval) first, then falls back to
+        /// `.#config.system.build.home` (full system eval).
+        installable: Option<String>,
 
         /// Extra arguments passed through to nix build.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
@@ -601,8 +605,11 @@ pub enum HomeCommand {
     /// rebuilds the home configuration with the updated inputs.
     Update {
         /// The installable for the home configuration.
-        #[arg(default_value = ".#config.system.build.home")]
-        installable: String,
+        ///
+        /// When omitted, tries `.#config.home.build.activationPackage`
+        /// (standalone eval) first, then falls back to
+        /// `.#config.system.build.home` (full system eval).
+        installable: Option<String>,
 
         /// Extra arguments passed through to nix build.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
