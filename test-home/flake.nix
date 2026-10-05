@@ -1,7 +1,7 @@
 {
   description = "Test flake for ekapkgs home e2e";
 
-  inputs.corepkgs.url = "github:ekala-project/corepkgs/jonringer/user-env";
+  inputs.corepkgs.url = "github:ekala-project/corepkgs";
 
   outputs =
     { corepkgs, ... }:
