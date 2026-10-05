@@ -8,7 +8,8 @@
 use std::path::Path;
 
 /// Create symlinks from a store path's `bin/` directory into the
-/// packages directory.
+/// packages directory. Warns when an existing symlink from a different
+/// store path is overwritten (binary collision).
 pub fn create_package_symlinks(packages_dir: &Path, store_path: &str) -> color_eyre::Result<()> {
     let bin_dir = Path::new(store_path).join("bin");
     let target_bin = packages_dir.join("bin");
@@ -19,7 +20,16 @@ pub fn create_package_symlinks(packages_dir: &Path, store_path: &str) -> color_e
             let entry = entry?;
             let name = entry.file_name();
             let link = target_bin.join(&name);
-            // Remove existing symlink if present (handles upgrades).
+            // Warn if an existing symlink points to a different store path.
+            if let Ok(existing) = std::fs::read_link(&link) {
+                if !existing.starts_with(store_path) {
+                    tracing::warn!(
+                        "binary {:?} already provided by {}, overwriting",
+                        name,
+                        existing.display()
+                    );
+                }
+            }
             let _ = std::fs::remove_file(&link);
             std::os::unix::fs::symlink(entry.path(), &link)?;
         }
