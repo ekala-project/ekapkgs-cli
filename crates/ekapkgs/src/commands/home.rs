@@ -10,11 +10,56 @@ use crate::config::{ClientConfig, HomePackageEntry, HomePackages, HomeServiceEnt
 /// Profile path for imperatively-installed packages (relative to `$HOME`).
 const PACKAGES_PROFILE: &str = ".ekapkgs-packages";
 
+/// Standalone home eval path (faster, no system modules).
+const HOME_INSTALLABLE_STANDALONE: &str = ".#config.home.build.activationPackage";
+/// Full system eval path (has bridge.nix alias).
+const HOME_INSTALLABLE_SYSTEM: &str = ".#config.system.build.home";
+
+/// Resolve the home installable. If the user provided one explicitly, use it.
+/// Otherwise try the standalone path first (faster eval, fewer modules), and
+/// fall back to the full system path.
+fn resolve_home_installable(explicit: Option<&str>) -> String {
+    if let Some(inst) = explicit {
+        return inst.to_owned();
+    }
+
+    // Probe the standalone attribute with a quick `nix eval`.
+    tracing::debug!("Probing {HOME_INSTALLABLE_STANDALONE}...");
+    let probe = NixCommand::new(&["eval"])
+        .arg(HOME_INSTALLABLE_STANDALONE)
+        .arg("--apply")
+        .arg("_: null")
+        .output();
+
+    match probe {
+        Ok(_) => {
+            tracing::info!("Using standalone home evaluator");
+            HOME_INSTALLABLE_STANDALONE.to_owned()
+        },
+        Err(_) => {
+            tracing::debug!(
+                "{HOME_INSTALLABLE_STANDALONE} not found, falling back to \
+                 {HOME_INSTALLABLE_SYSTEM}"
+            );
+            HOME_INSTALLABLE_SYSTEM.to_owned()
+        },
+    }
+}
+
 pub fn execute(command: HomeCommand) -> color_eyre::Result<()> {
     match command {
-        HomeCommand::Switch { installable, extra } => cmd_switch(&installable, &extra),
-        HomeCommand::Build { installable, extra } => cmd_build(&installable, &extra),
-        HomeCommand::Update { installable, extra } => cmd_update(&installable, &extra),
+        HomeCommand::Switch { installable, extra } => {
+            let inst = resolve_home_installable(installable.as_deref());
+            cmd_switch(&inst, &extra)
+        },
+        HomeCommand::Build { installable, extra } => {
+            let inst = resolve_home_installable(installable.as_deref());
+            cmd_build(&inst, &extra)
+        },
+        HomeCommand::Update { installable, extra } => {
+            let inst = resolve_home_installable(installable.as_deref());
+            cmd_update(&inst, &extra)
+        },
         HomeCommand::Generations => cmd_generations(),
         HomeCommand::Rollback => cmd_rollback(),
         HomeCommand::Packages { command } => cmd_packages(command),
