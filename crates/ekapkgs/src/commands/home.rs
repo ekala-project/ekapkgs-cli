@@ -126,6 +126,9 @@ fn cmd_switch(installable: &str, extra: &[String]) -> color_eyre::Result<()> {
 
     tracing::info!("Home configuration activated");
 
+    // Hint about session-vars.sh if it doesn't appear to be sourced.
+    hint_session_vars();
+
     // Populate the store path index from the built closure.
     populate_store_path_index(&store_path);
 
@@ -1851,6 +1854,40 @@ fn dirs_path() -> color_eyre::Result<std::path::PathBuf> {
 
 fn default_manifest_version() -> u32 {
     1
+}
+
+/// Print a hint if `session-vars.sh` exists but the user's shell rc doesn't
+/// appear to source it. Only checks on the first activation (when no
+/// generations directory existed before) or when the file is clearly absent
+/// from the rc.
+fn hint_session_vars() {
+    let Ok(home) = home_dir() else { return };
+    let session_vars = home.join(".config/ekaos/session-vars.sh");
+    if !session_vars.exists() {
+        return;
+    }
+
+    // Check common shell rc files for a reference to session-vars.sh.
+    let rc_files = [".bashrc", ".zshrc", ".config/fish/config.fish"];
+    let needle = "session-vars.sh";
+
+    for rc in &rc_files {
+        if let Ok(contents) = std::fs::read_to_string(home.join(rc)) {
+            if contents.contains(needle) {
+                return;
+            }
+        }
+    }
+
+    println!(
+        "\n{}",
+        "Hint: source ~/.config/ekaos/session-vars.sh in your shell rc for \
+         PATH, environment variables, and aliases:\n\n  \
+         # bash/zsh: add to ~/.bashrc or ~/.zshrc\n  \
+         . \"$HOME/.config/ekaos/session-vars.sh\"\n\n  \
+         Or enable programs.bash in your home configuration for automatic setup."
+            .dim()
+    );
 }
 
 #[derive(serde::Deserialize)]
