@@ -451,6 +451,13 @@ fn cmd_packages_remove(packages: &[String]) -> color_eyre::Result<()> {
     manifest.save()?;
 
     if removed > 0 {
+        // Reconcile the symlink directory so that any symlinks missed by
+        // the targeted removal (e.g. when the store path index is stale
+        // or empty) are cleaned up.
+        let remaining: Vec<String> = manifest.packages.iter().map(|p| p.name.clone()).collect();
+        let _ =
+            crate::symlink_dir::rebuild_symlink_dir(&packages_dir, &index, &remaining);
+
         println!("Removed {removed} package(s)");
 
         // Schedule debounced background apply.
