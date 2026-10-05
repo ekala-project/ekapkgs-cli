@@ -12,6 +12,47 @@ use crate::config::{ClientConfig, SystemPackageEntry, SystemPackages};
 
 const SYSTEM_PROFILE: &str = "/nix/var/nix/profiles/system";
 
+/// Fallback system installable when no hostname-based config is found.
+const SYSTEM_INSTALLABLE_FALLBACK: &str = ".#config.system.build.toplevel";
+
+/// Resolve the system installable. If the user provided one explicitly, use it.
+/// Otherwise try `.#ekaosConfigurations.<hostname>` first (hostname-based
+/// lookup for multi-host flakes), then fall back to the generic path.
+fn resolve_system_installable(explicit: Option<&str>) -> String {
+    if let Some(inst) = explicit {
+        return inst.to_owned();
+    }
+
+    // Read the hostname for auto-detection.
+    if let Some(hostname) = read_hostname() {
+        let candidate = format!(".#ekaosConfigurations.{hostname}.config.system.build.toplevel");
+        tracing::debug!("Probing {candidate}...");
+        let probe = NixCommand::new(&["eval"])
+            .arg(&candidate)
+            .arg("--apply")
+            .arg("_: null")
+            .output();
+
+        if probe.is_ok() {
+            tracing::info!("Using system configuration for host '{hostname}'");
+            return candidate;
+        }
+        tracing::debug!("{candidate} not found, trying fallback");
+    }
+
+    // Try the generic path.
+    tracing::debug!("Using fallback {SYSTEM_INSTALLABLE_FALLBACK}");
+    SYSTEM_INSTALLABLE_FALLBACK.to_owned()
+}
+
+/// Read the system hostname.
+fn read_hostname() -> Option<String> {
+    std::fs::read_to_string("/etc/hostname")
+        .ok()
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty())
+}
+
 struct Generation {
     number: u64,
     path: PathBuf,
@@ -54,26 +95,35 @@ pub fn execute(command: SystemCommand) -> color_eyre::Result<()> {
             channel,
             extra,
         } => {
+            let inst = resolve_system_installable(installable.as_deref());
             if let Some(ch) = &channel {
-                apply_channel(ch, &installable)?;
+                apply_channel(ch, &inst)?;
             }
-            cmd_activate(&installable, "switch", dry_run, &extra)
+            cmd_activate(&inst, "switch", dry_run, &extra)
         },
         SystemCommand::Boot {
             installable,
             channel,
             extra,
         } => {
+            let inst = resolve_system_installable(installable.as_deref());
             if let Some(ch) = &channel {
-                apply_channel(ch, &installable)?;
+                apply_channel(ch, &inst)?;
             }
-            cmd_activate(&installable, "boot", false, &extra)
+            cmd_activate(&inst, "boot", false, &extra)
         },
         SystemCommand::Test { installable, extra } => {
-            cmd_activate(&installable, "test", false, &extra)
+            let inst = resolve_system_installable(installable.as_deref());
+            cmd_activate(&inst, "test", false, &extra)
         },
-        SystemCommand::Build { installable, extra } => cmd_build(&installable, &extra),
-        SystemCommand::Diff { installable, extra } => cmd_diff(&installable, &extra),
+        SystemCommand::Build { installable, extra } => {
+            let inst = resolve_system_installable(installable.as_deref());
+            cmd_build(&inst, &extra)
+        },
+        SystemCommand::Diff { installable, extra } => {
+            let inst = resolve_system_installable(installable.as_deref());
+            cmd_diff(&inst, &extra)
+        },
         SystemCommand::ListGenerations { json } => cmd_list_generations(json),
         SystemCommand::Rollback { dry_run } => cmd_rollback(dry_run),
         SystemCommand::PruneBootEntries {
@@ -81,7 +131,10 @@ pub fn execute(command: SystemCommand) -> color_eyre::Result<()> {
             gc,
             dry_run,
         } => cmd_prune_boot_entries(&boot_mount, gc, dry_run),
-        SystemCommand::Update { installable, extra } => cmd_update(&installable, &extra),
+        SystemCommand::Update { installable, extra } => {
+            let inst = resolve_system_installable(installable.as_deref());
+            cmd_update(&inst, &extra)
+        },
         SystemCommand::Packages { command } => cmd_packages(command),
     }
 }

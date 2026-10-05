@@ -891,10 +891,11 @@ pub enum SystemCommand {
     /// Builds the system toplevel, updates the system profile, installs
     /// boot entries, and activates the new configuration.
     Switch {
-        /// The system configuration installable
-        /// (e.g., `.#nixosConfigurations.myhost.config.system.build.toplevel`).
-        #[arg(default_value = ".#config.system.build.toplevel")]
-        installable: String,
+        /// The system configuration installable.
+        ///
+        /// When omitted, tries `.#ekaosConfigurations.<hostname>` first,
+        /// then falls back to `.#config.system.build.toplevel`.
+        installable: Option<String>,
 
         /// Only show what would be done.
         #[arg(long)]
@@ -917,8 +918,10 @@ pub enum SystemCommand {
     /// running system is not changed until the next reboot.
     Boot {
         /// The system configuration installable.
-        #[arg(default_value = ".#config.system.build.toplevel")]
-        installable: String,
+        ///
+        /// When omitted, tries `.#ekaosConfigurations.<hostname>` first,
+        /// then falls back to `.#config.system.build.toplevel`.
+        installable: Option<String>,
 
         /// Switch the system flake to a different channel (branch) before
         /// building.
@@ -936,8 +939,10 @@ pub enum SystemCommand {
     /// across reboots.
     Test {
         /// The system configuration installable.
-        #[arg(default_value = ".#config.system.build.toplevel")]
-        installable: String,
+        ///
+        /// When omitted, tries `.#ekaosConfigurations.<hostname>` first,
+        /// then falls back to `.#config.system.build.toplevel`.
+        installable: Option<String>,
 
         /// Extra arguments passed through to nix build.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
@@ -947,8 +952,10 @@ pub enum SystemCommand {
     /// Build the system configuration without activating.
     Build {
         /// The system configuration installable.
-        #[arg(default_value = ".#config.system.build.toplevel")]
-        installable: String,
+        ///
+        /// When omitted, tries `.#ekaosConfigurations.<hostname>` first,
+        /// then falls back to `.#config.system.build.toplevel`.
+        installable: Option<String>,
 
         /// Extra arguments passed through to nix build.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
@@ -963,8 +970,10 @@ pub enum SystemCommand {
     /// already up to date.
     Diff {
         /// The system configuration installable.
-        #[arg(default_value = ".#config.system.build.toplevel")]
-        installable: String,
+        ///
+        /// When omitted, tries `.#ekaosConfigurations.<hostname>` first,
+        /// then falls back to `.#config.system.build.toplevel`.
+        installable: Option<String>,
 
         /// Extra arguments passed through to nix build.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
@@ -1015,8 +1024,10 @@ pub enum SystemCommand {
     /// rebuilds the system with the updated inputs.
     Update {
         /// The system configuration installable.
-        #[arg(default_value = ".#config.system.build.toplevel")]
-        installable: String,
+        ///
+        /// When omitted, tries `.#ekaosConfigurations.<hostname>` first,
+        /// then falls back to `.#config.system.build.toplevel`.
+        installable: Option<String>,
 
         /// Extra arguments passed through to nix build.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
