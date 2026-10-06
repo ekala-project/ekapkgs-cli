@@ -12,6 +12,21 @@ use crate::config::{ClientConfig, SystemPackageEntry, SystemPackages};
 
 const SYSTEM_PROFILE: &str = "/nix/var/nix/profiles/system";
 
+/// Resolve the profile path. Named profiles live under `system-profiles/`.
+fn resolve_profile_path(profile_name: Option<&str>) -> String {
+    match profile_name {
+        Some(name) => format!("/nix/var/nix/profiles/system-profiles/{name}"),
+        None => SYSTEM_PROFILE.to_owned(),
+    }
+}
+
+/// Options that modify activation behaviour.
+struct ActivateOpts {
+    profile_name: Option<String>,
+    install_bootloader: bool,
+    specialisation: Option<String>,
+}
+
 /// Fallback system installable when no hostname-based config is found.
 const SYSTEM_INSTALLABLE_FALLBACK: &str = ".#config.system.build.toplevel";
 
@@ -59,14 +74,18 @@ struct Generation {
     created: Timestamp,
 }
 
-fn discover_generations() -> color_eyre::Result<Vec<Generation>> {
-    let profile_dir = Path::new(SYSTEM_PROFILE).parent().unwrap_or(Path::new("/"));
+fn discover_generations(profile_path: &str) -> color_eyre::Result<Vec<Generation>> {
+    let profile = Path::new(profile_path);
+    let profile_dir = profile.parent().unwrap_or(Path::new("/"));
+    let profile_base = profile.file_name().unwrap_or_default().to_string_lossy();
+    let gen_prefix = format!("{profile_base}-");
+
     let mut generations: Vec<Generation> = std::fs::read_dir(profile_dir)?
         .filter_map(std::result::Result::ok)
         .filter_map(|e| {
             let name = e.file_name().to_string_lossy().into_owned();
             let number: u64 = name
-                .strip_prefix("system-")?
+                .strip_prefix(&gen_prefix)?
                 .strip_suffix("-link")?
                 .parse()
                 .ok()?;
@@ -93,39 +112,79 @@ pub fn execute(command: SystemCommand) -> color_eyre::Result<()> {
             installable,
             dry_run,
             channel,
+            install_bootloader,
+            specialisation,
+            profile_name,
             extra,
         } => {
             let inst = resolve_system_installable(installable.as_deref());
             if let Some(ch) = &channel {
                 apply_channel(ch, &inst)?;
             }
-            cmd_activate(&inst, "switch", dry_run, &extra)
+            let opts = ActivateOpts {
+                profile_name,
+                install_bootloader,
+                specialisation,
+            };
+            cmd_activate(&inst, "switch", dry_run, &extra, &opts)
         },
         SystemCommand::Boot {
             installable,
             channel,
+            install_bootloader,
+            specialisation,
+            profile_name,
             extra,
         } => {
             let inst = resolve_system_installable(installable.as_deref());
             if let Some(ch) = &channel {
                 apply_channel(ch, &inst)?;
             }
-            cmd_activate(&inst, "boot", false, &extra)
+            let opts = ActivateOpts {
+                profile_name,
+                install_bootloader,
+                specialisation,
+            };
+            cmd_activate(&inst, "boot", false, &extra, &opts)
         },
-        SystemCommand::Test { installable, extra } => {
+        SystemCommand::Test {
+            installable,
+            specialisation,
+            profile_name,
+            extra,
+        } => {
             let inst = resolve_system_installable(installable.as_deref());
-            cmd_activate(&inst, "test", false, &extra)
+            let opts = ActivateOpts {
+                profile_name,
+                install_bootloader: false,
+                specialisation,
+            };
+            cmd_activate(&inst, "test", false, &extra, &opts)
         },
-        SystemCommand::Build { installable, extra } => {
+        SystemCommand::Build {
+            installable,
+            profile_name,
+            extra,
+        } => {
             let inst = resolve_system_installable(installable.as_deref());
-            cmd_build(&inst, &extra)
+            cmd_build(&inst, &extra, profile_name.as_deref())
         },
         SystemCommand::Diff { installable, extra } => {
             let inst = resolve_system_installable(installable.as_deref());
             cmd_diff(&inst, &extra)
         },
-        SystemCommand::ListGenerations { json } => cmd_list_generations(json),
-        SystemCommand::Rollback { dry_run } => cmd_rollback(dry_run),
+        SystemCommand::ListGenerations { json, profile_name } => {
+            let profile = resolve_profile_path(profile_name.as_deref());
+            cmd_list_generations(json, &profile)
+        },
+        SystemCommand::Rollback {
+            generation,
+            dry_run,
+            profile_name,
+        } => {
+            let profile = resolve_profile_path(profile_name.as_deref());
+            cmd_rollback(generation, dry_run, &profile)
+        },
         SystemCommand::PruneBootEntries {
             boot_mount,
             gc,
@@ -189,25 +248,59 @@ fn cmd_activate(
     mode: &str,
     dry_run: bool,
     extra: &[String],
+    opts: &ActivateOpts,
 ) -> color_eyre::Result<()> {
     let system_path = build_system(installable, extra)?;
+
+    // Validate specialisation before activation.
+    if let Some(spec) = &opts.specialisation {
+        let spec_path = format!("{system_path}/specialisation/{spec}");
+        if !Path::new(&spec_path).exists() {
+            return Err(color_eyre::eyre::eyre!(
+                "Specialisation '{spec}' not found at {spec_path}"
+            ));
+        }
+    }
 
     if dry_run {
         println!("Dry run:");
         println!("  System path: {system_path}");
         println!("  Mode:        {mode}");
+        if let Some(spec) = &opts.specialisation {
+            println!("  Specialisation: {spec}");
+        }
+        if opts.install_bootloader {
+            println!("  Install bootloader: yes");
+        }
+        if let Some(name) = &opts.profile_name {
+            println!("  Profile: {name}");
+        }
         return Ok(());
     }
 
+    let profile = resolve_profile_path(opts.profile_name.as_deref());
+
+    // Ensure the profile parent directory exists for named profiles.
+    if opts.profile_name.is_some() {
+        let profile_dir = Path::new(&profile).parent().unwrap_or(Path::new("/"));
+        if !profile_dir.exists() {
+            let _ = Command::new("sudo")
+                .arg("mkdir")
+                .arg("-p")
+                .arg(profile_dir)
+                .status();
+        }
+    }
+
     // Record previous profile target so we can roll back on failure.
-    let prev_target = std::fs::read_link(SYSTEM_PROFILE).ok();
+    let prev_target = std::fs::read_link(&profile).ok();
 
     // Update the system profile (requires root).
     tracing::info!("Setting system profile...");
     let status = Command::new("sudo")
         .arg("nix-env")
         .arg("--profile")
-        .arg(SYSTEM_PROFILE)
+        .arg(&profile)
         .arg("--set")
         .arg(&system_path)
         .stdout(Stdio::inherit())
@@ -225,7 +318,24 @@ fn cmd_activate(
     // Activate the configuration.
     tracing::info!("Activating ({mode})...");
     let activate_cmd = format!("{system_path}/bin/switch-to-configuration");
-    let status = Command::new("sudo")
+    let mut cmd = Command::new("sudo");
+
+    // Pass environment variables through sudo using `env VAR=val`.
+    let mut env_args: Vec<String> = Vec::new();
+    if opts.install_bootloader {
+        env_args.push("NIXOS_INSTALL_BOOTLOADER=1".to_owned());
+    }
+    if let Some(spec) = &opts.specialisation {
+        env_args.push(format!("NIXOS_SPECIALISATION={spec}"));
+    }
+    if !env_args.is_empty() {
+        cmd.arg("env");
+        for arg in &env_args {
+            cmd.arg(arg);
+        }
+    }
+
+    let status = cmd
         .arg(&activate_cmd)
         .arg(mode)
         .stdout(Stdio::inherit())
@@ -236,6 +346,7 @@ fn cmd_activate(
     if !status.success() {
         // Activation failed — try to restore the previous profile and
         // re-activate it so the system isn't left in a broken state.
+        // Rollback uses no specialisation or bootloader env vars.
         if let Some(prev) = &prev_target {
             let prev_str = prev.to_string_lossy();
             tracing::warn!(
@@ -243,7 +354,9 @@ fn cmd_activate(
             );
 
             let profile_restored = Command::new("sudo")
-                .args(["nix-env", "--profile", SYSTEM_PROFILE, "--set"])
+                .args(["nix-env", "--profile"])
+                .arg(&profile)
+                .arg("--set")
                 .arg(prev_str.as_ref())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
@@ -279,7 +392,8 @@ fn cmd_activate(
             } else {
                 tracing::error!(
                     "Failed to restore system profile; system may be in an inconsistent state — \
-                     manually run: sudo nix-env --profile {SYSTEM_PROFILE} --set {prev_str}"
+                     manually run: sudo nix-env --profile {} --set {prev_str}",
+                    profile
                 );
             }
         }
@@ -310,7 +424,12 @@ fn cmd_update(installable: &str, extra: &[String]) -> color_eyre::Result<()> {
     }
 
     // Rebuild and activate.
-    cmd_activate(installable, "switch", false, extra)
+    let opts = ActivateOpts {
+        profile_name: None,
+        install_bootloader: false,
+        specialisation: None,
+    };
+    cmd_activate(installable, "switch", false, extra, &opts)
 }
 
 /// Populate the store path index from the closure of a built store path.
@@ -340,8 +459,43 @@ fn populate_store_path_index(store_path: &str) {
     }
 }
 
-fn cmd_build(installable: &str, extra: &[String]) -> color_eyre::Result<()> {
+fn cmd_build(
+    installable: &str,
+    extra: &[String],
+    profile_name: Option<&str>,
+) -> color_eyre::Result<()> {
     let store_path = build_system(installable, extra)?;
+
+    // Optionally set the profile without activating.
+    if let Some(name) = profile_name {
+        let profile = resolve_profile_path(Some(name));
+        let profile_dir = Path::new(&profile).parent().unwrap_or(Path::new("/"));
+        if !profile_dir.exists() {
+            let _ = Command::new("sudo")
+                .arg("mkdir")
+                .arg("-p")
+                .arg(profile_dir)
+                .status();
+        }
+        tracing::info!("Setting profile {profile}...");
+        let status = Command::new("sudo")
+            .arg("nix-env")
+            .arg("--profile")
+            .arg(&profile)
+            .arg("--set")
+            .arg(&store_path)
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .status()
+            .map_err(|e| color_eyre::eyre::eyre!("failed to set system profile: {e}"))?;
+        if !status.success() {
+            return Err(color_eyre::eyre::eyre!(
+                "Failed to set system profile (exit {})",
+                status.code().unwrap_or(1)
+            ));
+        }
+    }
+
     println!("{store_path}");
     Ok(())
 }
@@ -409,8 +563,8 @@ fn build_system(installable: &str, extra: &[String]) -> color_eyre::Result<Strin
     Ok(path)
 }
 
-fn cmd_list_generations(json_output: bool) -> color_eyre::Result<()> {
-    let generations = discover_generations()?;
+fn cmd_list_generations(json_output: bool, profile: &str) -> color_eyre::Result<()> {
+    let generations = discover_generations(profile)?;
 
     if generations.is_empty() {
         if json_output {
@@ -422,7 +576,7 @@ fn cmd_list_generations(json_output: bool) -> color_eyre::Result<()> {
     }
 
     // Find current generation.
-    let current_target = std::fs::read_link(SYSTEM_PROFILE).ok();
+    let current_target = std::fs::read_link(profile).ok();
 
     if json_output {
         let entries: Vec<serde_json::Value> = generations
@@ -451,55 +605,71 @@ fn cmd_list_generations(json_output: bool) -> color_eyre::Result<()> {
     Ok(())
 }
 
-fn cmd_rollback(dry_run: bool) -> color_eyre::Result<()> {
-    // Find the previous generation.
-    let current_target = std::fs::read_link(SYSTEM_PROFILE)
+fn cmd_rollback(target_gen: Option<u64>, dry_run: bool, profile: &str) -> color_eyre::Result<()> {
+    let current_target = std::fs::read_link(profile)
         .map_err(|e| color_eyre::eyre::eyre!("failed to read system profile: {e}"))?;
 
-    let generations = discover_generations()?;
+    let generations = discover_generations(profile)?;
 
-    // Find the generation before the current one.
-    let current_idx = generations.iter().position(|g| g.path == current_target);
-
-    let prev = match current_idx {
-        Some(idx) if idx > 0 => &generations[idx - 1],
-        Some(_) => {
-            return Err(color_eyre::eyre::eyre!(
-                "Already at the oldest generation, nothing to roll back to"
-            ));
-        },
+    let target = match target_gen {
+        Some(num) => generations
+            .iter()
+            .find(|g| g.number == num)
+            .ok_or_else(|| {
+                color_eyre::eyre::eyre!(
+                    "Generation {num} not found. Use `ekapkgs system list-generations` to see \
+                     available generations."
+                )
+            })?,
         None => {
-            // Current profile doesn't match any generation link; use the latest.
-            generations
-                .last()
-                .ok_or_else(|| color_eyre::eyre::eyre!("No system generations found"))?
+            // Find the generation before the current one.
+            let current_idx = generations.iter().position(|g| g.path == current_target);
+            match current_idx {
+                Some(idx) if idx > 0 => &generations[idx - 1],
+                Some(_) => {
+                    return Err(color_eyre::eyre::eyre!(
+                        "Already at the oldest generation, nothing to roll back to"
+                    ));
+                },
+                None => generations
+                    .last()
+                    .ok_or_else(|| color_eyre::eyre::eyre!("No system generations found"))?,
+            }
         },
     };
 
-    let (prev_num, prev_path) = (prev.number, &prev.path);
+    if target.path == current_target {
+        tracing::warn!(
+            "Generation {} is already the active generation",
+            target.number
+        );
+        return Ok(());
+    }
+
+    let (target_num, target_path) = (target.number, &target.path);
     tracing::info!(
-        "Rolling back to generation {prev_num}: {}",
-        prev_path.display()
+        "Rolling back to generation {target_num}: {}",
+        target_path.display()
     );
 
     if dry_run {
         println!("Dry run:");
-        println!("  Would roll back to generation {prev_num}");
-        println!("  System path: {}", prev_path.display());
+        println!("  Would roll back to generation {target_num}");
+        println!("  System path: {}", target_path.display());
         return Ok(());
     }
 
-    let prev_path_str = prev_path
+    let target_path_str = target_path
         .to_str()
         .ok_or_else(|| color_eyre::eyre::eyre!("generation path is not valid UTF-8"))?;
 
-    // Set the profile to the previous generation.
+    // Set the profile to the target generation.
     let status = Command::new("sudo")
         .arg("nix-env")
         .arg("--profile")
-        .arg(SYSTEM_PROFILE)
+        .arg(profile)
         .arg("--set")
-        .arg(prev_path_str)
+        .arg(target_path_str)
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .status()
@@ -513,7 +683,7 @@ fn cmd_rollback(dry_run: bool) -> color_eyre::Result<()> {
     }
 
     // Activate.
-    let activate_cmd = format!("{prev_path_str}/bin/switch-to-configuration");
+    let activate_cmd = format!("{target_path_str}/bin/switch-to-configuration");
     let status = Command::new("sudo")
         .arg(&activate_cmd)
         .arg("switch")
@@ -529,7 +699,7 @@ fn cmd_rollback(dry_run: bool) -> color_eyre::Result<()> {
         ));
     }
 
-    tracing::info!("Rolled back to generation {prev_num}");
+    tracing::info!("Rolled back to generation {target_num}");
     Ok(())
 }
 
@@ -601,7 +771,7 @@ fn cmd_prune_boot_entries(boot_mount: &str, gc: bool, dry_run: bool) -> color_ey
 
 /// Collect the set of generation numbers that have profile links.
 fn collect_active_generations() -> color_eyre::Result<HashSet<u64>> {
-    Ok(discover_generations()?
+    Ok(discover_generations(SYSTEM_PROFILE)?
         .into_iter()
         .map(|g| g.number)
         .collect())

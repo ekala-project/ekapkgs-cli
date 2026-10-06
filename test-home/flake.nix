@@ -8,7 +8,10 @@
     let
       system = "x86_64-linux";
       pkgs = corepkgs.legacyPackages.${system};
-      evalHome = import "${corepkgs}/ekaos/eval-home.nix" { inherit (pkgs) lib; inherit pkgs; };
+      evalHome = import "${corepkgs}/ekaos/eval-home.nix" {
+        inherit (pkgs) lib;
+        inherit pkgs;
+      };
 
       result = evalHome {
         modules = [
