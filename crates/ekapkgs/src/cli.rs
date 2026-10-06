@@ -907,6 +907,18 @@ pub enum SystemCommand {
         #[arg(long)]
         channel: Option<String>,
 
+        /// Force bootloader reinstallation during activation.
+        #[arg(long)]
+        install_bootloader: bool,
+
+        /// Activate a specific specialisation of the system configuration.
+        #[arg(long, short = 'c')]
+        specialisation: Option<String>,
+
+        /// Use an alternate system profile instead of the default.
+        #[arg(long, short = 'p')]
+        profile_name: Option<String>,
+
         /// Extra arguments passed through to nix build.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         extra: Vec<String>,
@@ -928,6 +940,18 @@ pub enum SystemCommand {
         #[arg(long)]
         channel: Option<String>,
 
+        /// Force bootloader reinstallation during activation.
+        #[arg(long)]
+        install_bootloader: bool,
+
+        /// Activate a specific specialisation of the system configuration.
+        #[arg(long, short = 'c')]
+        specialisation: Option<String>,
+
+        /// Use an alternate system profile instead of the default.
+        #[arg(long, short = 'p')]
+        profile_name: Option<String>,
+
         /// Extra arguments passed through to nix build.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         extra: Vec<String>,
@@ -944,6 +968,14 @@ pub enum SystemCommand {
         /// then falls back to `.#config.system.build.toplevel`.
         installable: Option<String>,
 
+        /// Activate a specific specialisation of the system configuration.
+        #[arg(long, short = 'c')]
+        specialisation: Option<String>,
+
+        /// Use an alternate system profile instead of the default.
+        #[arg(long, short = 'p')]
+        profile_name: Option<String>,
+
         /// Extra arguments passed through to nix build.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         extra: Vec<String>,
@@ -956,6 +988,13 @@ pub enum SystemCommand {
         /// When omitted, tries `.#ekaosConfigurations.<hostname>` first,
         /// then falls back to `.#config.system.build.toplevel`.
         installable: Option<String>,
+
+        /// Use an alternate system profile instead of the default.
+        ///
+        /// When set, the built configuration is recorded in the named
+        /// profile without activating.
+        #[arg(long, short = 'p')]
+        profile_name: Option<String>,
 
         /// Extra arguments passed through to nix build.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
@@ -985,13 +1024,28 @@ pub enum SystemCommand {
         /// Output as JSON.
         #[arg(long)]
         json: bool,
+
+        /// Use an alternate system profile instead of the default.
+        #[arg(long, short = 'p')]
+        profile_name: Option<String>,
     },
 
-    /// Roll back to the previous system generation.
+    /// Roll back to a previous system generation.
+    ///
+    /// Without a generation number, rolls back to the immediately
+    /// previous generation. With a generation number, rolls back to
+    /// that specific generation.
     Rollback {
+        /// Target generation number. If omitted, rolls back one step.
+        generation: Option<u64>,
+
         /// Only show what would be done.
         #[arg(long)]
         dry_run: bool,
+
+        /// Use an alternate system profile instead of the default.
+        #[arg(long, short = 'p')]
+        profile_name: Option<String>,
     },
 
     /// Remove boot entries for generations that no longer exist.
