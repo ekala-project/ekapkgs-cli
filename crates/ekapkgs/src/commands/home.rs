@@ -449,8 +449,7 @@ fn cmd_packages_remove(packages: &[String]) -> color_eyre::Result<()> {
         // the targeted removal (e.g. when the store path index is stale
         // or empty) are cleaned up.
         let remaining: Vec<String> = manifest.packages.iter().map(|p| p.name.clone()).collect();
-        let _ =
-            crate::symlink_dir::rebuild_symlink_dir(&packages_dir, &index, &remaining);
+        let _ = crate::symlink_dir::rebuild_symlink_dir(&packages_dir, &index, &remaining);
 
         println!("Removed {removed} package(s)");
 
@@ -576,8 +575,10 @@ fn cmd_packages_import(file: &str, merge: bool) -> color_eyre::Result<()> {
         if let Some(idx_entry) = index.lookup(name) {
             if crate::store_path_index::StorePathIndex::path_exists_locally(&idx_entry.store_path) {
                 tracing::info!("Installing {name} (cached)...");
-                let _ =
-                    crate::symlink_dir::create_package_symlinks(&packages_dir, &idx_entry.store_path);
+                let _ = crate::symlink_dir::create_package_symlinks(
+                    &packages_dir,
+                    &idx_entry.store_path,
+                );
                 installed += 1;
                 continue;
             }
@@ -594,7 +595,8 @@ fn cmd_packages_import(file: &str, merge: bool) -> color_eyre::Result<()> {
             .json::<Vec<BuildOutput>>()
         {
             Ok(outputs) => {
-                if let Some(store_path) = outputs.first().and_then(|o| o.outputs.get("out").cloned())
+                if let Some(store_path) =
+                    outputs.first().and_then(|o| o.outputs.get("out").cloned())
                 {
                     let _ = crate::symlink_dir::create_package_symlinks(&packages_dir, &store_path);
                     index.add_from_build_output(name, &store_path);
@@ -1898,11 +1900,10 @@ fn hint_session_vars() {
 
     println!(
         "\n{}",
-        "Hint: source ~/.config/ekaos/session-vars.sh in your shell rc for \
-         PATH, environment variables, and aliases:\n\n  \
-         # bash/zsh: add to ~/.bashrc or ~/.zshrc\n  \
-         . \"$HOME/.config/ekaos/session-vars.sh\"\n\n  \
-         Or enable programs.bash in your home configuration for automatic setup."
+        "Hint: source ~/.config/ekaos/session-vars.sh in your shell rc for PATH, environment \
+         variables, and aliases:\n\n  # bash/zsh: add to ~/.bashrc or ~/.zshrc\n  . \
+         \"$HOME/.config/ekaos/session-vars.sh\"\n\n  Or enable programs.bash in your home \
+         configuration for automatic setup."
             .dim()
     );
 }
