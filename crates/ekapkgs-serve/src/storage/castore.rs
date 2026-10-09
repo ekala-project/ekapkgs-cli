@@ -1116,15 +1116,12 @@ fn open_db(path: &Path) -> color_eyre::Result<Connection> {
     tracing::log::info!("Opening database at {}", path.display());
     let conn = Connection::open(path)?;
     conn.execute_batch(
-        "PRAGMA journal_mode=WAL;\
-         PRAGMA synchronous=FULL;\
-         PRAGMA foreign_keys=ON;\
-         PRAGMA busy_timeout=5000;",
+        "PRAGMA journal_mode=WAL;PRAGMA synchronous=FULL;PRAGMA foreign_keys=ON;PRAGMA \
+         busy_timeout=5000;",
     )?;
 
     // Detect corruption early rather than discovering it mid-operation.
-    let integrity: String =
-        conn.query_row("PRAGMA quick_check", [], |row| row.get(0))?;
+    let integrity: String = conn.query_row("PRAGMA quick_check", [], |row| row.get(0))?;
     if integrity != "ok" {
         return Err(color_eyre::eyre::eyre!(
             "database integrity check failed: {integrity}"

@@ -858,19 +858,53 @@ fn user_unit_dir() -> color_eyre::Result<std::path::PathBuf> {
     Ok(dir)
 }
 
+/// Unit file suffixes that ekapkgs manages.
+const MANAGED_UNIT_SUFFIXES: &[&str] = &[".service", ".socket", ".timer"];
+
+/// Check whether a file name has a managed unit suffix.
+fn is_managed_unit_file(name: &str) -> bool {
+    MANAGED_UNIT_SUFFIXES.iter().any(|s| name.ends_with(s))
+}
+
+/// Strip the unit suffix from a file name, returning the base name.
+fn strip_unit_suffix(name: &str) -> &str {
+    for suffix in MANAGED_UNIT_SUFFIXES {
+        if let Some(base) = name.strip_suffix(suffix) {
+            return base;
+        }
+    }
+    name
+}
+
 /// List currently installed ekapkgs-managed unit files.
+/// Returns the set of *logical service names* (i.e. what appears in the TOML
+/// manifest). A single logical service may own multiple unit files (e.g.
+/// `gpg-agent.service`, `gpg-agent.socket`, `gpg-agent-ssh.socket`).
+///
+/// To determine which logical service a unit file belongs to we check the
+/// managed marker comment — every managed unit file starts with
+/// `# ekapkgs-managed` optionally followed by ` service=<name>`.
 fn installed_managed_units() -> color_eyre::Result<std::collections::HashSet<String>> {
     let dir = user_unit_dir()?;
     let mut managed = std::collections::HashSet::new();
     if let Ok(entries) = std::fs::read_dir(&dir) {
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().into_owned();
-            if name.ends_with(".service") {
+            if is_managed_unit_file(&name) {
                 // Check if it's managed by us
                 if let Ok(contents) = std::fs::read_to_string(entry.path()) {
                     if contents.starts_with(MANAGED_MARKER) {
-                        // Strip the .service suffix to get the service name
-                        let svc_name = name.trim_end_matches(".service").to_owned();
+                        // Try to extract the logical service name from the
+                        // marker line: `# ekapkgs-managed service=<name>`
+                        let first_line = contents.lines().next().unwrap_or("");
+                        let svc_name = if let Some(rest) = first_line.strip_prefix(MANAGED_MARKER) {
+                            rest.trim()
+                                .strip_prefix("service=")
+                                .map(|s| s.trim().to_owned())
+                                .unwrap_or_else(|| strip_unit_suffix(&name).to_owned())
+                        } else {
+                            strip_unit_suffix(&name).to_owned()
+                        };
                         managed.insert(svc_name);
                     }
                 }
@@ -878,6 +912,25 @@ fn installed_managed_units() -> color_eyre::Result<std::collections::HashSet<Str
         }
     }
     Ok(managed)
+}
+
+/// List all ekapkgs-managed unit *file names* currently installed.
+fn installed_managed_unit_files() -> color_eyre::Result<Vec<String>> {
+    let dir = user_unit_dir()?;
+    let mut files = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if is_managed_unit_file(&name) {
+                if let Ok(contents) = std::fs::read_to_string(entry.path()) {
+                    if contents.starts_with(MANAGED_MARKER) {
+                        files.push(name);
+                    }
+                }
+            }
+        }
+    }
+    Ok(files)
 }
 
 fn cmd_services_apply(dry_run: bool) -> color_eyre::Result<()> {
@@ -912,13 +965,13 @@ fn cmd_services_apply(dry_run: bool) -> color_eyre::Result<()> {
 
     if dry_run {
         for name in &to_add {
-            println!("  {} {name}.service (new)", "+".bold());
+            println!("  {} {name} (new)", "+".bold());
         }
         for name in &to_update {
-            println!("  {} {name}.service (update)", "~".bold());
+            println!("  {} {name} (update)", "~".bold());
         }
         for name in &to_remove {
-            println!("  {} {name}.service (remove)", "-".bold());
+            println!("  {} {name} (remove)", "-".bold());
         }
         if to_add.is_empty() && to_update.is_empty() && to_remove.is_empty() {
             println!("No changes.");
@@ -926,23 +979,51 @@ fn cmd_services_apply(dry_run: bool) -> color_eyre::Result<()> {
         return Ok(());
     }
 
-    // Phase 1: Stop and remove services that are no longer desired
+    // Phase 1: Stop and remove services that are no longer desired.
+    // We need to remove all managed unit files that belong to these logical
+    // services, including .socket and .timer companions.
     let unit_dir = user_unit_dir()?;
+    let existing_unit_files = installed_managed_unit_files()?;
     for name in &to_remove {
         tracing::info!("Stopping {name}...");
-        let _ = std::process::Command::new("systemctl")
-            .args(["--user", "stop", &format!("{name}.service")])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
-        let _ = std::process::Command::new("systemctl")
-            .args(["--user", "disable", &format!("{name}.service")])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
-        let unit_path = unit_dir.join(format!("{name}.service"));
-        if unit_path.exists() {
-            std::fs::remove_file(&unit_path)?;
+        // Stop and disable all unit types for this service
+        for suffix in MANAGED_UNIT_SUFFIXES {
+            let unit = format!("{name}{suffix}");
+            let _ = std::process::Command::new("systemctl")
+                .args(["--user", "stop", &unit])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+            let _ = std::process::Command::new("systemctl")
+                .args(["--user", "disable", &unit])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
+        // Remove all managed unit files belonging to this logical service.
+        // This includes files like `{name}.service`, `{name}.socket`,
+        // `{name}-ssh.socket`, etc.
+        for file_name in &existing_unit_files {
+            // A unit file belongs to this service if its base name (before
+            // the unit suffix) equals the service name, or starts with
+            // `{name}-` (companion units like gpg-agent-ssh.socket).
+            let base = strip_unit_suffix(file_name);
+            if base == *name || base.starts_with(&format!("{name}-")) {
+                let unit_path = unit_dir.join(file_name);
+                if unit_path.exists() {
+                    let _ = std::process::Command::new("systemctl")
+                        .args(["--user", "stop", file_name])
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .status();
+                    let _ = std::process::Command::new("systemctl")
+                        .args(["--user", "disable", file_name])
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .status();
+                    std::fs::remove_file(&unit_path)?;
+                }
+            }
         }
         println!("  Removed {}", name.bold());
     }
@@ -969,27 +1050,75 @@ fn cmd_services_apply(dry_run: bool) -> color_eyre::Result<()> {
             .and_then(|b| b.outputs.get("out").cloned())
             .ok_or_else(|| color_eyre::eyre::eyre!("nix build produced no output"))?;
 
-        // Phase 3: Install unit files
+        // Phase 3: Install unit files — copy all managed unit types from
+        // the build output, not just .service files.
         let built_dir = std::path::Path::new(&store_path);
-        for entry in std::fs::read_dir(built_dir)?.flatten() {
-            let file_name = entry.file_name().to_string_lossy().into_owned();
-            if !file_name.ends_with(".service") {
+
+        // Collect the set of logical service names that own each unit file
+        // built in this derivation, so we can tag unit files with their
+        // owning service in the marker comment.
+        let enabled_names: std::collections::HashSet<&str> =
+            enabled.iter().map(|e| e.name.as_str()).collect();
+
+        for fs_entry in std::fs::read_dir(built_dir)?.flatten() {
+            let file_name = fs_entry.file_name().to_string_lossy().into_owned();
+            if !is_managed_unit_file(&file_name) {
                 continue;
             }
-            let svc_name = file_name.trim_end_matches(".service");
 
-            // Read the built unit file and prepend our managed marker
-            let unit_contents = std::fs::read_to_string(entry.path())?;
-            let marked_contents = format!("{MANAGED_MARKER}\n{unit_contents}");
+            // Determine which logical service this unit file belongs to.
+            let base = strip_unit_suffix(&file_name);
+            let owning_service = enabled_names
+                .iter()
+                .find(|&&svc| base == svc || base.starts_with(&format!("{svc}-")))
+                .copied()
+                .unwrap_or(base);
+
+            // Read the built unit file and prepend our managed marker with
+            // the owning service name so installed_managed_units() can map
+            // unit files back to logical services.
+            let unit_contents = std::fs::read_to_string(fs_entry.path())?;
+            let marked_contents =
+                format!("{MANAGED_MARKER} service={owning_service}\n{unit_contents}");
 
             let dest = unit_dir.join(&file_name);
             let is_new = !dest.exists();
             std::fs::write(&dest, marked_contents)?;
 
             if is_new {
-                println!("  Installed {}", svc_name.bold());
+                println!("  Installed {}", file_name.bold());
             } else {
-                println!("  Updated {}", svc_name.bold());
+                println!("  Updated {}", file_name.bold());
+            }
+        }
+
+        // Remove managed unit files that were previously installed for
+        // desired services but are no longer produced by the build (e.g. a
+        // service dropped its socket unit).
+        for file_name in &existing_unit_files {
+            let base = strip_unit_suffix(file_name);
+            let belongs_to_desired = enabled_names
+                .iter()
+                .any(|&svc| base == svc || base.starts_with(&format!("{svc}-")));
+            if belongs_to_desired {
+                let built_path = built_dir.join(file_name);
+                if !built_path.exists() {
+                    let unit_path = unit_dir.join(file_name);
+                    if unit_path.exists() {
+                        let _ = std::process::Command::new("systemctl")
+                            .args(["--user", "stop", file_name])
+                            .stdout(Stdio::null())
+                            .stderr(Stdio::null())
+                            .status();
+                        let _ = std::process::Command::new("systemctl")
+                            .args(["--user", "disable", file_name])
+                            .stdout(Stdio::null())
+                            .stderr(Stdio::null())
+                            .status();
+                        std::fs::remove_file(&unit_path)?;
+                        println!("  Removed stale {}", file_name.bold());
+                    }
+                }
             }
         }
 
@@ -1003,26 +1132,94 @@ fn cmd_services_apply(dry_run: bool) -> color_eyre::Result<()> {
 
         let mut failed_services: Vec<String> = Vec::new();
         for entry in &enabled {
-            let unit = format!("{}.service", entry.name);
-            // Enable the service
-            let _ = std::process::Command::new("systemctl")
-                .args(["--user", "enable", &unit])
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status();
-            // Restart (handles both new and updated services)
-            let status = std::process::Command::new("systemctl")
-                .args(["--user", "restart", &unit])
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status();
-            match status {
-                Ok(s) if s.success() => {
-                    tracing::info!("Started {}", entry.name);
-                },
-                _ => {
-                    failed_services.push(entry.name.clone());
-                },
+            // Collect all unit files produced for this service
+            let mut service_units = Vec::new();
+            let mut socket_units = Vec::new();
+            let mut timer_units = Vec::new();
+
+            for fs_entry in std::fs::read_dir(built_dir)?.flatten() {
+                let fname = fs_entry.file_name().to_string_lossy().into_owned();
+                let fbase = strip_unit_suffix(&fname);
+                if fbase == entry.name || fbase.starts_with(&format!("{}-", entry.name)) {
+                    if fname.ends_with(".socket") {
+                        socket_units.push(fname);
+                    } else if fname.ends_with(".timer") {
+                        timer_units.push(fname);
+                    } else if fname.ends_with(".service") {
+                        service_units.push(fname);
+                    }
+                }
+            }
+
+            // Enable all units for this service
+            for unit in service_units
+                .iter()
+                .chain(socket_units.iter())
+                .chain(timer_units.iter())
+            {
+                let _ = std::process::Command::new("systemctl")
+                    .args(["--user", "enable", unit])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status();
+            }
+
+            // Start strategy: if there are socket units, start those (the
+            // service will be socket-activated). If there are timer units,
+            // start those. Always also restart the .service if no sockets
+            // or timers trigger it.
+            let mut any_failed = false;
+
+            if !socket_units.is_empty() {
+                // Socket-activated: start socket units, restart service
+                for unit in &socket_units {
+                    let status = std::process::Command::new("systemctl")
+                        .args(["--user", "restart", unit])
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .status();
+                    if !matches!(status, Ok(s) if s.success()) {
+                        any_failed = true;
+                    }
+                }
+                // Also restart the service itself so it picks up new config
+                for unit in &service_units {
+                    let _ = std::process::Command::new("systemctl")
+                        .args(["--user", "restart", unit])
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .status();
+                }
+            } else {
+                // No sockets — start the service directly
+                for unit in &service_units {
+                    let status = std::process::Command::new("systemctl")
+                        .args(["--user", "restart", unit])
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .status();
+                    if !matches!(status, Ok(s) if s.success()) {
+                        any_failed = true;
+                    }
+                }
+            }
+
+            // Start timer units
+            for unit in &timer_units {
+                let status = std::process::Command::new("systemctl")
+                    .args(["--user", "restart", unit])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status();
+                if !matches!(status, Ok(s) if s.success()) {
+                    any_failed = true;
+                }
+            }
+
+            if any_failed {
+                failed_services.push(entry.name.clone());
+            } else {
+                tracing::info!("Started {}", entry.name);
             }
         }
 
@@ -1112,8 +1309,16 @@ in merged
                     continue;
                 }
                 let escaped_name = escape_nix_string(&entry.name);
+                // Copy all unit files (.service, .socket, .timer) produced
+                // by the service builder rather than hardcoding a single
+                // .service file. This supports socket-activated and
+                // timer-triggered services.
                 cmds.push(format!(
-                    r#"    cp ${{units."{escaped_name}"}}/{escaped_name}.service $out/{escaped_name}.service"#,
+                    r#"    for f in ${{units."{escaped_name}"}}/*; do
+      case "$f" in
+        *.service|*.socket|*.timer) cp "$f" "$out/$(basename "$f")" ;;
+      esac
+    done"#,
                 ));
             }
             cmds.join("\n")
@@ -1291,21 +1496,53 @@ fn cmd_services_logs(
 }
 
 fn cmd_services_restart(services: &[String]) -> color_eyre::Result<()> {
+    let unit_dir = user_unit_dir()?;
     for name in services {
         tracing::info!("Restarting {name}...");
-        let status = std::process::Command::new("systemctl")
-            .arg("--user")
-            .arg("restart")
-            .arg(format!("{name}.service"))
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit())
-            .status()
-            .map_err(|e| color_eyre::eyre::eyre!("Failed to run systemctl: {e}"))?;
 
-        if status.success() {
+        // Collect all unit files belonging to this service
+        let mut units_to_restart: Vec<String> = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(&unit_dir) {
+            for entry in entries.flatten() {
+                let fname = entry.file_name().to_string_lossy().into_owned();
+                if !is_managed_unit_file(&fname) {
+                    continue;
+                }
+                let base = strip_unit_suffix(&fname);
+                if base == name.as_str() || base.starts_with(&format!("{name}-")) {
+                    if let Ok(contents) = std::fs::read_to_string(entry.path()) {
+                        if contents.starts_with(MANAGED_MARKER) {
+                            units_to_restart.push(fname);
+                        }
+                    }
+                }
+            }
+        }
+
+        if units_to_restart.is_empty() {
+            // Fallback: just try the .service unit
+            units_to_restart.push(format!("{name}.service"));
+        }
+
+        let mut ok = true;
+        for unit in &units_to_restart {
+            let status = std::process::Command::new("systemctl")
+                .arg("--user")
+                .arg("restart")
+                .arg(unit)
+                .stdout(Stdio::inherit())
+                .stderr(Stdio::inherit())
+                .status()
+                .map_err(|e| color_eyre::eyre::eyre!("Failed to run systemctl: {e}"))?;
+
+            if !status.success() {
+                ok = false;
+                tracing::warn!("Failed to restart {unit}");
+            }
+        }
+
+        if ok {
             println!("Restarted {}", name.bold());
-        } else {
-            tracing::warn!("Failed to restart {name}");
         }
     }
     Ok(())
