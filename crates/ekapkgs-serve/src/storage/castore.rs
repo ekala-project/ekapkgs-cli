@@ -149,6 +149,16 @@ impl CastoreBackend {
 
     // --- GC methods ---
 
+    /// Checkpoint the WAL to bound its on-disk size. Uses PASSIVE mode so
+    /// it never blocks concurrent readers or writers.
+    pub fn wal_checkpoint(&self) {
+        let Ok(db) = self.db.lock() else { return };
+        match db.execute_batch("PRAGMA wal_checkpoint(PASSIVE)") {
+            Ok(()) => {},
+            Err(e) => tracing::warn!("WAL checkpoint failed: {e}"),
+        }
+    }
+
     /// Update `last_access` for a batch of store path hashes.
     pub fn update_access(&self, hashes: &[String]) {
         let now = std::time::SystemTime::now()
@@ -1106,8 +1116,21 @@ fn open_db(path: &Path) -> color_eyre::Result<Connection> {
     tracing::log::info!("Opening database at {}", path.display());
     let conn = Connection::open(path)?;
     conn.execute_batch(
-        "PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;",
+        "PRAGMA journal_mode=WAL;\
+         PRAGMA synchronous=FULL;\
+         PRAGMA foreign_keys=ON;\
+         PRAGMA busy_timeout=5000;",
     )?;
+
+    // Detect corruption early rather than discovering it mid-operation.
+    let integrity: String =
+        conn.query_row("PRAGMA quick_check", [], |row| row.get(0))?;
+    if integrity != "ok" {
+        return Err(color_eyre::eyre::eyre!(
+            "database integrity check failed: {integrity}"
+        ));
+    }
+
     Ok(conn)
 }
 
