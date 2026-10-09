@@ -195,6 +195,10 @@ fn cas_maybe_run_gc(
     target_size: u64,
     gc_metrics: Option<&GcMetrics>,
 ) -> color_eyre::Result<()> {
+    // Checkpoint the WAL periodically to bound its size and limit the blast
+    // radius of corruption. PASSIVE won't block writers.
+    backend.wal_checkpoint();
+
     let total = backend.total_chunk_bytes()?;
     if total <= max_size {
         return Ok(());
@@ -302,7 +306,10 @@ async fn gc_loop(
 fn open_db(path: &Path) -> color_eyre::Result<Connection> {
     let conn = Connection::open(path)?;
     conn.execute_batch(
-        "PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;",
+        "PRAGMA journal_mode=WAL;\
+         PRAGMA synchronous=FULL;\
+         PRAGMA foreign_keys=ON;\
+         PRAGMA busy_timeout=5000;",
     )?;
     Ok(conn)
 }
