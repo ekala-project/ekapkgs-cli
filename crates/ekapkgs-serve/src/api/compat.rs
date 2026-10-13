@@ -125,6 +125,8 @@ pub async fn nix_cache_info(State(state): State<Arc<AppState>>) -> impl IntoResp
 
 /// GET /ekapkgs-cache-info — plain-text cache status including storage stats and dedup info.
 pub async fn ekapkgs_cache_info(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    use crate::gc::format_bytes;
+
     let storage = &state.storage;
     let mut lines = Vec::new();
 
@@ -142,11 +144,16 @@ pub async fn ekapkgs_cache_info(State(state): State<Arc<AppState>>) -> impl Into
             let refs = cas.total_file_chunk_refs().unwrap_or(0);
 
             lines.push(format!("StorePaths: {paths}"));
-            lines.push(format!("TotalNarSize: {nar_size}"));
+            lines.push(format!("TotalNarSize: {}", format_bytes(nar_size)));
             lines.push(format!("Chunks: {chunks}"));
-            lines.push(format!("ChunkBytes: {chunk_bytes}"));
+            lines.push(format!("ChunkBytes: {}", format_bytes(chunk_bytes)));
             lines.push(format!("UniqueFiles: {files}"));
             lines.push(format!("FileChunkRefs: {refs}"));
+            if nar_size > 0 {
+                let saved = nar_size.saturating_sub(chunk_bytes);
+                let ratio = (saved as f64 / nar_size as f64) * 100.0;
+                lines.push(format!("SpaceSaved: {} ({ratio:.1}%)", format_bytes(saved)));
+            }
         }
     } else if storage
         .as_any()
@@ -164,7 +171,7 @@ pub async fn ekapkgs_cache_info(State(state): State<Arc<AppState>>) -> impl Into
     let gc_freed = metrics.gc_bytes_freed_total.get();
     lines.push(format!("GCRuns: {gc_runs}"));
     lines.push(format!("GCPathsEvicted: {gc_evicted}"));
-    lines.push(format!("GCBytesFreed: {gc_freed}"));
+    lines.push(format!("GCBytesFreed: {}", format_bytes(gc_freed)));
 
     let body = lines.join("\n") + "\n";
     (
