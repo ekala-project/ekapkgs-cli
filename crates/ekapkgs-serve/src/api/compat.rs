@@ -123,6 +123,57 @@ pub async fn nix_cache_info(State(state): State<Arc<AppState>>) -> impl IntoResp
     )
 }
 
+/// GET /ekapkgs-cache-info — plain-text cache status including storage stats and dedup info.
+pub async fn ekapkgs_cache_info(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let storage = &state.storage;
+    let mut lines = Vec::new();
+
+    if storage.supports_cas() {
+        lines.push("Backend: castore".to_owned());
+        if let Some(cas) = storage
+            .as_any()
+            .downcast_ref::<crate::storage::castore::CastoreBackend>()
+        {
+            let paths = cas.total_paths().unwrap_or(0);
+            let nar_size = cas.total_nar_size().unwrap_or(0);
+            let chunks = cas.total_chunks().unwrap_or(0);
+            let chunk_bytes = cas.total_chunk_bytes().unwrap_or(0);
+            let files = cas.total_unique_files().unwrap_or(0);
+            let refs = cas.total_file_chunk_refs().unwrap_or(0);
+
+            lines.push(format!("StorePaths: {paths}"));
+            lines.push(format!("TotalNarSize: {nar_size}"));
+            lines.push(format!("Chunks: {chunks}"));
+            lines.push(format!("ChunkBytes: {chunk_bytes}"));
+            lines.push(format!("UniqueFiles: {files}"));
+            lines.push(format!("FileChunkRefs: {refs}"));
+        }
+    } else if storage
+        .as_any()
+        .downcast_ref::<crate::storage::nix_store::NixStoreBackend>()
+        .is_some()
+    {
+        lines.push("Backend: nix-store".to_owned());
+    } else {
+        lines.push("Backend: filesystem".to_owned());
+    }
+
+    let metrics = &state.metrics;
+    let gc_runs = metrics.gc_runs_total.get();
+    let gc_evicted = metrics.gc_paths_evicted_total.get();
+    let gc_freed = metrics.gc_bytes_freed_total.get();
+    lines.push(format!("GCRuns: {gc_runs}"));
+    lines.push(format!("GCPathsEvicted: {gc_evicted}"));
+    lines.push(format!("GCBytesFreed: {gc_freed}"));
+
+    let body = lines.join("\n") + "\n";
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "text/x-ekapkgs-cache-info")],
+        body,
+    )
+}
+
 /// GET / — Root landing page with cache info, public keys, and nix.conf snippets.
 pub async fn root(State(state): State<Arc<AppState>>, headers: HeaderMap) -> impl IntoResponse {
     let scheme = headers
