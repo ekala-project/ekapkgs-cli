@@ -682,7 +682,7 @@ pub fn parse_byte_size(s: &str) -> color_eyre::Result<u64> {
     Ok((num * multiplier as f64) as u64)
 }
 
-fn format_bytes(bytes: u64) -> String {
+pub fn format_bytes(bytes: u64) -> String {
     const GIB: u64 = 1_073_741_824;
     const MIB: u64 = 1_048_576;
     const KIB: u64 = 1_024;
