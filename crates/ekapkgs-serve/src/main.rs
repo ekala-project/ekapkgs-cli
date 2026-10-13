@@ -259,6 +259,7 @@ fn build_http_router(
         .route("/health", get(api::compat::health))
         .route("/version", get(api::compat::version))
         .route("/nix-cache-info", get(api::compat::nix_cache_info))
+        .route("/ekapkgs-cache-info", get(api::compat::ekapkgs_cache_info))
         .route("/api/v1/cache-info", get(api::compat::cache_info))
         .route(
             "/api/v1/tokens",

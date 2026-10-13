@@ -2285,3 +2285,56 @@ async fn test_cache_status_castore() {
     // Shared content means logical size >= physical size.
     assert!(response.total_nar_size >= response.chunk_bytes);
 }
+
+#[tokio::test]
+async fn test_ekapkgs_cache_info_filesystem() {
+    let server = TestServer::start();
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .get(format!("{}/ekapkgs-cache-info", server.base_url()))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+    let body = resp.text().await.unwrap();
+    assert!(body.contains("Backend: filesystem"));
+    assert!(body.contains("GCRuns:"));
+}
+
+#[tokio::test]
+async fn test_ekapkgs_cache_info_castore() {
+    let server = TestServer::start_castore_with_tokens(&["writer"]);
+    let client = reqwest::Client::new();
+    let base = server.base_url();
+
+    // Push a NAR so stats are non-zero.
+    let nar_data = build_test_nar(b"cache info http test content");
+    push_nar_to_castore(
+        &client,
+        &base,
+        HASH_NEG,
+        "infopkg",
+        "1.0",
+        &nar_data,
+        "test_token_writer",
+    )
+    .await;
+
+    let resp = client
+        .get(format!("{base}/ekapkgs-cache-info"))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+    let body = resp.text().await.unwrap();
+    assert!(body.contains("Backend: castore"));
+    assert!(body.contains("StorePaths: 1"));
+    assert!(body.contains("Chunks:"));
+    assert!(body.contains("ChunkBytes:"));
+    assert!(body.contains("UniqueFiles:"));
+    assert!(body.contains("FileChunkRefs:"));
+    assert!(body.contains("TotalNarSize:"));
+}
