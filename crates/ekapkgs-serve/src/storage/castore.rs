@@ -194,6 +194,42 @@ impl CastoreBackend {
         Ok(count as u64)
     }
 
+    /// Return total number of unique chunks.
+    pub fn total_chunks(&self) -> color_eyre::Result<u64> {
+        let db = self.db.lock().expect("db lock");
+        let count: i64 = db.query_row("SELECT COUNT(*) FROM chunks", [], |row| row.get(0))?;
+        Ok(count as u64)
+    }
+
+    /// Return total logical NAR size (sum of nar_size across all paths).
+    pub fn total_nar_size(&self) -> color_eyre::Result<u64> {
+        let db = self.db.lock().expect("db lock");
+        let total: i64 = db.query_row(
+            "SELECT COALESCE(SUM(nar_size), 0) FROM cas_paths",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(total as u64)
+    }
+
+    /// Return the number of unique file digests in file_chunks.
+    pub fn total_unique_files(&self) -> color_eyre::Result<u64> {
+        let db = self.db.lock().expect("db lock");
+        let count: i64 = db.query_row(
+            "SELECT COUNT(DISTINCT file_digest) FROM file_chunks",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(count as u64)
+    }
+
+    /// Return total number of file-to-chunk mapping rows.
+    pub fn total_file_chunk_refs(&self) -> color_eyre::Result<u64> {
+        let db = self.db.lock().expect("db lock");
+        let count: i64 = db.query_row("SELECT COUNT(*) FROM file_chunks", [], |row| row.get(0))?;
+        Ok(count as u64)
+    }
+
     /// Evict a store path and its exclusively-referenced data.
     ///
     /// Deletes the `cas_paths` row, then removes any chunks that are no

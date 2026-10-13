@@ -15,6 +15,8 @@ service CacheService {
   // Push-side chunk negotiation: client sends its chunk manifest, server
   // replies with which chunks are missing.
   rpc PushNegotiate(PushNegotiateRequest) returns (PushNegotiateResponse);
+  // Query cache status: storage statistics and GC info.
+  rpc CacheStatus(CacheStatusRequest) returns (CacheStatusResponse);
 }
 
 message NegotiateRequest {
@@ -95,4 +97,30 @@ message PushNegotiateResponse {
   repeated B3Digest missing_chunks = 1;
   // True if the server already has this store path (no push needed).
   bool already_exists = 2;
+}
+
+message CacheStatusRequest {}
+
+message CacheStatusResponse {
+  // Storage backend type: "castore", "filesystem", or "nix-store".
+  string backend = 1;
+  // Number of store paths in the cache.
+  uint64 store_paths = 2;
+  // Total NAR size across all paths (logical, before deduplication).
+  uint64 total_nar_size = 3;
+
+  // CAS-specific fields (populated only for castore backend).
+  // Total unique chunks in the content-addressed store.
+  uint64 chunks = 4;
+  // Total bytes stored on disk in chunks.
+  uint64 chunk_bytes = 5;
+  // Total unique file digests (deduplicated files).
+  uint64 unique_files = 6;
+  // Total file-to-chunk references (before dedup).
+  uint64 total_file_chunk_refs = 7;
+
+  // GC information.
+  uint64 gc_runs = 8;
+  uint64 gc_paths_evicted = 9;
+  uint64 gc_bytes_freed = 10;
 }

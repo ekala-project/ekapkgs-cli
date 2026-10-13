@@ -105,8 +105,78 @@ pub fn execute(command: CacheCommand) -> color_eyre::Result<()> {
             new.as_deref(),
             cache.as_deref(),
         ),
+        CacheCommand::Status { cache } => cmd_status(cache.as_deref()),
         CacheCommand::Auth { command } => cmd_auth(command),
     }
+}
+
+// --- status ---
+
+fn cmd_status(cache_name: Option<&str>) -> color_eyre::Result<()> {
+    use ekapkgs_protocol::ekapkgs::v1::CacheStatusRequest;
+    use ekapkgs_protocol::ekapkgs::v1::cache_service_client::CacheServiceClient;
+
+    let config = ClientConfig::load()?;
+    let (server_url, _token) = resolve_cache_for_action(&config, cache_name)?;
+
+    let rt = tokio::runtime::Runtime::new()?;
+    let response = rt.block_on(async {
+        let mut client = CacheServiceClient::connect(server_url.clone())
+            .await?
+            .max_decoding_message_size(64 * 1024 * 1024);
+
+        let resp = client
+            .cache_status(tonic::Request::new(CacheStatusRequest {}))
+            .await?;
+        Ok::<_, color_eyre::Report>(resp.into_inner())
+    })?;
+
+    println!("Cache: {server_url}");
+    println!("Backend: {}", response.backend);
+    println!("Store paths: {}", response.store_paths);
+
+    if response.backend == "castore" {
+        let nar = response.total_nar_size;
+        let chunk = response.chunk_bytes;
+
+        println!();
+        println!("Content-addressed store:");
+        println!(
+            "  Total NAR size (logical): {}",
+            ekapkgs_ui::format::format_bytes(nar)
+        );
+        println!(
+            "  Chunk store size (physical): {}",
+            ekapkgs_ui::format::format_bytes(chunk)
+        );
+        if nar > 0 {
+            let saved = nar.saturating_sub(chunk);
+            let ratio = (saved as f64 / nar as f64) * 100.0;
+            println!(
+                "  Space saved by dedup: {} ({ratio:.1}%)",
+                ekapkgs_ui::format::format_bytes(saved)
+            );
+        }
+        println!("  Unique chunks: {}", response.chunks);
+        println!("  Unique files: {}", response.unique_files);
+        println!(
+            "  File-chunk references: {}",
+            response.total_file_chunk_refs
+        );
+    }
+
+    if response.gc_runs > 0 {
+        println!();
+        println!("Garbage collection:");
+        println!("  GC runs: {}", response.gc_runs);
+        println!("  Paths evicted: {}", response.gc_paths_evicted);
+        println!(
+            "  Bytes freed: {}",
+            ekapkgs_ui::format::format_bytes(response.gc_bytes_freed)
+        );
+    }
+
+    Ok(())
 }
 
 // --- push ---

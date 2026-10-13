@@ -3,10 +3,10 @@ use std::sync::Arc;
 
 use ekapkgs_protocol::ekapkgs::v1::cache_service_server::CacheService;
 use ekapkgs_protocol::ekapkgs::v1::{
-    B3Digest, CaDirectoryData, CaPathMapping, ChunkDownload, ChunkMeta, ChunkNegotiateRequest,
-    ChunkNegotiateResponse, Compression, DownloadBatch, DownloadPlan, FileChunkMapping, NarChunk,
-    NegotiateRequest, NegotiateResponse, PathManifestEntry, PushNegotiateRequest,
-    PushNegotiateResponse, StreamNarsRequest,
+    B3Digest, CaDirectoryData, CaPathMapping, CacheStatusRequest, CacheStatusResponse,
+    ChunkDownload, ChunkMeta, ChunkNegotiateRequest, ChunkNegotiateResponse, Compression,
+    DownloadBatch, DownloadPlan, FileChunkMapping, NarChunk, NegotiateRequest, NegotiateResponse,
+    PathManifestEntry, PushNegotiateRequest, PushNegotiateResponse, StreamNarsRequest,
 };
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
@@ -527,6 +527,66 @@ impl CacheService for NegotiateService {
         Ok(Response::new(PushNegotiateResponse {
             missing_chunks: missing,
             already_exists: false,
+        }))
+    }
+
+    async fn cache_status(
+        &self,
+        _request: Request<CacheStatusRequest>,
+    ) -> Result<Response<CacheStatusResponse>, Status> {
+        let storage = &self.state.storage;
+
+        // Determine backend type and gather CAS-specific stats.
+        let (
+            backend,
+            store_paths,
+            total_nar_size,
+            chunks,
+            chunk_bytes,
+            unique_files,
+            file_chunk_refs,
+        ) = if storage.supports_cas() {
+            if let Some(cas) = storage
+                .as_any()
+                .downcast_ref::<crate::storage::castore::CastoreBackend>()
+            {
+                let paths = cas.total_paths().unwrap_or(0);
+                let nar_size = cas.total_nar_size().unwrap_or(0);
+                let chunks = cas.total_chunks().unwrap_or(0);
+                let chunk_bytes = cas.total_chunk_bytes().unwrap_or(0);
+                let files = cas.total_unique_files().unwrap_or(0);
+                let refs = cas.total_file_chunk_refs().unwrap_or(0);
+                ("castore", paths, nar_size, chunks, chunk_bytes, files, refs)
+            } else {
+                ("castore", 0u64, 0u64, 0u64, 0u64, 0u64, 0u64)
+            }
+        } else if storage
+            .as_any()
+            .downcast_ref::<crate::storage::nix_store::NixStoreBackend>()
+            .is_some()
+        {
+            ("nix-store", 0u64, 0u64, 0u64, 0u64, 0u64, 0u64)
+        } else {
+            ("filesystem", 0u64, 0u64, 0u64, 0u64, 0u64, 0u64)
+        };
+
+        // Read GC metrics from prometheus counters.
+        let metrics = &self.state.metrics;
+        let gc_runs = metrics.gc_runs_total.get();
+        let gc_paths_evicted = metrics.gc_paths_evicted_total.get();
+        let gc_bytes_freed = metrics.gc_bytes_freed_total.get();
+
+        Ok(Response::new(CacheStatusResponse {
+            backend: backend.to_owned(),
+            store_paths,
+            total_nar_size,
+            chunks,
+            chunk_bytes,
+            unique_files,
+            total_file_chunk_refs: file_chunk_refs,
+            gc_runs,
+            gc_paths_evicted,
+            gc_bytes_freed,
         }))
     }
 }
