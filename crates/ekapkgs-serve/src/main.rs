@@ -739,7 +739,11 @@ async fn cmd_serve(cli: Cli) -> color_eyre::Result<()> {
             grpc_service.clone(),
         )
         .route_service("/ekapkgs.v1.CacheService/StreamNars", grpc_service.clone())
-        .route_service("/ekapkgs.v1.CacheService/PushNegotiate", grpc_service);
+        .route_service(
+            "/ekapkgs.v1.CacheService/PushNegotiate",
+            grpc_service.clone(),
+        )
+        .route_service("/ekapkgs.v1.CacheService/CacheStatus", grpc_service);
 
     // Check for systemd socket activation.
     let inherited_listener = try_socket_activation()?;

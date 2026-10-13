@@ -2206,3 +2206,82 @@ async fn test_castore_nested_directory_streaming() {
     assert!(!response.file_chunk_mappings.is_empty());
     assert!(!response.missing_chunks.is_empty());
 }
+
+#[tokio::test]
+async fn test_cache_status_filesystem() {
+    let server = TestServer::start();
+    let base = server.base_url();
+
+    use ekapkgs_protocol::ekapkgs::v1::CacheStatusRequest;
+    use ekapkgs_protocol::ekapkgs::v1::cache_service_client::CacheServiceClient;
+
+    let mut grpc_client = CacheServiceClient::connect(base.clone())
+        .await
+        .unwrap()
+        .max_decoding_message_size(64 * 1024 * 1024);
+    let response = grpc_client
+        .cache_status(tonic::Request::new(CacheStatusRequest {}))
+        .await
+        .unwrap()
+        .into_inner();
+
+    assert_eq!(response.backend, "filesystem");
+    // Filesystem backend doesn't populate CAS fields.
+    assert_eq!(response.chunks, 0);
+    assert_eq!(response.chunk_bytes, 0);
+}
+
+#[tokio::test]
+async fn test_cache_status_castore() {
+    let server = TestServer::start_castore_with_tokens(&["writer"]);
+    let client = reqwest::Client::new();
+    let base = server.base_url();
+
+    // Push two NARs with shared content to exercise dedup.
+    let shared = b"shared content for status test!!";
+    let nar1 = build_test_nar(shared);
+    let nar2 = build_test_nar(shared);
+    push_nar_to_castore(
+        &client,
+        &base,
+        HASH_DUP1,
+        "statpkg1",
+        "1.0",
+        &nar1,
+        "test_token_writer",
+    )
+    .await;
+    push_nar_to_castore(
+        &client,
+        &base,
+        HASH_DUP2,
+        "statpkg2",
+        "1.0",
+        &nar2,
+        "test_token_writer",
+    )
+    .await;
+
+    use ekapkgs_protocol::ekapkgs::v1::CacheStatusRequest;
+    use ekapkgs_protocol::ekapkgs::v1::cache_service_client::CacheServiceClient;
+
+    let mut grpc_client = CacheServiceClient::connect(base.clone())
+        .await
+        .unwrap()
+        .max_decoding_message_size(64 * 1024 * 1024);
+    let response = grpc_client
+        .cache_status(tonic::Request::new(CacheStatusRequest {}))
+        .await
+        .unwrap()
+        .into_inner();
+
+    assert_eq!(response.backend, "castore");
+    assert_eq!(response.store_paths, 2);
+    assert!(response.total_nar_size > 0);
+    assert!(response.chunks > 0);
+    assert!(response.chunk_bytes > 0);
+    assert!(response.unique_files > 0);
+    assert!(response.total_file_chunk_refs > 0);
+    // Shared content means logical size >= physical size.
+    assert!(response.total_nar_size >= response.chunk_bytes);
+}

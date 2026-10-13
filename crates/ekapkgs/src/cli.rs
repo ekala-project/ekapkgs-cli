@@ -277,6 +277,13 @@ pub enum CacheCommand {
         cache: Option<String>,
     },
 
+    /// Show cache server status (storage stats, deduplication, GC).
+    Status {
+        /// Cache name or URL. If omitted, uses the primary cache or EKAPKGS_CACHE_URL.
+        #[arg(long)]
+        cache: Option<String>,
+    },
+
     /// Configure cache authentication.
     Auth {
         #[command(subcommand)]
