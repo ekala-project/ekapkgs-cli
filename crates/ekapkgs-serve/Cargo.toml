@@ -39,6 +39,7 @@ rusqlite.workspace = true
 blake3.workspace = true
 fastcdc.workspace = true
 zstd.workspace = true
+rayon.workspace = true
 bzip2.workspace = true
 prometheus.workspace = true
 sd-notify.workspace = true

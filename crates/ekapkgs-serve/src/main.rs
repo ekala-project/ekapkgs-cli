@@ -47,6 +47,13 @@ struct Cli {
     verbose: clap_verbosity_flag::Verbosity,
 }
 
+fn default_jobs() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get() / 4)
+        .unwrap_or(1)
+        .max(1)
+}
+
 #[derive(Subcommand)]
 enum Command {
     /// Start the binary cache server (default).
@@ -71,6 +78,10 @@ enum Command {
     CompressChunks {
         /// Path to the castore root directory.
         path: PathBuf,
+
+        /// Number of parallel compression workers.
+        #[arg(short = 'j', long, default_value_t = default_jobs())]
+        jobs: usize,
 
         /// Only print what would be done, don't modify anything.
         #[arg(long)]
@@ -340,7 +351,11 @@ async fn main() -> color_eyre::Result<()> {
             output,
         } => cmd_issue_cert(&name, &ca_key, &ca_name, days, &output),
         Command::Token { command } => cmd_token(command, cli.config.as_deref()),
-        Command::CompressChunks { path, dry_run } => cmd_compress_chunks(&path, dry_run),
+        Command::CompressChunks {
+            path,
+            jobs,
+            dry_run,
+        } => cmd_compress_chunks(&path, jobs, dry_run),
         Command::Serve => cmd_serve(cli).await,
     }
 }
@@ -513,8 +528,13 @@ fn format_timestamp(unix: u64) -> String {
     format!("{year}-{month:02}-{day:02}")
 }
 
-fn cmd_compress_chunks(path: &std::path::Path, dry_run: bool) -> color_eyre::Result<()> {
+fn cmd_compress_chunks(
+    path: &std::path::Path,
+    jobs: usize,
+    dry_run: bool,
+) -> color_eyre::Result<()> {
     use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     use rusqlite::{Connection, params};
 
@@ -547,8 +567,7 @@ fn cmd_compress_chunks(path: &std::path::Path, dry_run: bool) -> color_eyre::Res
     }
 
     tracing::info!(
-        "{} chunks to process{}",
-        total,
+        "{total} chunks to process with {jobs} workers{}",
         if dry_run { " (dry run)" } else { "" }
     );
 
@@ -568,15 +587,37 @@ fn cmd_compress_chunks(path: &std::path::Path, dry_run: bool) -> color_eyre::Res
         .collect();
     drop(stmt);
 
-    let mut inlined = 0u64;
-    let mut compressed = 0u64;
-    let mut incompressible = 0u64;
-    let mut bytes_saved = 0u64;
-    let mut bytes_processed = 0u64;
-    let mut files_removed = 0u64;
-    let mut processed = 0u64;
+    // Result of processing a single chunk (sent from workers to main thread).
+    enum ChunkResult {
+        /// Chunk inlined into DB. Contains (digest, original_data).
+        Inline {
+            digest: [u8; 32],
+            data: Vec<u8>,
+            size: u64,
+        },
+        /// Chunk compressed and written to temp file.
+        Compressed {
+            digest: [u8; 32],
+            temp_path: std::path::PathBuf,
+            final_path: std::path::PathBuf,
+            compressed_size: u64,
+            original_size: u64,
+        },
+        /// Chunk is incompressible — just update disk_size.
+        Incompressible { digest: [u8; 32], size: u64 },
+        /// Chunk file was missing on disk — skip.
+        Skipped,
+    }
 
-    let chunk_path = |digest: &[u8; 32]| -> std::path::PathBuf {
+    let inlined = AtomicU64::new(0);
+    let compressed_count = AtomicU64::new(0);
+    let incompressible_count = AtomicU64::new(0);
+    let bytes_saved = AtomicU64::new(0);
+    let bytes_processed = AtomicU64::new(0);
+    let files_removed = AtomicU64::new(0);
+    let processed = AtomicU64::new(0);
+
+    let chunk_path_fn = |digest: &[u8; 32]| -> std::path::PathBuf {
         let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
         let prefix = &hex[..4.min(hex.len())];
         path.join("chunks")
@@ -584,109 +625,189 @@ fn cmd_compress_chunks(path: &std::path::Path, dry_run: bool) -> color_eyre::Res
             .join(format!("{hex}.chunk"))
     };
 
-    for (digest, size) in &chunks {
-        let file_path = chunk_path(digest);
+    // Process chunks in batches. Workers do I/O and compression in parallel,
+    // then the main thread flushes DB updates in a single transaction per batch.
+    const BATCH_SIZE: usize = 1000;
 
-        if size < &1024 {
-            // Inline small chunk.
-            if !file_path.exists() {
-                processed += 1;
-                continue;
-            }
-            let data = std::fs::read(&file_path)?;
-            if !dry_run {
-                conn.execute(
-                    "UPDATE chunks SET storage_format = 1, disk_size = 0, data = ?1 WHERE digest \
-                     = ?2",
-                    params![data.as_slice(), digest.as_slice()],
-                )?;
-                let _ = std::fs::remove_file(&file_path);
-            }
-            inlined += 1;
-            files_removed += 1;
-            bytes_saved += *size as u64;
-        } else {
-            // Try zstd compression.
-            if !file_path.exists() {
-                processed += 1;
-                continue;
-            }
-            let data = std::fs::read(&file_path)?;
-            match zstd::bulk::compress(&data, 1) {
-                Ok(compressed_data) if compressed_data.len() < data.len() => {
-                    let saved = data.len() - compressed_data.len();
-                    if !dry_run {
-                        // Write compressed file atomically.
-                        if let Some(parent) = file_path.parent() {
-                            let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
-                            tmp.write_all(&compressed_data)?;
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(jobs)
+        .build()
+        .map_err(|e| color_eyre::eyre::eyre!("failed to create thread pool: {e}"))?;
 
-                            // Update DB first, then replace file.
-                            conn.execute(
-                                "UPDATE chunks SET storage_format = 2, disk_size = ?1 WHERE \
-                                 digest = ?2",
-                                params![compressed_data.len() as i64, digest.as_slice()],
-                            )?;
+    for batch in chunks.chunks(BATCH_SIZE) {
+        // Workers: read, compress, write temp files in parallel.
+        let results: Vec<ChunkResult> = pool.install(|| {
+            use rayon::prelude::*;
+            batch
+                .par_iter()
+                .map(|(digest, size)| {
+                    let file_path = chunk_path_fn(digest);
 
-                            match tmp.persist(&file_path) {
-                                Ok(_) => {},
-                                Err(e) => {
-                                    // Rollback DB on file persist failure.
-                                    conn.execute(
-                                        "UPDATE chunks SET storage_format = 0, disk_size = 0 \
-                                         WHERE digest = ?1",
-                                        params![digest.as_slice()],
-                                    )?;
-                                    return Err(e.error.into());
-                                },
-                            }
+                    if !file_path.exists() {
+                        return ChunkResult::Skipped;
+                    }
+
+                    let Ok(data) = std::fs::read(&file_path) else {
+                        return ChunkResult::Skipped;
+                    };
+
+                    if (*size as usize) < 1024 {
+                        ChunkResult::Inline {
+                            digest: *digest,
+                            data,
+                            size: *size as u64,
+                        }
+                    } else {
+                        match zstd::bulk::compress(&data, 1) {
+                            Ok(compressed_data) if compressed_data.len() < data.len() => {
+                                if dry_run {
+                                    return ChunkResult::Compressed {
+                                        digest: *digest,
+                                        temp_path: std::path::PathBuf::new(),
+                                        final_path: file_path,
+                                        compressed_size: compressed_data.len() as u64,
+                                        original_size: *size as u64,
+                                    };
+                                }
+                                // Write compressed data to temp file.
+                                let Some(parent) = file_path.parent() else {
+                                    return ChunkResult::Skipped;
+                                };
+                                let tmp = match tempfile::NamedTempFile::new_in(parent) {
+                                    Ok(mut t) => {
+                                        if t.write_all(&compressed_data).is_err() {
+                                            return ChunkResult::Skipped;
+                                        }
+                                        t
+                                    },
+                                    Err(_) => return ChunkResult::Skipped,
+                                };
+                                let temp_path = tmp.into_temp_path().to_path_buf();
+                                ChunkResult::Compressed {
+                                    digest: *digest,
+                                    temp_path,
+                                    final_path: file_path,
+                                    compressed_size: compressed_data.len() as u64,
+                                    original_size: *size as u64,
+                                }
+                            },
+                            _ => ChunkResult::Incompressible {
+                                digest: *digest,
+                                size: *size as u64,
+                            },
                         }
                     }
-                    compressed += 1;
-                    bytes_saved += saved as u64;
-                },
-                _ => {
-                    // Incompressible — set disk_size to match size.
-                    if !dry_run {
-                        conn.execute(
-                            "UPDATE chunks SET disk_size = ?1 WHERE digest = ?2",
-                            params![*size, digest.as_slice()],
+                })
+                .collect()
+        });
+
+        // Main thread: flush DB updates in a single transaction.
+        if !dry_run {
+            let tx = conn.unchecked_transaction()?;
+            for result in &results {
+                match result {
+                    ChunkResult::Inline { digest, data, .. } => {
+                        tx.execute(
+                            "UPDATE chunks SET storage_format = 1, disk_size = 0, data = ?1 WHERE \
+                             digest = ?2",
+                            params![data.as_slice(), digest.as_slice()],
                         )?;
-                    }
-                    incompressible += 1;
-                },
+                    },
+                    ChunkResult::Compressed {
+                        digest,
+                        compressed_size,
+                        ..
+                    } => {
+                        tx.execute(
+                            "UPDATE chunks SET storage_format = 2, disk_size = ?1 WHERE digest = \
+                             ?2",
+                            params![*compressed_size as i64, digest.as_slice()],
+                        )?;
+                    },
+                    ChunkResult::Incompressible { digest, size } => {
+                        tx.execute(
+                            "UPDATE chunks SET disk_size = ?1 WHERE digest = ?2",
+                            params![*size as i64, digest.as_slice()],
+                        )?;
+                    },
+                    ChunkResult::Skipped => {},
+                }
             }
+            tx.commit()?;
         }
 
-        bytes_processed += *size as u64;
-        processed += 1;
-        if processed % 10_000 == 0 {
-            let ratio = if bytes_processed > 0 {
-                (bytes_saved as f64 / bytes_processed as f64) * 100.0
+        // After DB commit: finalize file operations.
+        for result in &results {
+            match result {
+                ChunkResult::Inline { digest, size, .. } => {
+                    if !dry_run {
+                        let _ = std::fs::remove_file(chunk_path_fn(digest));
+                    }
+                    inlined.fetch_add(1, Ordering::Relaxed);
+                    files_removed.fetch_add(1, Ordering::Relaxed);
+                    bytes_saved.fetch_add(*size, Ordering::Relaxed);
+                    bytes_processed.fetch_add(*size, Ordering::Relaxed);
+                },
+                ChunkResult::Compressed {
+                    temp_path,
+                    final_path,
+                    compressed_size,
+                    original_size,
+                    ..
+                } => {
+                    if !dry_run {
+                        let _ = std::fs::rename(temp_path, final_path);
+                    }
+                    let saved = original_size - compressed_size;
+                    compressed_count.fetch_add(1, Ordering::Relaxed);
+                    bytes_saved.fetch_add(saved, Ordering::Relaxed);
+                    bytes_processed.fetch_add(*original_size, Ordering::Relaxed);
+                },
+                ChunkResult::Incompressible { size, .. } => {
+                    incompressible_count.fetch_add(1, Ordering::Relaxed);
+                    bytes_processed.fetch_add(*size, Ordering::Relaxed);
+                },
+                ChunkResult::Skipped => {},
+            }
+            processed.fetch_add(1, Ordering::Relaxed);
+        }
+
+        let p = processed.load(Ordering::Relaxed);
+        let bp = bytes_processed.load(Ordering::Relaxed);
+        let bs = bytes_saved.load(Ordering::Relaxed);
+        if p % 10_000 < BATCH_SIZE as u64 {
+            let ratio = if bp > 0 {
+                (bs as f64 / bp as f64) * 100.0
             } else {
                 0.0
             };
             tracing::info!(
-                "Progress: {processed}/{total} — {} processed, {} saved ({ratio:.1}%)",
-                gc::format_bytes(bytes_processed),
-                gc::format_bytes(bytes_saved),
+                "Progress: {p}/{total} — {} processed, {} saved ({ratio:.1}%)",
+                gc::format_bytes(bp),
+                gc::format_bytes(bs),
             );
         }
     }
 
-    let ratio = if bytes_processed > 0 {
-        (bytes_saved as f64 / bytes_processed as f64) * 100.0
+    let bp = bytes_processed.load(Ordering::Relaxed);
+    let bs = bytes_saved.load(Ordering::Relaxed);
+    let ratio = if bp > 0 {
+        (bs as f64 / bp as f64) * 100.0
     } else {
         0.0
     };
     tracing::info!(
-        "{}Done: {inlined} inlined, {compressed} compressed, {incompressible} incompressible",
+        "{}Done: {} inlined, {} compressed, {} incompressible",
         if dry_run { "Dry run " } else { "" },
+        inlined.load(Ordering::Relaxed),
+        compressed_count.load(Ordering::Relaxed),
+        incompressible_count.load(Ordering::Relaxed),
     );
     tracing::info!(
-        "Space saved: {} of {} ({ratio:.1}%, {files_removed} files removed)",
-        gc::format_bytes(bytes_saved),
-        gc::format_bytes(bytes_processed),
+        "Space saved: {} of {} ({ratio:.1}%, {} files removed)",
+        gc::format_bytes(bs),
+        gc::format_bytes(bp),
+        files_removed.load(Ordering::Relaxed),
     );
 
     Ok(())
