@@ -119,6 +119,14 @@ message CacheStatusResponse {
   // Total file-to-chunk references (before dedup).
   uint64 total_file_chunk_refs = 7;
 
+  // Compression/inlining stats.
+  // Actual bytes on disk (after compression, excluding inlined chunks).
+  uint64 disk_bytes = 11;
+  // Number of chunks stored inline in SQLite (no disk file).
+  uint64 inline_chunks = 12;
+  // Number of zstd-compressed chunks on disk.
+  uint64 compressed_chunks = 13;
+
   // GC information.
   uint64 gc_runs = 8;
   uint64 gc_paths_evicted = 9;

@@ -159,6 +159,11 @@ pub trait StorageBackend: Send + Sync {
         Ok(None)
     }
 
+    /// Check if a chunk exists without reading its data.
+    fn has_chunk(&self, digest: &[u8]) -> color_eyre::Result<bool> {
+        Ok(self.get_chunk(digest)?.is_some())
+    }
+
     /// Get the serialized CaNode root for a store path hash.
     fn get_cas_root(&self, _hash: &str) -> color_eyre::Result<Option<Vec<u8>>> {
         Ok(None)

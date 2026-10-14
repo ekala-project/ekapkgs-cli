@@ -149,10 +149,26 @@ pub async fn ekapkgs_cache_info(State(state): State<Arc<AppState>>) -> impl Into
             lines.push(format!("ChunkBytes: {}", format_bytes(chunk_bytes)));
             lines.push(format!("UniqueFiles: {files}"));
             lines.push(format!("FileChunkRefs: {refs}"));
+
+            let disk_bytes = cas.total_disk_bytes().unwrap_or(0);
+            let inline = cas.total_inline_chunks().unwrap_or(0);
+            let compressed = cas.total_compressed_chunks().unwrap_or(0);
+            lines.push(format!("DiskBytes: {}", format_bytes(disk_bytes)));
+            lines.push(format!("InlineChunks: {inline}"));
+            lines.push(format!("CompressedChunks: {compressed}"));
+
             if nar_size > 0 {
                 let saved = nar_size.saturating_sub(chunk_bytes);
                 let ratio = (saved as f64 / nar_size as f64) * 100.0;
-                lines.push(format!("SpaceSaved: {} ({ratio:.1}%)", format_bytes(saved)));
+                lines.push(format!("DedupSaved: {} ({ratio:.1}%)", format_bytes(saved)));
+            }
+            if chunk_bytes > 0 && disk_bytes < chunk_bytes {
+                let saved = chunk_bytes - disk_bytes;
+                let ratio = (saved as f64 / chunk_bytes as f64) * 100.0;
+                lines.push(format!(
+                    "CompressionSaved: {} ({ratio:.1}%)",
+                    format_bytes(saved)
+                ));
             }
         }
     } else if storage

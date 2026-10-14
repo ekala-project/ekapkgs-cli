@@ -67,6 +67,16 @@ enum Command {
         command: TokenCommand,
     },
 
+    /// Compress existing uncompressed chunks in a castore backend.
+    CompressChunks {
+        /// Path to the castore root directory.
+        path: PathBuf,
+
+        /// Only print what would be done, don't modify anything.
+        #[arg(long)]
+        dry_run: bool,
+    },
+
     /// Issue a signing certificate signed by a CA.
     IssueCert {
         /// Name for the certificate (e.g., "cache.example.org-2025").
@@ -330,6 +340,7 @@ async fn main() -> color_eyre::Result<()> {
             output,
         } => cmd_issue_cert(&name, &ca_key, &ca_name, days, &output),
         Command::Token { command } => cmd_token(command, cli.config.as_deref()),
+        Command::CompressChunks { path, dry_run } => cmd_compress_chunks(&path, dry_run),
         Command::Serve => cmd_serve(cli).await,
     }
 }
@@ -500,6 +511,171 @@ fn format_timestamp(unix: u64) -> String {
     let month = remaining / 30 + 1;
     let day = remaining % 30 + 1;
     format!("{year}-{month:02}-{day:02}")
+}
+
+fn cmd_compress_chunks(path: &std::path::Path, dry_run: bool) -> color_eyre::Result<()> {
+    use std::io::Write;
+
+    use rusqlite::{Connection, params};
+
+    let db_path = path.join("castore.db");
+    if !db_path.exists() {
+        return Err(color_eyre::eyre::eyre!(
+            "castore.db not found at {}",
+            db_path.display()
+        ));
+    }
+
+    let conn = Connection::open(&db_path)?;
+    conn.execute_batch(
+        "PRAGMA journal_mode=WAL;PRAGMA synchronous=FULL;PRAGMA busy_timeout=5000;",
+    )?;
+
+    // Ensure new columns exist (idempotent migration).
+    storage::castore::ensure_compression_columns(&conn)?;
+
+    // Count total work.
+    let total: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM chunks WHERE storage_format = 0",
+        [],
+        |row| row.get(0),
+    )?;
+
+    if total == 0 {
+        tracing::info!("All chunks already compressed or inlined");
+        return Ok(());
+    }
+
+    tracing::info!(
+        "{} chunks to process{}",
+        total,
+        if dry_run { " (dry run)" } else { "" }
+    );
+
+    let mut stmt =
+        conn.prepare("SELECT digest, size FROM chunks WHERE storage_format = 0 ORDER BY size ASC")?;
+    let chunks: Vec<([u8; 32], i64)> = stmt
+        .query_map([], |row| {
+            let digest: Vec<u8> = row.get(0)?;
+            let size: i64 = row.get(1)?;
+            Ok((digest, size))
+        })?
+        .filter_map(|r| {
+            let (dv, sz) = r.ok()?;
+            let d: [u8; 32] = dv.as_slice().try_into().ok()?;
+            Some((d, sz))
+        })
+        .collect();
+    drop(stmt);
+
+    let mut inlined = 0u64;
+    let mut compressed = 0u64;
+    let mut incompressible = 0u64;
+    let mut bytes_saved = 0u64;
+    let mut files_removed = 0u64;
+    let mut processed = 0u64;
+
+    let chunk_path = |digest: &[u8; 32]| -> std::path::PathBuf {
+        let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+        let prefix = &hex[..4.min(hex.len())];
+        path.join("chunks")
+            .join(prefix)
+            .join(format!("{hex}.chunk"))
+    };
+
+    for (digest, size) in &chunks {
+        let file_path = chunk_path(digest);
+
+        if size < &1024 {
+            // Inline small chunk.
+            if !file_path.exists() {
+                processed += 1;
+                continue;
+            }
+            let data = std::fs::read(&file_path)?;
+            if !dry_run {
+                conn.execute(
+                    "UPDATE chunks SET storage_format = 1, disk_size = 0, data = ?1 WHERE digest \
+                     = ?2",
+                    params![data.as_slice(), digest.as_slice()],
+                )?;
+                let _ = std::fs::remove_file(&file_path);
+            }
+            inlined += 1;
+            files_removed += 1;
+            bytes_saved += *size as u64;
+        } else {
+            // Try zstd compression.
+            if !file_path.exists() {
+                processed += 1;
+                continue;
+            }
+            let data = std::fs::read(&file_path)?;
+            match zstd::bulk::compress(&data, 1) {
+                Ok(compressed_data) if compressed_data.len() < data.len() => {
+                    let saved = data.len() - compressed_data.len();
+                    if !dry_run {
+                        // Write compressed file atomically.
+                        if let Some(parent) = file_path.parent() {
+                            let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
+                            tmp.write_all(&compressed_data)?;
+
+                            // Update DB first, then replace file.
+                            conn.execute(
+                                "UPDATE chunks SET storage_format = 2, disk_size = ?1 WHERE \
+                                 digest = ?2",
+                                params![compressed_data.len() as i64, digest.as_slice()],
+                            )?;
+
+                            match tmp.persist(&file_path) {
+                                Ok(_) => {},
+                                Err(e) => {
+                                    // Rollback DB on file persist failure.
+                                    conn.execute(
+                                        "UPDATE chunks SET storage_format = 0, disk_size = 0 \
+                                         WHERE digest = ?1",
+                                        params![digest.as_slice()],
+                                    )?;
+                                    return Err(e.error.into());
+                                },
+                            }
+                        }
+                    }
+                    compressed += 1;
+                    bytes_saved += saved as u64;
+                },
+                _ => {
+                    // Incompressible — set disk_size to match size.
+                    if !dry_run {
+                        conn.execute(
+                            "UPDATE chunks SET disk_size = ?1 WHERE digest = ?2",
+                            params![*size, digest.as_slice()],
+                        )?;
+                    }
+                    incompressible += 1;
+                },
+            }
+        }
+
+        processed += 1;
+        if processed % 10_000 == 0 {
+            tracing::info!(
+                "Progress: {processed}/{total} ({} saved so far)",
+                gc::format_bytes(bytes_saved),
+            );
+        }
+    }
+
+    tracing::info!(
+        "{}Done: {inlined} inlined, {compressed} compressed, {incompressible} incompressible",
+        if dry_run { "Dry run " } else { "" },
+    );
+    tracing::info!(
+        "Space saved: {} ({files_removed} files removed)",
+        gc::format_bytes(bytes_saved),
+    );
+
+    Ok(())
 }
 
 async fn cmd_serve(cli: Cli) -> color_eyre::Result<()> {
