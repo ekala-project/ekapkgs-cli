@@ -37,6 +37,20 @@ const CHUNK_MIN: u32 = 16 * 1024; // 16 KiB
 const CHUNK_AVG: u32 = 64 * 1024; // 64 KiB
 const CHUNK_MAX: u32 = 256 * 1024; // 256 KiB
 
+/// Chunks smaller than this are stored inline in SQLite instead of as files.
+const INLINE_THRESHOLD: usize = 1024;
+
+/// How a chunk is persisted on the server.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StorageFormat {
+    /// Raw uncompressed file on disk (legacy and incompressible chunks).
+    Raw = 0,
+    /// Data stored inline in the SQLite `data` BLOB column.
+    Inline = 1,
+    /// Zstd-compressed file on disk.
+    Compressed = 2,
+}
+
 /// Represents the client's set of already-cached chunk digests.
 ///
 /// Either an exact hash set (from the flat `have_chunks` list) or a
@@ -85,12 +99,55 @@ impl CastoreBackend {
 
     /// Get a chunk by its blake3 digest (as 32 raw bytes).
     pub fn get_chunk_by_digest(&self, digest: &[u8; 32]) -> color_eyre::Result<Option<Vec<u8>>> {
-        let hex = hex_encode(digest);
-        let path = self.chunk_path(&hex);
-        if !path.exists() {
-            return Ok(None);
+        // Check SQLite for storage format and possible inline data.
+        let db = self.db.lock().expect("db lock");
+        let row: Option<(i64, Option<Vec<u8>>)> = db
+            .query_row(
+                "SELECT storage_format, data FROM chunks WHERE digest = ?1",
+                params![digest.as_slice()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .ok();
+        drop(db);
+
+        match row {
+            Some((1, Some(data))) => Ok(Some(data)),
+            Some((1, None)) => Err(color_eyre::eyre::eyre!(
+                "inline chunk {} has NULL data",
+                hex_encode(digest)
+            )),
+            Some((2, _)) => {
+                let path = self.chunk_path(&hex_encode(digest));
+                if !path.exists() {
+                    return Ok(None);
+                }
+                let compressed = std::fs::read(&path)?;
+                let decompressed = zstd::bulk::decompress(&compressed, CHUNK_MAX as usize * 2)
+                    .map_err(|e| {
+                        color_eyre::eyre::eyre!("corrupt zstd chunk {}: {e}", hex_encode(digest))
+                    })?;
+                Ok(Some(decompressed))
+            },
+            _ => {
+                // Raw on disk (format=0 or legacy row).
+                let path = self.chunk_path(&hex_encode(digest));
+                if !path.exists() {
+                    return Ok(None);
+                }
+                Ok(Some(std::fs::read(path)?))
+            },
         }
-        Ok(Some(std::fs::read(path)?))
+    }
+
+    /// Check if a chunk exists without reading its data.
+    pub fn has_chunk(&self, digest: &[u8; 32]) -> color_eyre::Result<bool> {
+        let db = self.db.lock().expect("db lock");
+        let exists: bool = db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM chunks WHERE digest = ?1)",
+            params![digest.as_slice()],
+            |row| row.get(0),
+        )?;
+        Ok(exists)
     }
 
     /// Get the CAS root node for a store path hash.
@@ -227,6 +284,39 @@ impl CastoreBackend {
     pub fn total_file_chunk_refs(&self) -> color_eyre::Result<u64> {
         let db = self.db.lock().expect("db lock");
         let count: i64 = db.query_row("SELECT COUNT(*) FROM file_chunks", [], |row| row.get(0))?;
+        Ok(count as u64)
+    }
+
+    /// Return total actual disk usage (compressed/raw sizes, excluding inline).
+    pub fn total_disk_bytes(&self) -> color_eyre::Result<u64> {
+        let db = self.db.lock().expect("db lock");
+        let total: i64 = db.query_row(
+            "SELECT COALESCE(SUM(disk_size), 0) FROM chunks",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(total as u64)
+    }
+
+    /// Return the number of inline chunks (stored in SQLite, no disk file).
+    pub fn total_inline_chunks(&self) -> color_eyre::Result<u64> {
+        let db = self.db.lock().expect("db lock");
+        let count: i64 = db.query_row(
+            "SELECT COUNT(*) FROM chunks WHERE storage_format = 1",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(count as u64)
+    }
+
+    /// Return the number of zstd-compressed chunks.
+    pub fn total_compressed_chunks(&self) -> color_eyre::Result<u64> {
+        let db = self.db.lock().expect("db lock");
+        let count: i64 = db.query_row(
+            "SELECT COUNT(*) FROM chunks WHERE storage_format = 2",
+            [],
+            |row| row.get(0),
+        )?;
         Ok(count as u64)
     }
 
@@ -448,34 +538,65 @@ impl CastoreBackend {
     /// When called outside a transaction (e.g. from external chunk uploads),
     /// acquires the DB lock internally.
     fn store_chunk(&self, data: &[u8]) -> color_eyre::Result<[u8; 32]> {
-        let digest = self.write_chunk_file(data)?;
+        let (digest, format, disk_size) = self.write_chunk_file(data)?;
+        let inline_data = if format == StorageFormat::Inline {
+            Some(data)
+        } else {
+            None
+        };
         let db = self.db.lock().expect("db lock");
-        Self::insert_chunk_row(&db, &digest, data.len())?;
+        Self::insert_chunk_row(&db, &digest, data.len(), format, disk_size, inline_data)?;
         Ok(digest)
     }
 
-    /// Write a chunk file to disk, returning its blake3 digest.
-    /// Idempotent — if the file already exists, this is a no-op.
-    fn write_chunk_file(&self, data: &[u8]) -> color_eyre::Result<[u8; 32]> {
+    /// Prepare a chunk for storage, returning its digest, storage format, and
+    /// disk size (0 for inline chunks).
+    ///
+    /// Chunks smaller than `INLINE_THRESHOLD` are not written to disk — the
+    /// caller stores the data in SQLite. Larger chunks are compressed with
+    /// zstd; if compression doesn't reduce size, they are stored raw.
+    fn write_chunk_file(&self, data: &[u8]) -> color_eyre::Result<([u8; 32], StorageFormat, u64)> {
         let hash = blake3::hash(data);
         let digest = *hash.as_bytes();
+
+        if data.len() < INLINE_THRESHOLD {
+            return Ok((digest, StorageFormat::Inline, 0));
+        }
+
         let hex = hex_encode(&digest);
         let path = self.chunk_path(&hex);
 
         if !path.exists() {
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent)?;
+
+                // Try zstd compression.
+                let compressed = zstd::bulk::compress(data, 1)
+                    .map_err(|e| color_eyre::eyre::eyre!("zstd compress failed: {e}"))?;
+
+                let (bytes_to_write, format) = if compressed.len() < data.len() {
+                    (compressed.as_slice(), StorageFormat::Compressed)
+                } else {
+                    (data, StorageFormat::Raw)
+                };
+
                 let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
-                tmp.write_all(data)?;
+                tmp.write_all(bytes_to_write)?;
                 match tmp.persist(&path) {
                     Ok(_) => {},
                     Err(e) if e.error.kind() == std::io::ErrorKind::AlreadyExists => {},
                     Err(e) => return Err(e.error.into()),
                 }
+
+                return Ok((digest, format, bytes_to_write.len() as u64));
             }
         }
 
-        Ok(digest)
+        // File already exists — return current disk size. The actual
+        // storage_format is whatever was set when the chunk was first inserted;
+        // INSERT OR IGNORE in the caller preserves it.
+        let disk_size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        Ok((digest, StorageFormat::Raw, disk_size))
     }
 
     /// Insert a row into the chunks table. Caller must hold a connection.
@@ -483,10 +604,20 @@ impl CastoreBackend {
         conn: &Connection,
         digest: &[u8; 32],
         size: usize,
+        format: StorageFormat,
+        disk_size: u64,
+        inline_data: Option<&[u8]>,
     ) -> color_eyre::Result<()> {
         conn.execute(
-            "INSERT OR IGNORE INTO chunks (digest, size, ref_count) VALUES (?1, ?2, 1)",
-            params![digest.as_slice(), size as i64],
+            "INSERT OR IGNORE INTO chunks (digest, size, ref_count, storage_format, disk_size, \
+             data) VALUES (?1, ?2, 1, ?3, ?4, ?5)",
+            params![
+                digest.as_slice(),
+                size as i64,
+                format as i64,
+                disk_size as i64,
+                inline_data,
+            ],
         )?;
         Ok(())
     }
@@ -561,10 +692,20 @@ impl CastoreBackend {
 
                 for chunk in chunks {
                     let chunk_data = &data[chunk.offset..chunk.offset + chunk.length];
-                    // Write chunk file to disk (idempotent, outside transaction).
-                    let digest = self.write_chunk_file(chunk_data)?;
-                    // Record in DB (inside caller's transaction).
-                    Self::insert_chunk_row(conn, &digest, chunk_data.len())?;
+                    let (digest, format, disk_size) = self.write_chunk_file(chunk_data)?;
+                    let inline = if format == StorageFormat::Inline {
+                        Some(chunk_data)
+                    } else {
+                        None
+                    };
+                    Self::insert_chunk_row(
+                        conn,
+                        &digest,
+                        chunk_data.len(),
+                        format,
+                        disk_size,
+                        inline,
+                    )?;
                     chunk_digests.push((digest, chunk.length as u64));
                     total_size += chunk.length as u64;
                 }
@@ -1082,6 +1223,13 @@ impl StorageBackend for CastoreBackend {
         self.get_chunk_by_digest(&d)
     }
 
+    fn has_chunk(&self, digest: &[u8]) -> color_eyre::Result<bool> {
+        let d: [u8; 32] = digest
+            .try_into()
+            .map_err(|_| color_eyre::eyre::eyre!("invalid digest length"))?;
+        CastoreBackend::has_chunk(self, &d)
+    }
+
     fn get_cas_root(&self, hash: &str) -> color_eyre::Result<Option<Vec<u8>>> {
         Ok(self.get_root_node(hash)?.map(|n| n.encode_to_vec()))
     }
@@ -1141,6 +1289,13 @@ impl StorageBackend for std::sync::Arc<CastoreBackend> {
         (**self).get_chunk(digest)
     }
 
+    fn has_chunk(&self, digest: &[u8]) -> color_eyre::Result<bool> {
+        let d: [u8; 32] = digest
+            .try_into()
+            .map_err(|_| color_eyre::eyre::eyre!("invalid digest length"))?;
+        CastoreBackend::has_chunk(self, &d)
+    }
+
     fn get_cas_root(&self, hash: &str) -> color_eyre::Result<Option<Vec<u8>>> {
         (**self).get_cas_root(hash)
     }
@@ -1183,9 +1338,12 @@ fn create_tables(conn: &Connection) -> color_eyre::Result<()> {
             last_access  INTEGER NOT NULL DEFAULT 0
         );
         CREATE TABLE IF NOT EXISTS chunks (
-            digest       BLOB PRIMARY KEY,
-            size         INTEGER NOT NULL,
-            ref_count    INTEGER NOT NULL DEFAULT 1
+            digest         BLOB PRIMARY KEY,
+            size           INTEGER NOT NULL,
+            ref_count      INTEGER NOT NULL DEFAULT 1,
+            storage_format INTEGER NOT NULL DEFAULT 0,
+            disk_size      INTEGER NOT NULL DEFAULT 0,
+            data           BLOB DEFAULT NULL
         );
         CREATE TABLE IF NOT EXISTS file_chunks (
             file_digest  BLOB NOT NULL,
@@ -1213,6 +1371,23 @@ fn create_tables(conn: &Connection) -> color_eyre::Result<()> {
         )?;
     }
 
+    ensure_compression_columns(conn)?;
+
+    Ok(())
+}
+
+/// Add chunk compression columns if missing (existing DBs).
+pub fn ensure_compression_columns(conn: &Connection) -> color_eyre::Result<()> {
+    let has_format: bool = conn
+        .prepare("SELECT storage_format FROM chunks LIMIT 0")
+        .is_ok();
+    if !has_format {
+        conn.execute_batch(
+            "ALTER TABLE chunks ADD COLUMN storage_format INTEGER NOT NULL DEFAULT 0;
+             ALTER TABLE chunks ADD COLUMN disk_size INTEGER NOT NULL DEFAULT 0;
+             ALTER TABLE chunks ADD COLUMN data BLOB DEFAULT NULL;",
+        )?;
+    }
     Ok(())
 }
 
@@ -1341,12 +1516,17 @@ mod tests {
         assert!(!backend.has_narinfo("nonexistent").unwrap());
     }
 
+    /// Generate a repeating byte pattern large enough to produce a disk chunk (>1K).
+    fn large_test_data(seed: u8, len: usize) -> Vec<u8> {
+        (0..len).map(|i| seed.wrapping_add(i as u8)).collect()
+    }
+
     #[test]
     fn chunk_deduplication() {
         let (_dir, backend) = setup_backend();
 
-        // Two NARs with the same file content.
-        let shared_data = b"shared content between packages".to_vec();
+        // Two NARs with the same file content (>1K to avoid inlining).
+        let shared_data = large_test_data(42, 2048);
 
         let node1 = NarNode::Regular {
             executable: false,
@@ -1520,7 +1700,7 @@ mod tests {
 
         let node = NarNode::Regular {
             executable: false,
-            data: b"unique data for eviction test".to_vec(),
+            data: large_test_data(1, 2048),
         };
         let nar_data = write_nar(&node);
         backend.put_nar("nar/evict1.nar", &nar_data).unwrap();
@@ -1538,7 +1718,7 @@ mod tests {
     fn evict_path_preserves_shared_chunks() {
         let (_dir, backend) = setup_backend();
 
-        let shared_data = b"shared data for eviction test".to_vec();
+        let shared_data = large_test_data(2, 2048);
 
         let node1 = NarNode::Regular {
             executable: false,
@@ -1581,14 +1761,14 @@ mod tests {
                     name: "a.txt".to_string(),
                     node: NarNode::Regular {
                         executable: false,
-                        data: b"file a content".to_vec(),
+                        data: large_test_data(10, 2048),
                     },
                 },
                 NarDirectoryEntry {
                     name: "b.txt".to_string(),
                     node: NarNode::Regular {
                         executable: true,
-                        data: b"file b content".to_vec(),
+                        data: large_test_data(20, 2048),
                     },
                 },
             ],
@@ -1598,7 +1778,7 @@ mod tests {
 
         assert!(backend.has_narinfo("dir1").unwrap());
         let chunks_before = count_chunk_files(&backend.root);
-        assert_eq!(chunks_before, 2); // Two files = two chunks.
+        assert_eq!(chunks_before, 2); // Two files = two disk chunks.
 
         let freed = backend.evict_path("dir1").unwrap();
         assert!(freed > 0);
@@ -1679,5 +1859,86 @@ mod tests {
         // ord1 should come first (older access).
         assert_eq!(paths[0].0, "ord1");
         assert_eq!(paths[1].0, "ord2");
+    }
+
+    #[test]
+    fn small_chunk_inlined_in_db() {
+        let (_dir, backend) = setup_backend();
+
+        // Small data (<1K) should be inlined — no file on disk.
+        let small_data = b"tiny chunk";
+        let digest = backend.store_chunk(small_data).unwrap();
+        assert_eq!(count_chunk_files(&backend.root), 0);
+
+        // Should still be readable.
+        let retrieved = backend.get_chunk_by_digest(&digest).unwrap().unwrap();
+        assert_eq!(retrieved, small_data);
+
+        // has_chunk should return true.
+        assert!(backend.has_chunk(&digest).unwrap());
+    }
+
+    #[test]
+    fn large_chunk_compressed_on_disk() {
+        let (_dir, backend) = setup_backend();
+
+        // Compressible data (>1K, repetitive pattern).
+        let data = vec![0xABu8; 4096];
+        let digest = backend.store_chunk(&data).unwrap();
+
+        // Should be on disk (1 file).
+        assert_eq!(count_chunk_files(&backend.root), 1);
+
+        // File should be smaller than original (compressed).
+        let hex = hex_encode(&digest);
+        let path = backend.chunk_path(&hex);
+        let disk_size = std::fs::metadata(&path).unwrap().len();
+        assert!(disk_size < data.len() as u64);
+
+        // Should decompress to original data.
+        let retrieved = backend.get_chunk_by_digest(&digest).unwrap().unwrap();
+        assert_eq!(retrieved, data);
+    }
+
+    #[test]
+    fn incompressible_chunk_stored_raw() {
+        let (_dir, backend) = setup_backend();
+
+        // Random-looking data that won't compress.
+        let data: Vec<u8> = (0..2048)
+            .map(|i| {
+                let x = (i as u64)
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                (x >> 33) as u8
+            })
+            .collect();
+        let digest = backend.store_chunk(&data).unwrap();
+
+        assert_eq!(count_chunk_files(&backend.root), 1);
+
+        let retrieved = backend.get_chunk_by_digest(&digest).unwrap().unwrap();
+        assert_eq!(retrieved, data);
+    }
+
+    #[test]
+    fn inline_chunk_nar_roundtrip() {
+        let (_dir, backend) = setup_backend();
+
+        // Small file content that will be inlined.
+        let node = NarNode::Regular {
+            executable: false,
+            data: b"small file".to_vec(),
+        };
+        let nar_data = write_nar(&node);
+
+        backend.put_nar("nar/small1.nar", &nar_data).unwrap();
+
+        // No chunk files on disk.
+        assert_eq!(count_chunk_files(&backend.root), 0);
+
+        // NAR should still roundtrip correctly.
+        let retrieved = backend.get_nar("nar/small1.nar").unwrap().unwrap();
+        assert_eq!(nar_data, retrieved);
     }
 }

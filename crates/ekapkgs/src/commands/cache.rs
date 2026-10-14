@@ -138,26 +138,31 @@ fn cmd_status(cache_name: Option<&str>) -> color_eyre::Result<()> {
     if response.backend == "castore" {
         let nar = response.total_nar_size;
         let chunk = response.chunk_bytes;
+        let disk = response.disk_bytes;
+        let fb = ekapkgs_ui::format::format_bytes;
 
         println!();
         println!("Content-addressed store:");
-        println!(
-            "  Total NAR size (logical): {}",
-            ekapkgs_ui::format::format_bytes(nar)
-        );
-        println!(
-            "  Chunk store size (physical): {}",
-            ekapkgs_ui::format::format_bytes(chunk)
-        );
+        println!("  Total NAR size (logical): {}", fb(nar));
+        println!("  Chunk store size (deduped): {}", fb(chunk));
         if nar > 0 {
             let saved = nar.saturating_sub(chunk);
             let ratio = (saved as f64 / nar as f64) * 100.0;
-            println!(
-                "  Space saved by dedup: {} ({ratio:.1}%)",
-                ekapkgs_ui::format::format_bytes(saved)
-            );
+            println!("  Space saved by dedup: {} ({ratio:.1}%)", fb(saved));
+        }
+        if disk > 0 && disk < chunk {
+            println!("  Disk usage (after compression): {}", fb(disk));
+            let saved = chunk - disk;
+            let ratio = (saved as f64 / chunk as f64) * 100.0;
+            println!("  Space saved by compression: {} ({ratio:.1}%)", fb(saved));
         }
         println!("  Unique chunks: {}", response.chunks);
+        if response.inline_chunks > 0 {
+            println!("    Inline (in SQLite): {}", response.inline_chunks);
+        }
+        if response.compressed_chunks > 0 {
+            println!("    Compressed (zstd): {}", response.compressed_chunks);
+        }
         println!("  Unique files: {}", response.unique_files);
         println!(
             "  File-chunk references: {}",

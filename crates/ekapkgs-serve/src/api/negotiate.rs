@@ -518,9 +518,9 @@ impl CacheService for NegotiateService {
                 Ok(d) => d,
                 Err(_) => continue,
             };
-            match self.state.storage.get_chunk(&d) {
-                Ok(Some(_)) => {}, // Server has it.
-                Ok(None) | Err(_) => missing.push(digest.clone()),
+            match self.state.storage.has_chunk(&d) {
+                Ok(true) => {},
+                Ok(false) | Err(_) => missing.push(digest.clone()),
             }
         }
 
@@ -537,57 +537,41 @@ impl CacheService for NegotiateService {
         let storage = &self.state.storage;
 
         // Determine backend type and gather CAS-specific stats.
-        let (
-            backend,
-            store_paths,
-            total_nar_size,
-            chunks,
-            chunk_bytes,
-            unique_files,
-            file_chunk_refs,
-        ) = if storage.supports_cas() {
+        let mut resp = CacheStatusResponse::default();
+
+        if storage.supports_cas() {
+            resp.backend = "castore".to_owned();
             if let Some(cas) = storage
                 .as_any()
                 .downcast_ref::<crate::storage::castore::CastoreBackend>()
             {
-                let paths = cas.total_paths().unwrap_or(0);
-                let nar_size = cas.total_nar_size().unwrap_or(0);
-                let chunks = cas.total_chunks().unwrap_or(0);
-                let chunk_bytes = cas.total_chunk_bytes().unwrap_or(0);
-                let files = cas.total_unique_files().unwrap_or(0);
-                let refs = cas.total_file_chunk_refs().unwrap_or(0);
-                ("castore", paths, nar_size, chunks, chunk_bytes, files, refs)
-            } else {
-                ("castore", 0u64, 0u64, 0u64, 0u64, 0u64, 0u64)
+                resp.store_paths = cas.total_paths().unwrap_or(0);
+                resp.total_nar_size = cas.total_nar_size().unwrap_or(0);
+                resp.chunks = cas.total_chunks().unwrap_or(0);
+                resp.chunk_bytes = cas.total_chunk_bytes().unwrap_or(0);
+                resp.unique_files = cas.total_unique_files().unwrap_or(0);
+                resp.total_file_chunk_refs = cas.total_file_chunk_refs().unwrap_or(0);
+                resp.disk_bytes = cas.total_disk_bytes().unwrap_or(0);
+                resp.inline_chunks = cas.total_inline_chunks().unwrap_or(0);
+                resp.compressed_chunks = cas.total_compressed_chunks().unwrap_or(0);
             }
         } else if storage
             .as_any()
             .downcast_ref::<crate::storage::nix_store::NixStoreBackend>()
             .is_some()
         {
-            ("nix-store", 0u64, 0u64, 0u64, 0u64, 0u64, 0u64)
+            resp.backend = "nix-store".to_owned();
         } else {
-            ("filesystem", 0u64, 0u64, 0u64, 0u64, 0u64, 0u64)
-        };
+            resp.backend = "filesystem".to_owned();
+        }
 
         // Read GC metrics from prometheus counters.
         let metrics = &self.state.metrics;
-        let gc_runs = metrics.gc_runs_total.get();
-        let gc_paths_evicted = metrics.gc_paths_evicted_total.get();
-        let gc_bytes_freed = metrics.gc_bytes_freed_total.get();
+        resp.gc_runs = metrics.gc_runs_total.get();
+        resp.gc_paths_evicted = metrics.gc_paths_evicted_total.get();
+        resp.gc_bytes_freed = metrics.gc_bytes_freed_total.get();
 
-        Ok(Response::new(CacheStatusResponse {
-            backend: backend.to_owned(),
-            store_paths,
-            total_nar_size,
-            chunks,
-            chunk_bytes,
-            unique_files,
-            total_file_chunk_refs: file_chunk_refs,
-            gc_runs,
-            gc_paths_evicted,
-            gc_bytes_freed,
-        }))
+        Ok(Response::new(resp))
     }
 }
 
