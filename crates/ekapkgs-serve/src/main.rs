@@ -552,8 +552,8 @@ fn cmd_compress_chunks(path: &std::path::Path, dry_run: bool) -> color_eyre::Res
         if dry_run { " (dry run)" } else { "" }
     );
 
-    let mut stmt =
-        conn.prepare("SELECT digest, size FROM chunks WHERE storage_format = 0 ORDER BY size ASC")?;
+    let mut stmt = conn
+        .prepare("SELECT digest, size FROM chunks WHERE storage_format = 0 ORDER BY size DESC")?;
     let chunks: Vec<([u8; 32], i64)> = stmt
         .query_map([], |row| {
             let digest: Vec<u8> = row.get(0)?;
@@ -572,6 +572,7 @@ fn cmd_compress_chunks(path: &std::path::Path, dry_run: bool) -> color_eyre::Res
     let mut compressed = 0u64;
     let mut incompressible = 0u64;
     let mut bytes_saved = 0u64;
+    let mut bytes_processed = 0u64;
     let mut files_removed = 0u64;
     let mut processed = 0u64;
 
@@ -657,22 +658,35 @@ fn cmd_compress_chunks(path: &std::path::Path, dry_run: bool) -> color_eyre::Res
             }
         }
 
+        bytes_processed += *size as u64;
         processed += 1;
         if processed % 10_000 == 0 {
+            let ratio = if bytes_processed > 0 {
+                (bytes_saved as f64 / bytes_processed as f64) * 100.0
+            } else {
+                0.0
+            };
             tracing::info!(
-                "Progress: {processed}/{total} ({} saved so far)",
+                "Progress: {processed}/{total} — {} processed, {} saved ({ratio:.1}%)",
+                gc::format_bytes(bytes_processed),
                 gc::format_bytes(bytes_saved),
             );
         }
     }
 
+    let ratio = if bytes_processed > 0 {
+        (bytes_saved as f64 / bytes_processed as f64) * 100.0
+    } else {
+        0.0
+    };
     tracing::info!(
         "{}Done: {inlined} inlined, {compressed} compressed, {incompressible} incompressible",
         if dry_run { "Dry run " } else { "" },
     );
     tracing::info!(
-        "Space saved: {} ({files_removed} files removed)",
+        "Space saved: {} of {} ({ratio:.1}%, {files_removed} files removed)",
         gc::format_bytes(bytes_saved),
+        gc::format_bytes(bytes_processed),
     );
 
     Ok(())
