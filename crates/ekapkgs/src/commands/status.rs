@@ -5,9 +5,9 @@ use yansi::Paint;
 use crate::cli::StatusCommand;
 use crate::config::{ENV_MANIFEST_NAME, HomeServices};
 
-pub fn execute(command: StatusCommand) -> color_eyre::Result<()> {
+pub fn execute(command: &StatusCommand) -> color_eyre::Result<()> {
     match command {
-        StatusCommand::Services { json } => cmd_services(json),
+        StatusCommand::Services { json } => cmd_services(*json),
     }
 }
 
