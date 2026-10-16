@@ -206,6 +206,21 @@ pub fn apply_template(template: &ServiceTemplate, config: &mut toml::Table) {
         );
     }
 
+    if !config.contains_key("stop_signal") {
+        config.insert(
+            "stop_signal".to_owned(),
+            toml::Value::String(template.stop_signal.to_owned()),
+        );
+    }
+    if let Some(hc) = template.health_check {
+        if !config.contains_key("health_check") {
+            config.insert(
+                "health_check".to_owned(),
+                toml::Value::String(hc.to_owned()),
+            );
+        }
+    }
+
     // Set up ports table.
     if !config.contains_key("ports") {
         let mut port_entry = toml::Table::new();
