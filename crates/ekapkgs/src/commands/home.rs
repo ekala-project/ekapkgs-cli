@@ -5,7 +5,10 @@ use ekapkgs_nix::{NixCommand, eval};
 use yansi::Paint;
 
 use crate::cli::{HomeCommand, HomePackagesCommand, HomeServicesCommand};
-use crate::config::{ClientConfig, HomePackageEntry, HomePackages, HomeServiceEntry, HomeServices};
+use crate::config::{
+    ClientConfig, HomePackageEntry, HomePackages, HomeServiceEntry, HomeServices,
+    provenance_caller, provenance_timestamp,
+};
 
 /// Profile path for imperatively-installed packages (relative to `$HOME`).
 const PACKAGES_PROFILE: &str = ".ekapkgs-packages";
@@ -310,7 +313,7 @@ fn cmd_packages(command: HomePackagesCommand) -> color_eyre::Result<()> {
         HomePackagesCommand::Remove { packages } => cmd_packages_remove(&packages),
         HomePackagesCommand::Present { packages } => cmd_packages_present(&packages),
         HomePackagesCommand::Missing { packages } => cmd_packages_missing(&packages),
-        HomePackagesCommand::List { json } => cmd_packages_list(json),
+        HomePackagesCommand::List { json, verbose } => cmd_packages_list(json, verbose),
         HomePackagesCommand::Export { output } => cmd_packages_export(output.as_deref()),
         HomePackagesCommand::Import { file, merge } => cmd_packages_import(&file, merge),
     }
@@ -344,6 +347,8 @@ fn cmd_packages_add(packages: &[String], flake_override: Option<&str>) -> color_
         let entry = HomePackageEntry {
             name: name.clone(),
             flake: flake_override.map(str::to_owned),
+            added_at: Some(provenance_timestamp()),
+            added_by: Some(provenance_caller()),
         };
 
         // Compute the installable before mutating manifest.
@@ -498,7 +503,7 @@ fn cmd_packages_missing(packages: &[String]) -> color_eyre::Result<()> {
     Ok(())
 }
 
-fn cmd_packages_list(json_output: bool) -> color_eyre::Result<()> {
+fn cmd_packages_list(json_output: bool, verbose: bool) -> color_eyre::Result<()> {
     let manifest = HomePackages::load()?;
 
     if json_output {
@@ -515,13 +520,38 @@ fn cmd_packages_list(json_output: bool) -> color_eyre::Result<()> {
         return Ok(());
     }
 
-    for entry in &manifest.packages {
-        let flake_display = entry.flake.as_deref().unwrap_or(&manifest.flake);
+    if verbose {
         println!(
-            "  {} {}",
-            entry.name.bold(),
-            format!("({flake_display})").dim()
+            "{:<24} {:<16} {:<20} {}",
+            "NAME".bold(),
+            "ADDED".bold(),
+            "BY".bold(),
+            "FLAKE".bold()
         );
+        for entry in &manifest.packages {
+            let flake_display = entry.flake.as_deref().unwrap_or(&manifest.flake);
+            let added = entry.added_at.as_deref().unwrap_or("-");
+            // Show just the date portion for compactness.
+            let added_short = if added.len() >= 10 {
+                &added[..10]
+            } else {
+                added
+            };
+            let by = entry.added_by.as_deref().unwrap_or("-");
+            println!(
+                "{:<24} {added_short:<16} {by:<20} {flake_display}",
+                entry.name
+            );
+        }
+    } else {
+        for entry in &manifest.packages {
+            let flake_display = entry.flake.as_deref().unwrap_or(&manifest.flake);
+            println!(
+                "  {} {}",
+                entry.name.bold(),
+                format!("({flake_display})").dim()
+            );
+        }
     }
     println!("\n{} package(s)", manifest.packages.len());
 
