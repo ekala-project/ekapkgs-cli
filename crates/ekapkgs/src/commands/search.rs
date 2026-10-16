@@ -189,32 +189,41 @@ fn cmd_packages(
     let data = load_or_generate_index(&index_name, || generate_package_index(flake))?;
     let entries: Vec<PackageSearchEntry> = serde_json::from_slice(&data)?;
 
-    let query_lower = query.to_lowercase();
-    let mut results: Vec<(u8, &PackageSearchEntry)> = entries
-        .iter()
-        .filter_map(|e| {
-            let attr_lower = e.attr.to_lowercase();
-            let pname_lower = e.pname.to_lowercase();
-            let desc_lower = e.description.to_lowercase();
+    // When the query is empty, return all packages (useful for piping to fzf).
+    // Override the limit to unlimited so `search packages` lists everything.
+    let effective_limit = if query.is_empty() { 0 } else { limit };
 
-            // Score: 0 = exact, 1 = prefix, 2 = contains, 3 = desc contains
-            if pname_lower == query_lower {
-                Some((0, e))
-            } else if pname_lower.starts_with(&query_lower) {
-                Some((1, e))
-            } else if attr_lower.contains(&query_lower) || pname_lower.contains(&query_lower) {
-                Some((2, e))
-            } else if desc_lower.contains(&query_lower) {
-                Some((3, e))
-            } else {
-                None
-            }
-        })
-        .collect();
+    let query_lower = query.to_lowercase();
+    let mut results: Vec<(u8, &PackageSearchEntry)> = if query.is_empty() {
+        // Empty query: return all entries with score 0 (sorted by name later).
+        entries.iter().map(|e| (0u8, e)).collect()
+    } else {
+        entries
+            .iter()
+            .filter_map(|e| {
+                let attr_lower = e.attr.to_lowercase();
+                let pname_lower = e.pname.to_lowercase();
+                let desc_lower = e.description.to_lowercase();
+
+                // Score: 0 = exact, 1 = prefix, 2 = contains, 3 = desc contains
+                if pname_lower == query_lower {
+                    Some((0, e))
+                } else if pname_lower.starts_with(&query_lower) {
+                    Some((1, e))
+                } else if attr_lower.contains(&query_lower) || pname_lower.contains(&query_lower) {
+                    Some((2, e))
+                } else if desc_lower.contains(&query_lower) {
+                    Some((3, e))
+                } else {
+                    None
+                }
+            })
+            .collect()
+    };
 
     // If substring matching found few results, add fuzzy matches as tier 4.
-    if !query.is_empty() && results.len() < limit.max(1) {
-        let fuzzy = fuzzy_match_entries(&entries, query, limit);
+    if !query.is_empty() && results.len() < effective_limit.max(1) {
+        let fuzzy = fuzzy_match_entries(&entries, query, effective_limit);
         for (_, e) in &fuzzy {
             if !results.iter().any(|(_, r)| std::ptr::eq(*r, *e)) {
                 results.push((4, e));
@@ -223,8 +232,8 @@ fn cmd_packages(
     }
 
     results.sort_by_key(|(score, e)| (*score, e.pname.clone()));
-    if limit > 0 {
-        results.truncate(limit);
+    if effective_limit > 0 {
+        results.truncate(effective_limit);
     }
 
     if json_output {
