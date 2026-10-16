@@ -678,7 +678,7 @@ fn cmd_status(json_output: bool) -> color_eyre::Result<()> {
         println!("{}: {}", "Active".bold(), "yes".bold());
         println!("{}: {env_dir}", "Directory".dim());
     } else {
-        println!("{}: {}", "Active".bold(), "no (shell hook not active)");
+        println!("{}: no (shell hook not active)", "Active".bold());
     }
 
     if has_manifest {
