@@ -1349,9 +1349,16 @@ fn generate_direct_unit_file(
         format!("{resolved} {args}")
     };
 
+    let stop_signal = entry
+        .config
+        .get("stop_signal")
+        .and_then(|v| v.as_str())
+        .unwrap_or("SIGTERM");
+
     let unit = format!(
         "[Unit]\nDescription={description}\n\n[Service]\nType=simple\nExecStart={exec_start}\\
-         nRestart=on-failure\nRestartSec=5\n\n[Install]\nWantedBy=default.target\n"
+         nRestart=on-failure\nRestartSec=5\nKillSignal={stop_signal}\n\n[Install]\\
+         nWantedBy=default.target\n"
     );
 
     Ok(unit)

@@ -725,6 +725,12 @@ pub struct EnvServiceEntry {
     pub port: Option<u16>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub working_dir: Option<String>,
+    /// Health check command to verify the service is ready.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub health_check: Option<String>,
+    /// Signal to send when stopping the service (e.g., SIGTERM, SIGQUIT).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_signal: Option<String>,
 }
 
 impl EnvServices {
@@ -793,6 +799,30 @@ impl EnvServices {
                 .replace("$PROJECT_ROOT", &root_str);
             lines.push(format!("    working_dir: \"{}\"", working_dir));
             lines.push("    restart: on_failure".to_owned());
+            if let Some(ref hc) = svc.health_check {
+                let hc = hc.replace("$PROJECT_ROOT", &root_str);
+                lines.push("    readiness_probe:".to_owned());
+                lines.push(format!(
+                    "      exec:
+        command: \"{}\"",
+                    hc.replace('"', "\\\"")
+                ));
+                lines.push("      initial_delay_seconds: 2".to_owned());
+                lines.push("      period_seconds: 5".to_owned());
+            }
+            if let Some(ref sig) = svc.stop_signal {
+                // Map signal names to numeric values for process-compose.
+                let sig_num = match sig.as_str() {
+                    "SIGTERM" => "15",
+                    "SIGINT" => "2",
+                    "SIGQUIT" => "3",
+                    "SIGHUP" => "1",
+                    "SIGKILL" => "9",
+                    other => other,
+                };
+                lines.push("    shutdown:".to_owned());
+                lines.push(format!("      signal: {sig_num}"));
+            }
         }
         lines.join("\n")
     }

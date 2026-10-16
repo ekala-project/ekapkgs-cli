@@ -381,6 +381,8 @@ fn cmd_services_add(
         description: String::new(),
         port: None,
         working_dir: None,
+        health_check: None,
+        stop_signal: None,
     };
 
     // Apply template defaults.
@@ -393,6 +395,8 @@ fn cmd_services_add(
         entry.args = tmpl.args.to_owned();
         entry.description = tmpl.description.to_owned();
         entry.port = Some(tmpl.port);
+        entry.health_check = tmpl.health_check.map(str::to_owned);
+        entry.stop_signal = Some(tmpl.stop_signal.to_owned());
         // Use $PROJECT_ROOT for data — expanded at YAML generation time.
         entry.working_dir = Some(format!("$PROJECT_ROOT/.dev/data/{}", tmpl.data_dir));
     }
@@ -427,6 +431,21 @@ fn cmd_services_add(
         return Err(color_eyre::eyre::eyre!(
             "Service command is required. Use --template or --set command=<cmd>"
         ));
+    }
+
+    // Check for port conflicts with existing env services and system listeners.
+    if let Some(port) = entry.port {
+        for existing in &manifest.services {
+            if existing.port == Some(port) {
+                tracing::warn!(
+                    "Port {port} conflicts with existing service '{}'",
+                    existing.name
+                );
+            }
+        }
+        if std::net::TcpListener::bind(("127.0.0.1", port)).is_err() {
+            tracing::warn!("Port {port} is already in use by another process");
+        }
     }
 
     manifest.add(entry);
