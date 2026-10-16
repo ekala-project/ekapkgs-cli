@@ -154,6 +154,12 @@ pub enum Command {
         command: EnvCommand,
     },
 
+    /// Show status across all scopes.
+    Status {
+        #[command(subcommand)]
+        command: StatusCommand,
+    },
+
     /// Check system health and configuration.
     Doctor,
 
@@ -738,12 +744,19 @@ pub enum HomeServicesCommand {
         #[arg(add = ArgValueCompleter::new(compl::complete_services))]
         service: String,
 
+        /// Use a well-known service template with sane defaults.
+        ///
+        /// Available templates: redis, postgres, mysql, mongodb,
+        /// rabbitmq, nats, minio, nginx, caddy, memcached, clickhouse.
+        #[arg(long)]
+        template: Option<String>,
+
         /// Flake to resolve the service package from.
         #[arg(long)]
         flake: Option<String>,
 
         /// Set configuration options inline (e.g., `--set ports.http.port=8080`).
-        /// Can be repeated.
+        /// Can be repeated. When used with --template, overrides template defaults.
         #[arg(long = "set", value_name = "KEY=VALUE")]
         sets: Vec<String>,
 
@@ -761,6 +774,10 @@ pub enum HomeServicesCommand {
         /// Only update the manifest without stopping or uninstalling.
         #[arg(long)]
         no_apply: bool,
+
+        /// Also delete data directories (e.g., `~/.local/share/<service>/`).
+        #[arg(long)]
+        purge: bool,
     },
 
     /// Set a configuration option on a service.
@@ -906,11 +923,27 @@ pub enum HomeServicesCommand {
         json: bool,
     },
 
-    /// Regenerate the cached service options schema.
+    /// Update services: re-resolve binaries to latest versions and restart.
+    ///
+    /// Re-runs `nix build` for each service's package to pick up newer
+    /// versions from the flake inputs, regenerates unit files with the
+    /// new store paths, and restarts affected services.
+    ///
+    /// Use `--schema-only` to only refresh the options schema cache
+    /// without touching running services.
     Update {
         /// Flake reference to evaluate services from.
         #[arg(long, default_value = ".")]
         flake: String,
+
+        /// Only refresh the service options schema, don't re-resolve
+        /// binaries or restart services.
+        #[arg(long)]
+        schema_only: bool,
+
+        /// Suppress stdout; only print to stderr on failure.
+        #[arg(long = "silent")]
+        silent: bool,
     },
 }
 
@@ -1287,8 +1320,28 @@ pub enum EnvCommand {
         rev: Option<String>,
     },
 
+    /// Manage dev-shell-scoped services via process-compose.
+    Services {
+        #[command(subcommand)]
+        command: EnvServicesCommand,
+    },
+
     /// List packages and flakes in the directory environment.
     List {
+        /// Output as JSON.
+        #[arg(long)]
+        json: bool,
+
+        /// Also show services from the dev shell's process-compose config.
+        #[arg(long)]
+        services: bool,
+    },
+
+    /// Show the status of the current directory environment.
+    ///
+    /// Reports whether an environment is active, its manifest path,
+    /// trust status, and the number of packages and flakes.
+    Status {
         /// Output as JSON.
         #[arg(long)]
         json: bool,
@@ -1296,6 +1349,13 @@ pub enum EnvCommand {
 
     /// Rebuild the environment profile from the current manifest and flake state.
     Reload,
+
+    /// Remove cached profiles and rendered environments for the current directory.
+    ///
+    /// Deletes the `.dev/` directory (if present) and the cached nix profile
+    /// and rendered env scripts. Useful for cleaning up after removing a
+    /// dev shell or to force a full rebuild.
+    Clean,
 
     /// Allow the environment in the current directory.
     ///
@@ -1366,6 +1426,51 @@ pub enum EnvCommand {
         /// Shell type to render for.
         #[arg(value_enum)]
         shell: EnvHookShell,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum EnvServicesCommand {
+    /// Add a service to the dev shell environment.
+    Add {
+        /// Service name.
+        service: String,
+
+        /// Use a well-known service template with sane defaults.
+        #[arg(long)]
+        template: Option<String>,
+
+        /// Set configuration options inline (e.g., `--set command=valkey-server`).
+        #[arg(long = "set", value_name = "KEY=VALUE")]
+        sets: Vec<String>,
+    },
+
+    /// Remove a service from the dev shell environment.
+    Remove {
+        /// Service names to remove.
+        #[arg(required = true)]
+        services: Vec<String>,
+    },
+
+    /// List services in the dev shell environment.
+    List {
+        /// Output as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Show status of dev shell services.
+    Status {
+        /// Output as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Restart dev shell services.
+    Restart {
+        /// Service names to restart.
+        #[arg(required = true)]
+        services: Vec<String>,
     },
 }
 
@@ -1557,6 +1662,16 @@ pub enum FuseCommand {
         /// Mount point to check.
         #[arg(long, default_value = "/usr/lib")]
         mountpoint: String,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum StatusCommand {
+    /// Show all managed services across scopes (home, env, system).
+    Services {
+        /// Output as JSON.
+        #[arg(long)]
+        json: bool,
     },
 }
 

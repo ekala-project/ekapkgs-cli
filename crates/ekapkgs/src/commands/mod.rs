@@ -17,6 +17,7 @@ mod run;
 mod sbom;
 pub(crate) mod search;
 mod shell;
+mod status;
 mod store;
 mod substituter;
 mod system;
@@ -56,6 +57,7 @@ pub fn run(command: Command) -> color_eyre::Result<()> {
         Command::Log { installable } => log::execute(&installable),
         Command::DryRun { installable, extra } => dry_run::execute(&installable, &extra),
         Command::Env { command } => env::execute(command),
+        Command::Status { command } => status::execute(command),
         Command::Doctor => doctor::execute(),
         Command::Substituter { port, upstream } => substituter::execute(port, upstream),
         Command::Wtf {

@@ -662,13 +662,22 @@ fn cmd_services(command: HomeServicesCommand) -> color_eyre::Result<()> {
     match command {
         HomeServicesCommand::Add {
             service,
+            template,
             flake,
             sets,
             no_apply,
-        } => cmd_services_add(&service, flake.as_deref(), &sets, no_apply),
-        HomeServicesCommand::Remove { services, no_apply } => {
-            cmd_services_remove(&services, no_apply)
-        },
+        } => cmd_services_add(
+            &service,
+            template.as_deref(),
+            flake.as_deref(),
+            &sets,
+            no_apply,
+        ),
+        HomeServicesCommand::Remove {
+            services,
+            no_apply,
+            purge,
+        } => cmd_services_remove(&services, no_apply, purge),
         HomeServicesCommand::Set {
             service,
             key,
@@ -697,7 +706,11 @@ fn cmd_services(command: HomeServicesCommand) -> color_eyre::Result<()> {
         HomeServicesCommand::Schema { service, json } => {
             cmd_services_schema(service.as_deref(), json)
         },
-        HomeServicesCommand::Update { flake } => cmd_services_update(&flake),
+        HomeServicesCommand::Update {
+            flake,
+            schema_only,
+            silent,
+        } => cmd_services_update(&flake, schema_only, silent),
     }
 }
 
@@ -705,6 +718,7 @@ fn cmd_services(command: HomeServicesCommand) -> color_eyre::Result<()> {
 
 fn cmd_services_add(
     service: &str,
+    template_name: Option<&str>,
     flake: Option<&str>,
     sets: &[String],
     no_apply: bool,
@@ -724,7 +738,16 @@ fn cmd_services_add(
         config: toml::Table::new(),
     };
 
-    // Apply --set key=value pairs
+    // Apply template defaults if specified.
+    if let Some(tmpl_name) = template_name {
+        let tmpl = crate::service_templates::find_template(tmpl_name).ok_or_else(|| {
+            let available = crate::service_templates::template_names().join(", ");
+            color_eyre::eyre::eyre!("Unknown template '{tmpl_name}'. Available: {available}")
+        })?;
+        crate::service_templates::apply_template(tmpl, &mut entry.config);
+    }
+
+    // Apply --set key=value pairs (overrides template defaults).
     for kv in sets {
         let (key, value) = kv.split_once('=').ok_or_else(|| {
             color_eyre::eyre::eyre!("Invalid --set format '{kv}': expected KEY=VALUE")
@@ -732,6 +755,9 @@ fn cmd_services_add(
         let toml_value = parse_toml_value(value);
         entry.set_config(key, toml_value);
     }
+
+    // Check for port conflicts before adding.
+    check_port_conflicts(&entry.config, &manifest);
 
     manifest.add(entry);
     manifest.save()?;
@@ -749,7 +775,7 @@ fn cmd_services_add(
     Ok(())
 }
 
-fn cmd_services_remove(services: &[String], no_apply: bool) -> color_eyre::Result<()> {
+fn cmd_services_remove(services: &[String], no_apply: bool, purge: bool) -> color_eyre::Result<()> {
     let (mut manifest, _lock) = HomeServices::load_locked()?;
     let mut removed = 0u32;
 
@@ -764,9 +790,25 @@ fn cmd_services_remove(services: &[String], no_apply: bool) -> color_eyre::Resul
     manifest.save()?;
 
     if removed > 0 {
+        // Remove GC roots for removed services so their store paths
+        // can be garbage collected.
+        for name in services {
+            remove_service_gcroot(name);
+        }
+
         println!("Removed {removed} service(s)");
         if !no_apply {
             cmd_services_apply(false)?;
+        }
+        if purge {
+            let home = home_dir()?;
+            for name in services {
+                let data_dir = home.join(".local/share").join(name);
+                if data_dir.exists() {
+                    std::fs::remove_dir_all(&data_dir)?;
+                    println!("Purged data directory: {}", data_dir.display());
+                }
+            }
         }
     }
 
@@ -963,7 +1005,7 @@ fn installed_managed_unit_files() -> color_eyre::Result<Vec<String>> {
     Ok(files)
 }
 
-fn cmd_services_apply(dry_run: bool) -> color_eyre::Result<()> {
+fn cmd_services_apply_quiet(dry_run: bool, silent: bool) -> color_eyre::Result<()> {
     let manifest = HomeServices::load()?;
     let enabled: Vec<_> = manifest.services.iter().filter(|s| s.enable).collect();
 
@@ -989,7 +1031,9 @@ fn cmd_services_apply(dry_run: bool) -> color_eyre::Result<()> {
         .collect();
 
     if enabled.is_empty() && to_remove.is_empty() {
-        println!("No services to apply.");
+        if !silent {
+            println!("No services to apply.");
+        }
         return Ok(());
     }
 
@@ -1055,38 +1099,75 @@ fn cmd_services_apply(dry_run: bool) -> color_eyre::Result<()> {
                 }
             }
         }
-        println!("  Removed {}", name.bold());
+        if !silent {
+            println!("  Removed {}", name.bold());
+        }
     }
 
-    // Phase 2: Build unit files for enabled services
+    // Phase 2: Build/generate unit files for enabled services.
+    //
+    // Two strategies:
+    //   (a) Direct: services that have `command` in their config get a
+    //       systemd unit file generated directly — no Nix needed.
+    //   (b) Nix builder: services without `command` go through the flake's
+    //       `services/default.nix` infrastructure for full Nix evaluation.
+    //
+    // Both paths produce unit files in a temporary directory that Phase 3
+    // installs into ~/.config/systemd/user/.
     if !enabled.is_empty() {
-        let nix_expr = build_services_nix_expr(&manifest)?;
+        let direct_services: Vec<&HomeServiceEntry> = enabled
+            .iter()
+            .filter(|e| e.config.get("command").and_then(|v| v.as_str()).is_some())
+            .copied()
+            .collect();
+        let nix_services: Vec<&HomeServiceEntry> = enabled
+            .iter()
+            .filter(|e| e.config.get("command").and_then(|v| v.as_str()).is_none())
+            .copied()
+            .collect();
 
-        let spinner = ekapkgs_ui::progress::spinner("Building service unit files...");
-        let output = NixCommand::new(&["build"])
-            .arg("--no-link")
-            .arg("--json")
-            .arg("--impure")
-            .arg("--expr")
-            .arg(&nix_expr)
-            .output();
-        spinner.finish_and_clear();
+        let tmp_dir = tempfile::TempDir::new()?;
+        let built_dir = tmp_dir.path();
 
-        let output = output?;
-        let builds: Vec<BuildOutput> = serde_json::from_slice(&output.stdout)?;
+        // (a) Generate unit files directly for services with `command`.
+        for entry in &direct_services {
+            let unit_contents = generate_direct_unit_file(entry, &manifest.flake)?;
+            let unit_path = built_dir.join(format!("{}.service", entry.name));
+            std::fs::write(&unit_path, unit_contents)?;
+        }
 
-        let store_path = builds
-            .first()
-            .and_then(|b| b.outputs.get("out").cloned())
-            .ok_or_else(|| color_eyre::eyre::eyre!("nix build produced no output"))?;
+        // (b) Build via Nix for services that need the builder infra.
+        if !nix_services.is_empty() {
+            let nix_expr = build_services_nix_expr(&manifest)?;
 
-        // Phase 3: Install unit files — copy all managed unit types from
-        // the build output, not just .service files.
-        let built_dir = std::path::Path::new(&store_path);
+            let spinner = ekapkgs_ui::progress::spinner("Building service unit files...");
+            let output = NixCommand::new(&["build"])
+                .arg("--no-link")
+                .arg("--json")
+                .arg("--impure")
+                .arg("--expr")
+                .arg(&nix_expr)
+                .output();
+            spinner.finish_and_clear();
 
-        // Collect the set of logical service names that own each unit file
-        // built in this derivation, so we can tag unit files with their
-        // owning service in the marker comment.
+            let output = output?;
+            let builds: Vec<BuildOutput> = serde_json::from_slice(&output.stdout)?;
+
+            let store_path = builds
+                .first()
+                .and_then(|b| b.outputs.get("out").cloned())
+                .ok_or_else(|| color_eyre::eyre::eyre!("nix build produced no output"))?;
+
+            // Copy Nix-built unit files into the temp dir alongside direct ones.
+            for fs_entry in std::fs::read_dir(&store_path)?.flatten() {
+                let file_name = fs_entry.file_name().to_string_lossy().into_owned();
+                if is_managed_unit_file(&file_name) {
+                    std::fs::copy(fs_entry.path(), built_dir.join(&file_name))?;
+                }
+            }
+        }
+
+        // Phase 3: Install unit files from the temp dir.
         let enabled_names: std::collections::HashSet<&str> =
             enabled.iter().map(|e| e.name.as_str()).collect();
 
@@ -1096,7 +1177,6 @@ fn cmd_services_apply(dry_run: bool) -> color_eyre::Result<()> {
                 continue;
             }
 
-            // Determine which logical service this unit file belongs to.
             let base = strip_unit_suffix(&file_name);
             let owning_service = enabled_names
                 .iter()
@@ -1104,9 +1184,6 @@ fn cmd_services_apply(dry_run: bool) -> color_eyre::Result<()> {
                 .copied()
                 .unwrap_or(base);
 
-            // Read the built unit file and prepend our managed marker with
-            // the owning service name so installed_managed_units() can map
-            // unit files back to logical services.
             let unit_contents = std::fs::read_to_string(fs_entry.path())?;
             let marked_contents =
                 format!("{MANAGED_MARKER} service={owning_service}\n{unit_contents}");
@@ -1115,24 +1192,24 @@ fn cmd_services_apply(dry_run: bool) -> color_eyre::Result<()> {
             let is_new = !dest.exists();
             std::fs::write(&dest, marked_contents)?;
 
-            if is_new {
-                println!("  Installed {}", file_name.bold());
-            } else {
-                println!("  Updated {}", file_name.bold());
+            if !silent {
+                if is_new {
+                    println!("  Installed {}", file_name.bold());
+                } else {
+                    println!("  Updated {}", file_name.bold());
+                }
             }
         }
 
-        // Remove managed unit files that were previously installed for
-        // desired services but are no longer produced by the build (e.g. a
-        // service dropped its socket unit).
+        // Remove stale managed unit files no longer produced by the build.
         for file_name in &existing_unit_files {
             let base = strip_unit_suffix(file_name);
             let belongs_to_desired = enabled_names
                 .iter()
                 .any(|&svc| base == svc || base.starts_with(&format!("{svc}-")));
             if belongs_to_desired {
-                let built_path = built_dir.join(file_name);
-                if !built_path.exists() {
+                let new_path = built_dir.join(file_name);
+                if !new_path.exists() {
                     let unit_path = unit_dir.join(file_name);
                     if unit_path.exists() {
                         let _ = std::process::Command::new("systemctl")
@@ -1146,7 +1223,9 @@ fn cmd_services_apply(dry_run: bool) -> color_eyre::Result<()> {
                             .stderr(Stdio::null())
                             .status();
                         std::fs::remove_file(&unit_path)?;
-                        println!("  Removed stale {}", file_name.bold());
+                        if !silent {
+                            println!("  Removed stale {}", file_name.bold());
+                        }
                     }
                 }
             }
@@ -1162,103 +1241,50 @@ fn cmd_services_apply(dry_run: bool) -> color_eyre::Result<()> {
 
         let mut failed_services: Vec<String> = Vec::new();
         for entry in &enabled {
-            // Collect all unit files produced for this service
-            let mut service_units = Vec::new();
-            let mut socket_units = Vec::new();
-            let mut timer_units = Vec::new();
+            let unit_name = format!("{}.service", entry.name);
 
-            for fs_entry in std::fs::read_dir(built_dir)?.flatten() {
-                let fname = fs_entry.file_name().to_string_lossy().into_owned();
-                let fbase = strip_unit_suffix(&fname);
-                if fbase == entry.name || fbase.starts_with(&format!("{}-", entry.name)) {
-                    if fname.ends_with(".socket") {
-                        socket_units.push(fname);
-                    } else if fname.ends_with(".timer") {
-                        timer_units.push(fname);
-                    } else if fname.ends_with(".service") {
-                        service_units.push(fname);
-                    }
-                }
-            }
+            let _ = std::process::Command::new("systemctl")
+                .args(["--user", "enable", &unit_name])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
 
-            // Enable all units for this service
-            for unit in service_units
-                .iter()
-                .chain(socket_units.iter())
-                .chain(timer_units.iter())
-            {
-                let _ = std::process::Command::new("systemctl")
-                    .args(["--user", "enable", unit])
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .status();
-            }
-
-            // Start strategy: if there are socket units, start those (the
-            // service will be socket-activated). If there are timer units,
-            // start those. Always also restart the .service if no sockets
-            // or timers trigger it.
-            let mut any_failed = false;
-
-            if !socket_units.is_empty() {
-                // Socket-activated: start socket units, restart service
-                for unit in &socket_units {
-                    let status = std::process::Command::new("systemctl")
-                        .args(["--user", "restart", unit])
-                        .stdout(Stdio::null())
-                        .stderr(Stdio::null())
-                        .status();
-                    if !matches!(status, Ok(s) if s.success()) {
-                        any_failed = true;
-                    }
-                }
-                // Also restart the service itself so it picks up new config
-                for unit in &service_units {
+            // Also enable/start any companion socket/timer units.
+            for suffix in &[".socket", ".timer"] {
+                let companion = format!("{}{suffix}", entry.name);
+                if built_dir.join(&companion).exists() {
                     let _ = std::process::Command::new("systemctl")
-                        .args(["--user", "restart", unit])
+                        .args(["--user", "enable", &companion])
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .status();
+                    let _ = std::process::Command::new("systemctl")
+                        .args(["--user", "restart", &companion])
                         .stdout(Stdio::null())
                         .stderr(Stdio::null())
                         .status();
                 }
-            } else {
-                // No sockets — start the service directly
-                for unit in &service_units {
-                    let status = std::process::Command::new("systemctl")
-                        .args(["--user", "restart", unit])
-                        .stdout(Stdio::null())
-                        .stderr(Stdio::null())
-                        .status();
-                    if !matches!(status, Ok(s) if s.success()) {
-                        any_failed = true;
-                    }
-                }
             }
 
-            // Start timer units
-            for unit in &timer_units {
-                let status = std::process::Command::new("systemctl")
-                    .args(["--user", "restart", unit])
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .status();
-                if !matches!(status, Ok(s) if s.success()) {
-                    any_failed = true;
-                }
-            }
+            let status = std::process::Command::new("systemctl")
+                .args(["--user", "restart", &unit_name])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
 
-            if any_failed {
-                failed_services.push(entry.name.clone());
-            } else {
+            if matches!(status, Ok(s) if s.success()) {
                 tracing::info!("Started {}", entry.name);
+            } else {
+                failed_services.push(entry.name.clone());
             }
         }
 
         if !failed_services.is_empty() {
-            println!("Services applied with {} error(s):", failed_services.len());
+            eprintln!("Services applied with {} error(s):", failed_services.len());
             for name in &failed_services {
-                println!(
-                    "  {} failed to start — check logs with `ekapkgs home services logs {name}`",
-                    name.bold()
+                eprintln!(
+                    "  {name} failed to start — check logs with `ekapkgs home services logs \
+                     {name}`"
                 );
             }
             return Err(color_eyre::eyre::eyre!(
@@ -1275,8 +1301,170 @@ fn cmd_services_apply(dry_run: bool) -> color_eyre::Result<()> {
             .status();
     }
 
-    println!("Services applied.");
+    if !silent {
+        println!("Services applied.");
+    }
     Ok(())
+}
+
+/// Convenience wrapper — non-silent apply used by add/remove/enable/disable.
+fn cmd_services_apply(dry_run: bool) -> color_eyre::Result<()> {
+    cmd_services_apply_quiet(dry_run, false)
+}
+
+/// Generate a systemd unit file directly from a service entry's config.
+///
+/// This avoids Nix evaluation entirely — suitable for services whose config
+/// has an explicit `command` (e.g., those added via `--template`).
+fn generate_direct_unit_file(
+    entry: &HomeServiceEntry,
+    manifest_flake: &str,
+) -> color_eyre::Result<String> {
+    let command = entry
+        .config
+        .get("command")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| color_eyre::eyre::eyre!("Service '{}' has no command", entry.name))?;
+
+    let args = entry
+        .config
+        .get("args")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+
+    let description = entry
+        .config
+        .get("description")
+        .and_then(|v| v.as_str())
+        .unwrap_or(&entry.name);
+
+    // Resolve the command to an absolute path. Falls back to nix build
+    // to fetch the binary from the store if it's not on PATH. Creates a
+    // GC root so the store path survives garbage collection.
+    let flake = entry.flake.as_deref().unwrap_or(manifest_flake);
+    let resolved = resolve_command_path(&entry.name, command, Some(flake));
+    let exec_start = if args.is_empty() {
+        resolved
+    } else {
+        format!("{resolved} {args}")
+    };
+
+    let unit = format!(
+        "[Unit]\nDescription={description}\n\n[Service]\nType=simple\nExecStart={exec_start}\\
+         nRestart=on-failure\nRestartSec=5\n\n[Install]\nWantedBy=default.target\n"
+    );
+
+    Ok(unit)
+}
+
+/// Resolve a command name to its absolute path.
+///
+/// Tries in order: already absolute, PATH lookup, nix build from the
+/// service's flake (or nixpkgs). The nix build path ensures the binary
+/// is in the store even if it's not on the user's PATH, and creates a
+/// GC root to prevent it from being garbage collected.
+fn resolve_command_path(service_name: &str, command: &str, flake: Option<&str>) -> String {
+    if command.starts_with('/') {
+        return command.to_owned();
+    }
+    if let Ok(path) = which::which(command) {
+        return path.to_string_lossy().into_owned();
+    }
+
+    let flake_ref = flake.unwrap_or("nixpkgs");
+
+    if let Ok(path) = resolve_command_via_nix(service_name, command, flake_ref) {
+        return path;
+    }
+
+    command.to_owned()
+}
+
+/// Directory for service GC root symlinks. Each symlink points to a nix
+/// store path used by a managed service, preventing garbage collection.
+fn service_gcroots_dir() -> color_eyre::Result<std::path::PathBuf> {
+    let config_dir = directories::ProjectDirs::from("", "", "ekapkgs")
+        .map(|d| d.config_dir().to_path_buf())
+        .unwrap_or_else(|| {
+            let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+            std::path::PathBuf::from(home).join(".config/ekapkgs")
+        });
+    let dir = config_dir.join("service-roots");
+    std::fs::create_dir_all(&dir)?;
+    Ok(dir)
+}
+
+/// Build a package via nix and return the absolute path to its binary.
+///
+/// Creates a GC root symlink in the service-roots directory so the store
+/// path is not garbage collected while the service is configured.
+fn resolve_command_via_nix(
+    service_name: &str,
+    command: &str,
+    flake: &str,
+) -> color_eyre::Result<String> {
+    // Try common package names that provide this command.
+    let package_candidates = match command {
+        "valkey-server" | "valkey-cli" => vec!["valkey"],
+        "redis-server" | "redis-cli" => vec!["redis"],
+        "postgres" | "pg_isready" => vec!["postgresql"],
+        "mariadbd" | "mariadb-admin" => vec!["mariadb"],
+        "mongod" => vec!["mongodb"],
+        "rabbitmq-server" | "rabbitmq-diagnostics" => vec!["rabbitmq-server"],
+        "nats-server" => vec!["nats-server"],
+        "caddy" => vec!["caddy"],
+        "nginx" => vec!["nginx"],
+        "memcached" => vec!["memcached"],
+        "clickhouse-server" => vec!["clickhouse"],
+        other => vec![other],
+    };
+
+    let gcroots = service_gcroots_dir()?;
+    let gcroot_path = gcroots.join(service_name);
+
+    for package in &package_candidates {
+        let installable = format!("{flake}#{package}");
+        tracing::info!("Resolving {command} via {installable}...");
+
+        // Use --out-link to create a GC root symlink that prevents the
+        // store path from being garbage collected.
+        let result: Result<Vec<BuildOutput>, _> = NixCommand::new(&["build"])
+            .arg(&installable)
+            .arg("--out-link")
+            .arg(gcroot_path.to_str().unwrap_or("result"))
+            .arg("--json")
+            .json();
+
+        if let Ok(outputs) = result {
+            if let Some(store_path) = outputs.first().and_then(|o| o.outputs.get("out")) {
+                let bin_path = format!("{store_path}/bin/{command}");
+                if std::path::Path::new(&bin_path).exists() {
+                    return Ok(bin_path);
+                }
+                // Check sbin too.
+                let sbin_path = format!("{store_path}/sbin/{command}");
+                if std::path::Path::new(&sbin_path).exists() {
+                    return Ok(sbin_path);
+                }
+            }
+        }
+    }
+
+    Err(color_eyre::eyre::eyre!(
+        "Could not resolve command '{command}' from {flake}"
+    ))
+}
+
+/// Remove the GC root for a service, allowing its store paths to be
+/// garbage collected.
+fn remove_service_gcroot(service_name: &str) {
+    if let Ok(gcroots) = service_gcroots_dir() {
+        let gcroot_path = gcroots.join(service_name);
+        if gcroot_path.exists() || gcroot_path.is_symlink() {
+            let _ = std::fs::remove_file(&gcroot_path);
+            tracing::debug!("Removed GC root for {service_name}");
+        }
+    }
 }
 
 /// Build the nix expression that produces a derivation containing all service
@@ -1652,6 +1840,38 @@ fn cmd_services_inspect(service: &str, json_output: bool) -> color_eyre::Result<
         HomeServices::manifest_path().display()
     );
 
+    // Show runtime status.
+    let status = query_systemd_status(service);
+    println!(
+        "  {}: {} {}",
+        "Status".dim(),
+        status.active_state,
+        status.pid.map(|p| format!("(PID {p})")).unwrap_or_default()
+    );
+
+    // Show connection info derived from port config and service name.
+    let ports = extract_ports(&entry.config);
+    if !ports.is_empty() {
+        println!();
+        println!("  {}:", "Connection".bold());
+        for port in &ports {
+            let protocol = infer_service_protocol(service);
+            let url = format!("{protocol}://127.0.0.1:{port}");
+            println!("    {}: {url}", "URL".dim());
+        }
+    }
+
+    // Show data directory if it exists.
+    if let Ok(home) = home_dir() {
+        let data_dir = home.join(".local/share").join(service);
+        if data_dir.exists() {
+            println!("    {}: {}", "Data".dim(), data_dir.display());
+        }
+    }
+
+    // Show log hint.
+    println!("    {}: ekapkgs home services logs {service}", "Logs".dim());
+
     if !entry.config.is_empty() {
         println!();
         println!("  {}:", "Configuration".bold());
@@ -1659,6 +1879,19 @@ fn cmd_services_inspect(service: &str, json_output: bool) -> color_eyre::Result<
     }
 
     Ok(())
+}
+
+/// Infer the connection protocol for a service based on its name.
+fn infer_service_protocol(service: &str) -> &'static str {
+    match service {
+        "redis" | "valkey" => "redis",
+        "postgres" | "postgresql" => "postgresql",
+        "mysql" | "mariadb" => "mysql",
+        "mongodb" | "mongod" => "mongodb",
+        "nats" => "nats",
+        "rabbitmq" => "amqp",
+        _ => "tcp",
+    }
 }
 
 fn cmd_services_validate(json_output: bool) -> color_eyre::Result<()> {
@@ -1886,20 +2119,176 @@ fn cmd_services_schema(service: Option<&str>, json_output: bool) -> color_eyre::
     Ok(())
 }
 
-fn cmd_services_update(flake: &str) -> color_eyre::Result<()> {
-    let spinner = ekapkgs_ui::progress::spinner("Generating service options schema...");
-    let schema = crate::service_schema::generate(flake)?;
-    spinner.finish_and_clear();
-    crate::service_schema::write_cache(&schema)?;
-    println!(
-        "Service schema: {} base options, {} services",
-        schema.base.options.len(),
-        schema.services.len(),
-    );
-    Ok(())
+fn cmd_services_update(flake: &str, schema_only: bool, silent: bool) -> color_eyre::Result<()> {
+    if schema_only {
+        // Schema-only mode: regenerate the options schema cache.
+        let spinner = ekapkgs_ui::progress::spinner("Generating service options schema...");
+        let schema = crate::service_schema::generate(flake)?;
+        spinner.finish_and_clear();
+        crate::service_schema::write_cache(&schema)?;
+        if !silent {
+            println!(
+                "Service schema: {} base options, {} services",
+                schema.base.options.len(),
+                schema.services.len(),
+            );
+        }
+        return Ok(());
+    }
+
+    // Optionally refresh schema, but don't fail if the flake doesn't
+    // have a services infrastructure.
+    if !silent {
+        let spinner = ekapkgs_ui::progress::spinner("Refreshing service schema...");
+        match crate::service_schema::generate(flake) {
+            Ok(schema) => {
+                spinner.finish_and_clear();
+                let _ = crate::service_schema::write_cache(&schema);
+            },
+            Err(_) => {
+                spinner.finish_and_clear();
+            },
+        }
+    }
+
+    // Re-resolve binaries and re-apply all enabled services.
+    let manifest = HomeServices::load()?;
+    let direct_services: Vec<&HomeServiceEntry> = manifest
+        .services
+        .iter()
+        .filter(|e| e.enable && e.config.get("command").and_then(|v| v.as_str()).is_some())
+        .collect();
+
+    if direct_services.is_empty() && manifest.services.iter().all(|s| !s.enable) {
+        if !silent {
+            println!("No enabled services to update.");
+        }
+        return Ok(());
+    }
+
+    // Re-resolve each service binary and collect change info.
+    let mut changes: Vec<(String, Option<String>, String)> = Vec::new();
+    for entry in &direct_services {
+        let command = entry
+            .config
+            .get("command")
+            .and_then(|v| v.as_str())
+            .unwrap();
+        let svc_flake = entry.flake.as_deref().unwrap_or(&manifest.flake);
+        let old_path = read_current_exec_start(&entry.name);
+        let new_path = resolve_command_path(&entry.name, command, Some(svc_flake));
+        changes.push((entry.name.clone(), old_path, new_path));
+    }
+
+    if !silent {
+        println!("Re-resolving service binaries...");
+        for (name, old_path, new_path) in &changes {
+            if let Some(old) = old_path {
+                if old == new_path {
+                    println!("  {name} — unchanged");
+                } else {
+                    println!(
+                        "  {name} — {} → {}",
+                        abbreviate_store_path(old),
+                        abbreviate_store_path(new_path)
+                    );
+                }
+            } else {
+                println!("  {name} — resolved to {}", abbreviate_store_path(new_path));
+            }
+        }
+        println!();
+    }
+
+    // Re-apply to regenerate unit files and restart.
+    cmd_services_apply_quiet(false, silent)
+}
+
+/// Read the ExecStart path from a currently installed unit file.
+fn read_current_exec_start(service_name: &str) -> Option<String> {
+    let unit_dir = user_unit_dir().ok()?;
+    let unit_path = unit_dir.join(format!("{service_name}.service"));
+    let contents = std::fs::read_to_string(unit_path).ok()?;
+    for line in contents.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("ExecStart=") {
+            // ExecStart may have arguments — return just the binary path.
+            return Some(rest.split_whitespace().next().unwrap_or(rest).to_owned());
+        }
+    }
+    None
+}
+
+/// Abbreviate a nix store path for display: /nix/store/abc...xyz-name-1.0 → name-1.0
+fn abbreviate_store_path(path: &str) -> &str {
+    // Store paths look like /nix/store/<hash>-<name>
+    // Strip the /nix/store/<hash>- prefix.
+    if let Some(rest) = path.strip_prefix("/nix/store/") {
+        if let Some(pos) = rest.find('-') {
+            return &rest[pos + 1..];
+        }
+    }
+    path
 }
 
 // --- Service helpers ---
+
+/// Extract port numbers from a service config's `ports` table.
+fn extract_ports(config: &toml::Table) -> Vec<u16> {
+    let mut ports = Vec::new();
+    if let Some(toml::Value::Table(ports_table)) = config.get("ports") {
+        for (_name, value) in ports_table {
+            if let Some(table) = value.as_table() {
+                if let Some(port) = table.get("port").and_then(toml::Value::as_integer) {
+                    if let Ok(p) = u16::try_from(port) {
+                        ports.push(p);
+                    }
+                }
+            }
+        }
+    }
+    // Also check a top-level `port` key (common in simple configs).
+    if let Some(port) = config.get("port").and_then(toml::Value::as_integer) {
+        if let Ok(p) = u16::try_from(port) {
+            ports.push(p);
+        }
+    }
+    ports
+}
+
+/// Check if any ports in the new service config conflict with existing
+/// ekapkgs services or system listeners. Emits warnings but does not block.
+fn check_port_conflicts(new_config: &toml::Table, manifest: &HomeServices) {
+    let new_ports = extract_ports(new_config);
+    if new_ports.is_empty() {
+        return;
+    }
+
+    // Check against other ekapkgs-managed services.
+    for existing in &manifest.services {
+        let existing_ports = extract_ports(&existing.config);
+        for port in &new_ports {
+            if existing_ports.contains(port) {
+                tracing::warn!(
+                    "Port {port} conflicts with existing service '{}'",
+                    existing.name
+                );
+            }
+        }
+    }
+
+    // Check if any port is already bound on the system.
+    for port in &new_ports {
+        if is_port_in_use(*port) {
+            tracing::warn!("Port {port} is already in use by another process");
+        }
+    }
+}
+
+/// Check if a TCP port is currently in use by attempting to bind it.
+fn is_port_in_use(port: u16) -> bool {
+    std::net::TcpListener::bind(("127.0.0.1", port)).is_err()
+}
 
 /// Parse a string value into a TOML value, inferring the type.
 fn parse_toml_value(s: &str) -> toml::Value {

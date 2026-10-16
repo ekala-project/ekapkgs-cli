@@ -602,6 +602,210 @@ fn default_devshell() -> String {
 /// Name of the manifest file in a project directory.
 pub const ENV_MANIFEST_NAME: &str = ".ekapkgs-env.toml";
 
+/// Name of the services manifest in the shadow directory.
+pub const ENV_SERVICES_NAME: &str = "services.toml";
+
+// ---------------------------------------------------------------------------
+// Env root resolution & shadow directory
+// ---------------------------------------------------------------------------
+
+/// Resolve the environment root for the current directory.
+///
+/// Tries `git rev-parse --show-toplevel` first to use the git repo root.
+/// Falls back to the current working directory if not in a git repo.
+pub fn resolve_env_root() -> color_eyre::Result<PathBuf> {
+    if let Some(git_root) = git_toplevel() {
+        return Ok(git_root);
+    }
+    std::env::current_dir()
+        .map_err(|e| color_eyre::eyre::eyre!("failed to determine current directory: {e}"))
+}
+
+/// Run `git rev-parse --show-toplevel` and return the path if successful.
+fn git_toplevel() -> Option<PathBuf> {
+    let output = std::process::Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let path = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    if path.is_empty() {
+        return None;
+    }
+    Some(PathBuf::from(path))
+}
+
+/// Compute the shadow directory for a given env root.
+///
+/// Shadow directories live at `~/.config/ekapkgs/shadows/<hash>/` and
+/// store service configs, process-compose YAML, and metadata for
+/// projects that don't have an `.ekapkgs-env.toml` in-tree.
+pub fn shadow_dir(env_root: &Path) -> color_eyre::Result<PathBuf> {
+    let config_dir = directories::ProjectDirs::from("", "", "ekapkgs")
+        .map(|d| d.config_dir().to_path_buf())
+        .unwrap_or_else(|| {
+            let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+            PathBuf::from(home).join(".config/ekapkgs")
+        });
+    let canonical = env_root
+        .canonicalize()
+        .unwrap_or_else(|_| env_root.to_path_buf());
+    let hash = {
+        let h = blake3::hash(canonical.to_string_lossy().as_bytes());
+        h.to_hex().as_str()[..32].to_owned()
+    };
+    let dir = config_dir.join("shadows").join(hash);
+    std::fs::create_dir_all(&dir)?;
+
+    // Write metadata so we can detect out-of-tree usage.
+    let meta_path = dir.join("meta.toml");
+    if !meta_path.exists() {
+        let meta = ShadowMeta {
+            env_root: canonical.to_string_lossy().into_owned(),
+        };
+        let contents = toml::to_string_pretty(&meta)?;
+        atomic_write(&meta_path, &contents)?;
+    }
+
+    Ok(dir)
+}
+
+/// Check if the current env root matches the shadow directory's recorded
+/// root. Returns the stored root path if they differ (out-of-tree).
+pub fn check_out_of_tree(env_root: &Path) -> Option<String> {
+    let dir = shadow_dir(env_root).ok()?;
+    let meta_path = dir.join("meta.toml");
+    let contents = std::fs::read_to_string(meta_path).ok()?;
+    let meta: ShadowMeta = toml::from_str(&contents).ok()?;
+    let canonical = env_root
+        .canonicalize()
+        .unwrap_or_else(|_| env_root.to_path_buf());
+    if meta.env_root != canonical.to_string_lossy().as_ref() {
+        Some(meta.env_root)
+    } else {
+        None
+    }
+}
+
+/// Metadata stored alongside shadow configs for provenance tracking.
+#[derive(Debug, Serialize, Deserialize)]
+struct ShadowMeta {
+    /// The canonical path of the git root this shadow dir was created for.
+    env_root: String,
+}
+
+// ---------------------------------------------------------------------------
+// Env services manifest (stored in shadow dir)
+// ---------------------------------------------------------------------------
+
+/// Per-project services manifest for dev shell environments.
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+pub struct EnvServices {
+    #[serde(default = "default_manifest_version")]
+    pub version: u32,
+    #[serde(default)]
+    pub services: Vec<EnvServiceEntry>,
+}
+
+/// A service entry in the env services manifest.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct EnvServiceEntry {
+    pub name: String,
+    #[serde(default)]
+    pub command: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub args: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_dir: Option<String>,
+}
+
+impl EnvServices {
+    /// Load from the shadow directory for the given env root.
+    pub fn load(env_root: &Path) -> color_eyre::Result<Self> {
+        let dir = shadow_dir(env_root)?;
+        let path = dir.join(ENV_SERVICES_NAME);
+        if path.exists() {
+            let contents = std::fs::read_to_string(&path)?;
+            Ok(toml::from_str(&contents)?)
+        } else {
+            Ok(Self::default())
+        }
+    }
+
+    /// Save to the shadow directory for the given env root.
+    pub fn save(&self, env_root: &Path) -> color_eyre::Result<()> {
+        let dir = shadow_dir(env_root)?;
+        let path = dir.join(ENV_SERVICES_NAME);
+        let contents = toml::to_string_pretty(self)?;
+        atomic_write(&path, &contents)?;
+        Ok(())
+    }
+
+    /// Path to the process-compose YAML in the shadow directory.
+    pub fn process_compose_path(env_root: &Path) -> color_eyre::Result<PathBuf> {
+        Ok(shadow_dir(env_root)?.join("process-compose.yaml"))
+    }
+
+    /// Add a service if not already present.
+    pub fn add(&mut self, entry: EnvServiceEntry) -> bool {
+        if self.services.iter().any(|s| s.name == entry.name) {
+            return false;
+        }
+        self.services.push(entry);
+        true
+    }
+
+    /// Remove a service by name.
+    pub fn remove(&mut self, name: &str) -> bool {
+        let before = self.services.len();
+        self.services.retain(|s| s.name != name);
+        self.services.len() < before
+    }
+
+    /// Generate a process-compose YAML config from the services.
+    pub fn to_process_compose_yaml(&self, env_root: &Path) -> String {
+        let root_str = env_root.to_string_lossy();
+        let mut lines = Vec::new();
+        lines.push("version: \"0.5\"".to_owned());
+        lines.push("processes:".to_owned());
+        for svc in &self.services {
+            lines.push(format!("  {}:", svc.name));
+            let cmd = if svc.args.is_empty() {
+                svc.command.clone()
+            } else {
+                format!("{} {}", svc.command, svc.args)
+            };
+            // Expand $PROJECT_ROOT so paths are relative to the git root.
+            let cmd = cmd.replace("$PROJECT_ROOT", &root_str);
+            lines.push(format!("    command: \"{}\"", cmd.replace('"', "\\\"")));
+            let working_dir = svc
+                .working_dir
+                .as_deref()
+                .unwrap_or(&root_str)
+                .replace("$PROJECT_ROOT", &root_str);
+            lines.push(format!("    working_dir: \"{}\"", working_dir));
+            lines.push("    restart: on_failure".to_owned());
+        }
+        lines.join("\n")
+    }
+
+    /// Write the process-compose YAML to the shadow directory.
+    pub fn write_process_compose(&self, env_root: &Path) -> color_eyre::Result<PathBuf> {
+        let pc_path = Self::process_compose_path(env_root)?;
+        let yaml = self.to_process_compose_yaml(env_root);
+        std::fs::write(&pc_path, yaml)?;
+        Ok(pc_path)
+    }
+}
+
 impl EnvManifest {
     /// Load from a specific directory.
     pub fn load_from(dir: &Path) -> color_eyre::Result<Self> {
