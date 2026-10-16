@@ -202,6 +202,25 @@ pub enum Command {
         command: FuseCommand,
     },
 
+    /// Use a package temporarily without installing it.
+    ///
+    /// Wraps `nix shell` to make a package available for a single command
+    /// or interactive session. Nothing is persisted to the user profile.
+    Try {
+        /// Package names (resolved against nixpkgs by default).
+        #[arg(required = true, add = ArgValueCompleter::new(compl::complete_packages))]
+        packages: Vec<String>,
+
+        /// Flake to resolve packages from (default: `nixpkgs`).
+        #[arg(long, default_value = "nixpkgs")]
+        flake: String,
+
+        /// Command to run with the packages available. If omitted,
+        /// opens an interactive shell.
+        #[arg(last = true, allow_hyphen_values = true)]
+        command: Vec<String>,
+    },
+
     /// Generate shell completions.
     Completions {
         /// Shell to generate completions for.

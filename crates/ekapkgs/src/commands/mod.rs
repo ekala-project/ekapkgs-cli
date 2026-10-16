@@ -21,6 +21,7 @@ mod store;
 mod substituter;
 mod system;
 mod template;
+mod try_pkg;
 mod wtf;
 
 use crate::cli::Command;
@@ -64,6 +65,11 @@ pub fn run(command: Command) -> color_eyre::Result<()> {
         } => wtf::execute(&command_name, &args, &flake),
         Command::Template { command } => template::execute(command),
         Command::Fuse { command } => fuse::execute(command),
+        Command::Try {
+            packages,
+            flake,
+            command,
+        } => try_pkg::execute(&packages, &flake, &command),
         Command::Completions { .. } => unreachable!("handled in main"),
     }
 }
