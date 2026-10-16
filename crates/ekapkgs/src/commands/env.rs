@@ -1,8 +1,11 @@
 use ekapkgs_nix::NixCommand;
 use yansi::Paint;
 
-use crate::cli::{EnvCommand, EnvHookShell};
-use crate::config::{ENV_MANIFEST_NAME, EnvFlakeEntry, EnvManifest, EnvPackageEntry, TrustedEnvs};
+use crate::cli::{EnvCommand, EnvHookShell, EnvServicesCommand};
+use crate::config::{
+    ENV_MANIFEST_NAME, EnvFlakeEntry, EnvManifest, EnvPackageEntry, EnvServiceEntry, EnvServices,
+    TrustedEnvs, check_out_of_tree, resolve_env_root,
+};
 
 pub fn execute(command: EnvCommand) -> color_eyre::Result<()> {
     match command {
@@ -17,7 +20,10 @@ pub fn execute(command: EnvCommand) -> color_eyre::Result<()> {
         } => cmd_flake_add(&ref_, &devshell, rev.as_deref(), &override_inputs),
         EnvCommand::FlakeRemove { ref_ } => cmd_flake_remove(&ref_),
         EnvCommand::FlakePin { ref_, rev } => cmd_flake_pin(&ref_, rev.as_deref()),
-        EnvCommand::List { json } => cmd_list(json),
+        EnvCommand::Services { command } => cmd_services(command),
+        EnvCommand::List { json, services } => cmd_list(json, services),
+        EnvCommand::Status { json } => cmd_status(json),
+        EnvCommand::Clean => cmd_clean(),
         EnvCommand::Reload => cmd_reload(),
         EnvCommand::Allow => cmd_allow(),
         EnvCommand::Disallow => cmd_disallow(),
@@ -230,12 +236,21 @@ fn cmd_flake_pin(ref_: &str, rev: Option<&str>) -> color_eyre::Result<()> {
     Ok(())
 }
 
-fn cmd_list(json_output: bool) -> color_eyre::Result<()> {
+fn cmd_list(json_output: bool, show_services: bool) -> color_eyre::Result<()> {
     let dir = cwd()?;
     let manifest = EnvManifest::load_from(&dir)?;
 
     if json_output {
-        println!("{}", serde_json::to_string_pretty(&manifest)?);
+        if show_services {
+            let services = discover_env_services();
+            let result = serde_json::json!({
+                "manifest": manifest,
+                "services": services,
+            });
+            println!("{}", serde_json::to_string_pretty(&result)?);
+        } else {
+            println!("{}", serde_json::to_string_pretty(&manifest)?);
+        }
         return Ok(());
     }
 
@@ -286,8 +301,381 @@ fn cmd_list(json_output: bool) -> color_eyre::Result<()> {
         }
     }
 
+    if show_services {
+        let services = discover_env_services();
+        if !services.is_empty() {
+            println!();
+            println!("{}:", "Services".bold());
+            for svc in &services {
+                let status = svc["status"].as_str().unwrap_or("unknown");
+                let name = svc["name"].as_str().unwrap_or("unknown");
+                println!("  {} {}", name.bold(), format!("({status})").dim());
+            }
+        }
+    }
+
     let total = manifest.flakes.len() + manifest.packages.len();
     println!("\n{total} entry(ies)");
+
+    Ok(())
+}
+
+/// Discover services from the active dev shell's process-compose.
+fn discover_env_services() -> Vec<serde_json::Value> {
+    let output = std::process::Command::new("pc")
+        .arg("status")
+        .arg("-o")
+        .arg("json")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .output();
+
+    match output {
+        Ok(out) if out.status.success() => {
+            serde_json::from_slice::<Vec<serde_json::Value>>(&out.stdout).unwrap_or_default()
+        },
+        _ => Vec::new(),
+    }
+}
+
+fn cmd_services(command: EnvServicesCommand) -> color_eyre::Result<()> {
+    match command {
+        EnvServicesCommand::Add {
+            service,
+            template,
+            sets,
+        } => cmd_services_add(&service, template.as_deref(), &sets),
+        EnvServicesCommand::Remove { services } => cmd_services_remove(&services),
+        EnvServicesCommand::List { json } => cmd_services_list(json),
+        EnvServicesCommand::Status { json } => cmd_services_status(json),
+        EnvServicesCommand::Restart { services } => cmd_services_restart(&services),
+    }
+}
+
+fn cmd_services_add(
+    service: &str,
+    template_name: Option<&str>,
+    sets: &[String],
+) -> color_eyre::Result<()> {
+    let env_root = resolve_env_root()?;
+
+    // Warn if this shadow dir was created for a different path (out-of-tree).
+    if let Some(original) = check_out_of_tree(&env_root) {
+        tracing::warn!(
+            "This project was previously tracked at {original} — service state may diverge"
+        );
+    }
+
+    let mut manifest = EnvServices::load(&env_root)?;
+
+    if manifest.services.iter().any(|s| s.name == service) {
+        return Err(color_eyre::eyre::eyre!(
+            "Service '{service}' already exists"
+        ));
+    }
+
+    let mut entry = EnvServiceEntry {
+        name: service.to_owned(),
+        command: String::new(),
+        args: String::new(),
+        description: String::new(),
+        port: None,
+        working_dir: None,
+    };
+
+    // Apply template defaults.
+    if let Some(tmpl_name) = template_name {
+        let tmpl = crate::service_templates::find_template(tmpl_name).ok_or_else(|| {
+            let available = crate::service_templates::template_names().join(", ");
+            color_eyre::eyre::eyre!("Unknown template '{tmpl_name}'. Available: {available}")
+        })?;
+        entry.command = tmpl.command.to_owned();
+        entry.args = tmpl.args.to_owned();
+        entry.description = tmpl.description.to_owned();
+        entry.port = Some(tmpl.port);
+        // Use $PROJECT_ROOT for data — expanded at YAML generation time.
+        entry.working_dir = Some(format!("$PROJECT_ROOT/.dev/data/{}", tmpl.data_dir));
+    }
+
+    // Apply --set overrides.
+    for kv in sets {
+        let (key, value) = kv.split_once('=').ok_or_else(|| {
+            color_eyre::eyre::eyre!("Invalid --set format '{kv}': expected KEY=VALUE")
+        })?;
+        match key {
+            "command" => entry.command = value.to_owned(),
+            "args" => entry.args = value.to_owned(),
+            "description" => entry.description = value.to_owned(),
+            "port" => {
+                entry.port = Some(
+                    value
+                        .parse()
+                        .map_err(|_| color_eyre::eyre::eyre!("Invalid port: {value}"))?,
+                );
+            },
+            "working_dir" => entry.working_dir = Some(value.to_owned()),
+            _ => {
+                return Err(color_eyre::eyre::eyre!(
+                    "Unknown service key '{key}'. Valid: command, args, description, port, \
+                     working_dir"
+                ));
+            },
+        }
+    }
+
+    if entry.command.is_empty() {
+        return Err(color_eyre::eyre::eyre!(
+            "Service command is required. Use --template or --set command=<cmd>"
+        ));
+    }
+
+    manifest.add(entry);
+    manifest.save(&env_root)?;
+
+    // Generate process-compose config in the shadow directory.
+    let pc_path = manifest.write_process_compose(&env_root)?;
+
+    println!("Added service {service}");
+    println!("  {}", format!("Config: {}", pc_path.display()).dim());
+    println!(
+        "  {}",
+        format!("Start: pc -f {} up", pc_path.display()).dim()
+    );
+
+    Ok(())
+}
+
+fn cmd_services_remove(services: &[String]) -> color_eyre::Result<()> {
+    let env_root = resolve_env_root()?;
+    let mut manifest = EnvServices::load(&env_root)?;
+    let mut removed = 0u32;
+
+    for name in services {
+        if manifest.remove(name) {
+            removed += 1;
+        } else {
+            tracing::warn!("{name} is not in the services manifest");
+        }
+    }
+
+    manifest.save(&env_root)?;
+
+    if removed > 0 {
+        if manifest.services.is_empty() {
+            let pc_path = EnvServices::process_compose_path(&env_root)?;
+            if pc_path.exists() {
+                let _ = std::fs::remove_file(&pc_path);
+            }
+        } else {
+            manifest.write_process_compose(&env_root)?;
+        }
+
+        println!("Removed {removed} service(s)");
+    }
+
+    Ok(())
+}
+
+fn cmd_services_list(json_output: bool) -> color_eyre::Result<()> {
+    let env_root = resolve_env_root()?;
+    let manifest = EnvServices::load(&env_root)?;
+
+    if json_output {
+        println!("{}", serde_json::to_string_pretty(&manifest.services)?);
+        return Ok(());
+    }
+
+    if manifest.services.is_empty() {
+        println!("No services in this environment.");
+        println!("{}", "Use `ekapkgs env services add` to add one.".dim());
+        return Ok(());
+    }
+
+    println!(
+        "{:<24} {:<8} {}",
+        "SERVICE".bold(),
+        "PORT".bold(),
+        "COMMAND".bold()
+    );
+    for svc in &manifest.services {
+        let port_str = svc.port.map_or("-".to_owned(), |p| p.to_string());
+        let cmd = if svc.args.is_empty() {
+            svc.command.clone()
+        } else {
+            format!("{} {}", svc.command, svc.args)
+        };
+        // Truncate long commands.
+        let cmd_display = if cmd.len() > 50 {
+            format!("{}...", &cmd[..47])
+        } else {
+            cmd
+        };
+        println!("{:<24} {port_str:<8} {cmd_display}", svc.name);
+    }
+    println!("\n{} service(s)", manifest.services.len());
+
+    Ok(())
+}
+
+fn cmd_services_status(json_output: bool) -> color_eyre::Result<()> {
+    let env_root = resolve_env_root()?;
+    let pc_path = EnvServices::process_compose_path(&env_root)?;
+
+    if !pc_path.exists() {
+        println!("No services configured.");
+        println!("{}", "Use `ekapkgs env services add` to add one.".dim());
+        return Ok(());
+    }
+
+    // Delegate to process-compose status with our config file.
+    let output = std::process::Command::new("pc")
+        .arg("-f")
+        .arg(&pc_path)
+        .arg("status")
+        .arg("-o")
+        .arg(if json_output { "json" } else { "table" })
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit())
+        .status();
+
+    match output {
+        Ok(s) if s.success() => Ok(()),
+        Ok(_) => {
+            println!("No process-compose services running.");
+            println!(
+                "  {}",
+                format!("Start: pc -f {} up", pc_path.display()).dim()
+            );
+            Ok(())
+        },
+        Err(_) => {
+            println!("process-compose (pc) not found.");
+            println!(
+                "{}",
+                "Install it or use `ekapkgs home services` for systemd-managed services.".dim()
+            );
+            Ok(())
+        },
+    }
+}
+
+fn cmd_services_restart(services: &[String]) -> color_eyre::Result<()> {
+    let env_root = resolve_env_root()?;
+    let pc_path = EnvServices::process_compose_path(&env_root)?;
+
+    for name in services {
+        tracing::info!("Restarting {name}...");
+        let status = std::process::Command::new("pc")
+            .arg("-f")
+            .arg(&pc_path)
+            .arg("restart")
+            .arg(name)
+            .stdout(std::process::Stdio::inherit())
+            .stderr(std::process::Stdio::inherit())
+            .status();
+
+        match status {
+            Ok(s) if s.success() => println!("Restarted {}", name.bold()),
+            Ok(_) => tracing::warn!("Failed to restart {name}"),
+            Err(e) => tracing::warn!("Failed to restart {name}: {e}"),
+        }
+    }
+    Ok(())
+}
+
+fn cmd_clean() -> color_eyre::Result<()> {
+    let dir = cwd()?;
+    let mut cleaned = 0u32;
+
+    // Remove cached profile and env scripts.
+    if let Ok(env_dir) = EnvManifest::env_dir_path(&dir) {
+        if env_dir.exists() {
+            std::fs::remove_dir_all(&env_dir)?;
+            println!("Removed cache: {}", env_dir.display());
+            cleaned += 1;
+        }
+    }
+
+    // Remove .dev/ directory if present (dev shell data).
+    let dev_dir = dir.join(".dev");
+    if dev_dir.exists() {
+        std::fs::remove_dir_all(&dev_dir)?;
+        println!("Removed .dev/");
+        cleaned += 1;
+    }
+
+    if cleaned == 0 {
+        println!("Nothing to clean.");
+    } else {
+        println!(
+            "{}",
+            "Run `ekapkgs env reload` to rebuild the environment.".dim()
+        );
+    }
+
+    Ok(())
+}
+
+fn cmd_status(json_output: bool) -> color_eyre::Result<()> {
+    let dir = cwd()?;
+    let manifest_path = dir.join(ENV_MANIFEST_NAME);
+
+    // Check if $EKAPKGS_ENV is set (shell hook active).
+    let active_env = std::env::var("EKAPKGS_ENV").ok();
+    let has_manifest = manifest_path.exists();
+
+    if json_output {
+        let manifest = if has_manifest {
+            Some(EnvManifest::load_from(&dir)?)
+        } else {
+            None
+        };
+        let trusted = TrustedEnvs::load()?;
+        let is_trusted = has_manifest && trusted.is_trusted(&dir);
+
+        let status = serde_json::json!({
+            "active": active_env.is_some(),
+            "active_dir": active_env,
+            "manifest": has_manifest,
+            "manifest_path": if has_manifest { Some(manifest_path.to_string_lossy().into_owned()) } else { None },
+            "trusted": is_trusted,
+            "packages": manifest.as_ref().map(|m| m.packages.len()).unwrap_or(0),
+            "flakes": manifest.as_ref().map(|m| m.flakes.len()).unwrap_or(0),
+        });
+        println!("{}", serde_json::to_string_pretty(&status)?);
+        return Ok(());
+    }
+
+    if !has_manifest && active_env.is_none() {
+        println!("{}: no", "Active".bold());
+        println!(
+            "{}",
+            "No environment in this directory. Use `ekapkgs env init` to create one.".dim()
+        );
+        return Ok(());
+    }
+
+    if let Some(ref env_dir) = active_env {
+        println!("{}: {}", "Active".bold(), "yes".bold());
+        println!("{}: {env_dir}", "Directory".dim());
+    } else {
+        println!("{}: {}", "Active".bold(), "no (shell hook not active)");
+    }
+
+    if has_manifest {
+        let manifest = EnvManifest::load_from(&dir)?;
+        let trusted = TrustedEnvs::load()?;
+        let is_trusted = trusted.is_trusted(&dir);
+
+        println!("{}: {}", "Manifest".dim(), manifest_path.display());
+        println!(
+            "{}: {}",
+            "Trusted".dim(),
+            if is_trusted { "yes" } else { "no" }
+        );
+        println!("{}: {}", "Packages".dim(), manifest.packages.len());
+        println!("{}: {}", "Flakes".dim(), manifest.flakes.len());
+    }
 
     Ok(())
 }
