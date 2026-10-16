@@ -185,6 +185,14 @@ pub fn execute(command: SystemCommand) -> color_eyre::Result<()> {
             let profile = resolve_profile_path(profile_name.as_deref());
             cmd_rollback(generation, dry_run, &profile)
         },
+        SystemCommand::UpdateCheck {
+            installable,
+            json,
+            extra,
+        } => {
+            let inst = resolve_system_installable(installable.as_deref());
+            cmd_update_check(&inst, json, &extra)
+        },
         SystemCommand::PruneBootEntries {
             boot_mount,
             gc,
@@ -524,6 +532,50 @@ fn cmd_diff(installable: &str, extra: &[String]) -> color_eyre::Result<()> {
         .arg(&current_resolved)
         .arg(&new_path)
         .stream()?;
+
+    Ok(())
+}
+
+fn cmd_update_check(
+    installable: &str,
+    json_output: bool,
+    extra: &[String],
+) -> color_eyre::Result<()> {
+    let new_path = build_system(installable, extra)?;
+    let current = "/run/current-system";
+
+    if !Path::new(current).exists() {
+        return Err(color_eyre::eyre::eyre!(
+            "{current} does not exist — is this a NixOS system?"
+        ));
+    }
+
+    let current_resolved = std::fs::read_link(current)
+        .unwrap_or_else(|_| PathBuf::from(current))
+        .to_string_lossy()
+        .into_owned();
+
+    let up_to_date = current_resolved == new_path;
+
+    if json_output {
+        let result = serde_json::json!({
+            "updates_available": !up_to_date,
+            "current": current_resolved,
+            "new": new_path,
+        });
+        println!("{}", serde_json::to_string_pretty(&result)?);
+    } else if up_to_date {
+        println!("System is up to date.");
+    } else {
+        println!("Updates available.");
+        println!("  Current: {current_resolved}");
+        println!("  New:     {new_path}");
+        println!("{}", "Run `ekapkgs system switch` to apply.".dim());
+    }
+
+    if up_to_date {
+        std::process::exit(1);
+    }
 
     Ok(())
 }
