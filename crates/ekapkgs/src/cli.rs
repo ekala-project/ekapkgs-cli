@@ -1098,6 +1098,28 @@ pub enum SystemCommand {
         dry_run: bool,
     },
 
+    /// Check if system updates are available.
+    ///
+    /// Evaluates the system configuration and compares it against the
+    /// running system without activating anything. Exits with code 0
+    /// if updates are available, 1 if the system is up to date.
+    /// Use `--json` for machine-readable output.
+    UpdateCheck {
+        /// The system configuration installable.
+        ///
+        /// When omitted, tries `.#ekaosConfigurations.<hostname>` first,
+        /// then falls back to `.#config.system.build.toplevel`.
+        installable: Option<String>,
+
+        /// Output as JSON.
+        #[arg(long)]
+        json: bool,
+
+        /// Extra arguments passed through to nix build.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        extra: Vec<String>,
+    },
+
     /// Update flake inputs and rebuild the system configuration.
     ///
     /// Runs `nix flake update`, invalidates the store path index, and
