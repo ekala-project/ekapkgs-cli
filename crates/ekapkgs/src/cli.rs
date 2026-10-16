@@ -706,6 +706,10 @@ pub enum HomePackagesCommand {
         /// Output as JSON.
         #[arg(long)]
         json: bool,
+
+        /// Show provenance metadata (when added, by whom).
+        #[arg(long, short)]
+        verbose: bool,
     },
 
     /// Export the package manifest for syncing to another machine.
@@ -1187,6 +1191,10 @@ pub enum SystemPackagesCommand {
         /// Output as JSON.
         #[arg(long)]
         json: bool,
+
+        /// Show provenance metadata (when added, by whom).
+        #[arg(long, short)]
+        verbose: bool,
     },
 
     /// Export the system package manifest.

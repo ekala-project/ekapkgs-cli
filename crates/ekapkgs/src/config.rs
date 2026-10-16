@@ -206,6 +206,25 @@ pub struct HomePackageEntry {
     /// Overrides the manifest-level default flake for this package.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub flake: Option<String>,
+    /// ISO 8601 timestamp of when this package was added.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub added_at: Option<String>,
+    /// Who or what added this package (e.g., "user", "claude-code").
+    /// Auto-detected from `$EKAPKGS_CALLER` if set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub added_by: Option<String>,
+}
+
+/// Get the current ISO 8601 timestamp for provenance metadata.
+pub fn provenance_timestamp() -> String {
+    jiff::Timestamp::now()
+        .strftime("%Y-%m-%dT%H:%M:%S%:z")
+        .to_string()
+}
+
+/// Get the caller label from `$EKAPKGS_CALLER`, defaulting to "user".
+pub fn provenance_caller() -> String {
+    std::env::var("EKAPKGS_CALLER").unwrap_or_else(|_| "user".to_owned())
 }
 
 impl HomePackages {
@@ -303,6 +322,12 @@ pub struct SystemPackageEntry {
     /// Overrides the manifest-level default flake for this package.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub flake: Option<String>,
+    /// ISO 8601 timestamp of when this package was added.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub added_at: Option<String>,
+    /// Who or what added this package (e.g., "user", "claude-code").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub added_by: Option<String>,
 }
 
 impl SystemPackages {
@@ -771,6 +796,8 @@ mod tests {
         let entry = HomePackageEntry {
             name: "hello".into(),
             flake: None,
+            added_at: None,
+            added_by: None,
         };
         assert!(hp.add(entry.clone()));
         assert!(!hp.add(entry)); // duplicate
@@ -783,10 +810,14 @@ mod tests {
         hp.add(HomePackageEntry {
             name: "hello".into(),
             flake: None,
+            added_at: None,
+            added_by: None,
         });
         hp.add(HomePackageEntry {
             name: "world".into(),
             flake: None,
+            added_at: None,
+            added_by: None,
         });
         assert!(hp.remove("hello"));
         assert!(!hp.remove("hello")); // already gone
@@ -800,6 +831,8 @@ mod tests {
         let entry = HomePackageEntry {
             name: "ripgrep".into(),
             flake: None,
+            added_at: None,
+            added_by: None,
         };
         assert_eq!(hp.resolve_installable(&entry), "nixpkgs#ripgrep");
     }
@@ -810,6 +843,8 @@ mod tests {
         let entry = HomePackageEntry {
             name: "my-tool".into(),
             flake: Some("github:user/repo".into()),
+            added_at: None,
+            added_by: None,
         };
         assert_eq!(hp.resolve_installable(&entry), "github:user/repo#my-tool");
     }
@@ -820,10 +855,14 @@ mod tests {
         hp.add(HomePackageEntry {
             name: "jq".into(),
             flake: None,
+            added_at: None,
+            added_by: None,
         });
         hp.add(HomePackageEntry {
             name: "special".into(),
             flake: Some("github:foo/bar".into()),
+            added_at: None,
+            added_by: None,
         });
 
         let toml_str = toml::to_string_pretty(&hp).unwrap();
@@ -857,10 +896,14 @@ mod tests {
         assert!(sp.add(SystemPackageEntry {
             name: "htop".into(),
             flake: None,
+            added_at: None,
+            added_by: None,
         }));
         assert!(!sp.add(SystemPackageEntry {
             name: "htop".into(),
             flake: None,
+            added_at: None,
+            added_by: None,
         }));
         assert!(sp.remove("htop"));
         assert!(!sp.remove("htop"));
@@ -875,6 +918,8 @@ mod tests {
         let entry = SystemPackageEntry {
             name: "vim".into(),
             flake: None,
+            added_at: None,
+            added_by: None,
         };
         assert_eq!(sp.resolve_installable(&entry), "my-flake#vim");
     }
