@@ -318,11 +318,19 @@ fn build_http_router(
         router = router.route("/metrics", get(metrics_handler));
     }
 
+    // Limit concurrent in-flight requests to prevent resource exhaustion
+    // under load. Requests beyond this limit are queued by tower.
+    let max_concurrent = std::thread::available_parallelism()
+        .map(std::num::NonZero::get)
+        .unwrap_or(8)
+        * 64;
+
     let router = router
         .layer(http_metrics::HttpMetricsLayer::new(
             state.metrics.http_requests_total.clone(),
             state.metrics.http_request_duration_seconds.clone(),
         ))
+        .layer(tower::limit::ConcurrencyLimitLayer::new(max_concurrent))
         .layer(tower_http::timeout::TimeoutLayer::with_status_code(
             axum::http::StatusCode::REQUEST_TIMEOUT,
             request_timeout,

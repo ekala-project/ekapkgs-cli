@@ -56,7 +56,7 @@ futures = "0.3"
 axum = "0.8"
 axum-server = { version = "0.7", features = ["tls-rustls"] }
 http-body-util = "0.1"
-tower = "0.5"
+tower = { version = "0.5", features = ["limit"] }
 tower-http = { version = "0.6", features = ["compression-zstd", "cors", "timeout", "trace"] }
 
 prost = "0.13"
