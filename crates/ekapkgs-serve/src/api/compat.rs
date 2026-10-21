@@ -517,7 +517,16 @@ pub async fn get_nar(
 
     let nar_path = format!("nar/{file}");
 
-    match state.storage.get_nar(&nar_path) {
+    // Offload the potentially heavy NAR read (CAS reassembly, decompression)
+    // to the blocking pool so it doesn't starve the async runtime.
+    let storage_state = Arc::clone(&state);
+    let nar_path_clone = nar_path.clone();
+    let nar_result =
+        tokio::task::spawn_blocking(move || storage_state.storage.get_nar(&nar_path_clone))
+            .await
+            .unwrap_or_else(|e| Err(color_eyre::eyre::eyre!("spawn_blocking join: {e}")));
+
+    match nar_result {
         Ok(Some(data)) => {
             state.metrics.nar_downloads_total.inc();
 

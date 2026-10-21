@@ -55,63 +55,72 @@ impl CacheService for NegotiateService {
             req.want.clone()
         };
 
-        let mut available = Vec::new();
-        let mut unavailable = Vec::new();
         let mut total_download_size: u64 = 0;
         let mut total_nar_size: u64 = 0;
 
-        // Query storage for each wanted path.
-        for hash in &want_hashes {
-            match self.state.storage.get_narinfo(hash) {
-                Ok(Some(mut ni)) => {
-                    // Re-sign with our key.
-                    let fingerprint = crate::signing::NarInfoSigner::fingerprint(
-                        &ni.store_path,
-                        &ni.nar_hash,
-                        ni.nar_size,
-                        &ni.references,
-                    );
-                    let sig = self.state.signer.sign(&fingerprint);
-                    if !ni.signatures.contains(&sig) {
-                        ni.signatures.push(sig);
-                    }
-
-                    let compression = match ni.compression.as_str() {
-                        "zstd" => Compression::Zstd as i32,
-                        "xz" => Compression::Xz as i32,
-                        "none" | "" => Compression::None as i32,
-                        _ => Compression::Unspecified as i32,
-                    };
-
-                    total_download_size += ni.file_size;
-                    total_nar_size += ni.nar_size;
-
-                    available.push(PathManifestEntry {
-                        store_path: ni.store_path,
-                        nar_hash: ni.nar_hash,
-                        nar_size: ni.nar_size,
-                        references: ni.references,
-                        signatures: ni.signatures,
-                        cert_signature: None,
-                        cert_signatures: Vec::new(),
-                        ca: ni.ca.unwrap_or_default(),
-                        url: ni.url,
-                        compression,
-                        file_hash: ni.file_hash,
-                        file_size: ni.file_size,
-                        delta_base_hash: String::new(),
-                        delta_url: String::new(),
-                        delta_size: 0,
-                    });
-                },
-                Ok(None) => {
-                    unavailable.push(hash.clone());
-                },
-                Err(e) => {
-                    tracing::warn!("Failed to query narinfo for {hash}: {e}");
-                    unavailable.push(hash.clone());
-                },
+        // Batch-query narinfo for all wanted paths on the blocking pool
+        // so we don't block the async runtime during DB I/O.
+        let query_state = Arc::clone(&self.state);
+        let want_hashes_owned = want_hashes.clone();
+        let (mut narinfo_results, unavailable) = tokio::task::spawn_blocking(move || {
+            let mut avail = Vec::new();
+            let mut unavail = Vec::new();
+            for hash in &want_hashes_owned {
+                match query_state.storage.get_narinfo(hash) {
+                    Ok(Some(ni)) => avail.push((hash.clone(), ni)),
+                    Ok(None) => unavail.push(hash.clone()),
+                    Err(e) => {
+                        tracing::warn!("Failed to query narinfo for {hash}: {e}");
+                        unavail.push(hash.clone());
+                    },
+                }
             }
+            (avail, unavail)
+        })
+        .await
+        .map_err(|e| Status::internal(format!("spawn_blocking join: {e}")))?;
+
+        // Sign and build manifest entries (CPU-bound, runs on async thread).
+        let mut available: Vec<PathManifestEntry> = Vec::with_capacity(narinfo_results.len());
+        for (_hash, mut ni) in narinfo_results.drain(..) {
+            let fingerprint = crate::signing::NarInfoSigner::fingerprint(
+                &ni.store_path,
+                &ni.nar_hash,
+                ni.nar_size,
+                &ni.references,
+            );
+            let sig = self.state.signer.sign(&fingerprint);
+            if !ni.signatures.contains(&sig) {
+                ni.signatures.push(sig);
+            }
+
+            let compression = match ni.compression.as_str() {
+                "zstd" => Compression::Zstd as i32,
+                "xz" => Compression::Xz as i32,
+                "none" | "" => Compression::None as i32,
+                _ => Compression::Unspecified as i32,
+            };
+
+            total_download_size += ni.file_size;
+            total_nar_size += ni.nar_size;
+
+            available.push(PathManifestEntry {
+                store_path: ni.store_path,
+                nar_hash: ni.nar_hash,
+                nar_size: ni.nar_size,
+                references: ni.references,
+                signatures: ni.signatures,
+                cert_signature: None,
+                cert_signatures: Vec::new(),
+                ca: ni.ca.unwrap_or_default(),
+                url: ni.url,
+                compression,
+                file_hash: ni.file_hash,
+                file_size: ni.file_size,
+                delta_base_hash: String::new(),
+                delta_url: String::new(),
+                delta_size: 0,
+            });
         }
 
         // Apply certificate-based signatures if configured.
@@ -306,69 +315,79 @@ impl CacheService for NegotiateService {
 
         // Walk the Merkle trees in a single pass to find missing chunks and
         // collect directory/file metadata needed for client-side NAR reassembly.
-        let (missing_chunks, directories, file_chunk_mappings) = if let Some(castore) = self
-            .state
-            .storage
-            .as_any()
-            .downcast_ref::<crate::storage::castore::CastoreBackend>()
-        {
-            let (chunks, dirs_raw, file_maps_raw) = castore
-                .walk_cas_trees(&want_hashes, &have_check)
+        // Offloaded to the blocking pool since tree walks do heavy SQLite I/O.
+        let (missing_chunks, directories, file_chunk_mappings) =
+            if self.state.storage.supports_cas() {
+                let state = Arc::clone(&self.state);
+                let want_owned: Vec<String> = want_hashes.into_iter().map(String::from).collect();
+                let walk_result = tokio::task::spawn_blocking(move || {
+                    let castore = state
+                        .storage
+                        .as_any()
+                        .downcast_ref::<crate::storage::castore::CastoreBackend>()
+                        .expect("supports_cas but not CastoreBackend");
+                    let want_refs: Vec<&str> = want_owned.iter().map(String::as_str).collect();
+                    castore.walk_cas_trees(&want_refs, &have_check)
+                })
+                .await
+                .map_err(|e| Status::internal(format!("spawn_blocking join: {e}")))?
                 .map_err(|e| Status::internal(format!("CAS tree walk failed: {e}")))?;
 
-            let missing: Vec<ChunkDownload> = chunks
-                .into_iter()
-                .map(|cm| {
-                    let hex = cm
-                        .digest
-                        .as_ref()
-                        .map(|d| {
-                            d.digest
-                                .iter()
-                                .map(|b| format!("{b:02x}"))
-                                .collect::<String>()
-                        })
-                        .unwrap_or_default();
-                    ChunkDownload {
-                        digest: cm.digest,
-                        size: cm.size,
-                        url: format!("cas/chunk/{hex}"),
-                    }
-                })
-                .collect();
+                let (chunks, dirs_raw, file_maps_raw) = walk_result;
 
-            let dirs = dirs_raw
-                .into_iter()
-                .map(|(digest, dir)| CaDirectoryData {
-                    digest: Some(B3Digest {
-                        digest: digest.to_vec(),
-                    }),
-                    directory: Some(dir),
-                })
-                .collect();
+                let missing: Vec<ChunkDownload> = chunks
+                    .into_iter()
+                    .map(|cm| {
+                        let hex = cm
+                            .digest
+                            .as_ref()
+                            .map(|d| {
+                                d.digest
+                                    .iter()
+                                    .map(|b| format!("{b:02x}"))
+                                    .collect::<String>()
+                            })
+                            .unwrap_or_default();
+                        ChunkDownload {
+                            digest: cm.digest,
+                            size: cm.size,
+                            url: format!("cas/chunk/{hex}"),
+                        }
+                    })
+                    .collect();
 
-            let mappings = file_maps_raw
-                .into_iter()
-                .map(|(file_digest, chunks)| FileChunkMapping {
-                    file_digest: Some(B3Digest {
-                        digest: file_digest.to_vec(),
-                    }),
-                    chunks: chunks
-                        .into_iter()
-                        .map(|(chunk_digest, chunk_size)| ChunkMeta {
-                            digest: Some(B3Digest {
-                                digest: chunk_digest.to_vec(),
-                            }),
-                            size: chunk_size,
-                        })
-                        .collect(),
-                })
-                .collect();
+                let dirs = dirs_raw
+                    .into_iter()
+                    .map(|(digest, dir)| CaDirectoryData {
+                        digest: Some(B3Digest {
+                            digest: digest.to_vec(),
+                        }),
+                        directory: Some(dir),
+                    })
+                    .collect();
 
-            (missing, dirs, mappings)
-        } else {
-            (Vec::new(), Vec::new(), Vec::new())
-        };
+                let mappings = file_maps_raw
+                    .into_iter()
+                    .map(|(file_digest, chunks)| FileChunkMapping {
+                        file_digest: Some(B3Digest {
+                            digest: file_digest.to_vec(),
+                        }),
+                        chunks: chunks
+                            .into_iter()
+                            .map(|(chunk_digest, chunk_size)| ChunkMeta {
+                                digest: Some(B3Digest {
+                                    digest: chunk_digest.to_vec(),
+                                }),
+                                size: chunk_size,
+                            })
+                            .collect(),
+                    })
+                    .collect();
+
+                (missing, dirs, mappings)
+            } else {
+                (Vec::new(), Vec::new(), Vec::new())
+            };
 
         let total_chunk_size: u64 = missing_chunks.iter().map(|c| c.size).sum();
 
@@ -392,39 +411,45 @@ impl CacheService for NegotiateService {
         let state = Arc::clone(&self.state);
         tokio::spawn(async move {
             for hash in req.path_hashes {
-                // Look up narinfo to get the NAR URL and file size.
-                let narinfo = match state.storage.get_narinfo(&hash) {
-                    Ok(Some(ni)) => ni,
-                    Ok(None) => {
+                // Offload blocking storage I/O (narinfo lookup + NAR read) to
+                // the blocking pool so heavy CAS reassembly doesn't stall the
+                // async runtime.
+                let st = Arc::clone(&state);
+                let h = hash.clone();
+                let loaded = tokio::task::spawn_blocking(move || {
+                    let narinfo = match st.storage.get_narinfo(&h) {
+                        Ok(Some(ni)) => ni,
+                        Ok(None) => return Ok(None),
+                        Err(e) => return Err(e),
+                    };
+
+                    let delta = st.delta_cache.get_for_target(&h);
+                    if let Some(d) = delta {
+                        return Ok(Some((d, true)));
+                    }
+
+                    match st.storage.get_nar(&narinfo.url) {
+                        Ok(Some(data)) => Ok(Some((data, false))),
+                        Ok(None) => Ok(None),
+                        Err(e) => Err(e),
+                    }
+                })
+                .await;
+
+                let (stream_data, is_delta) = match loaded {
+                    Ok(Ok(Some(pair))) => pair,
+                    Ok(Ok(None)) => {
                         tracing::warn!("StreamNars: path {hash} not found, skipping");
                         continue;
                     },
-                    Err(e) => {
-                        tracing::warn!("StreamNars: failed to query {hash}: {e}");
+                    Ok(Err(e)) => {
+                        tracing::warn!("StreamNars: failed to load {hash}: {e}");
                         continue;
                     },
-                };
-
-                // Check if a delta is cached for this path.
-                let (stream_data, is_delta) = {
-                    // Try all possible base hashes in the delta cache.
-                    let delta = state.delta_cache.get_for_target(&hash);
-                    if let Some(d) = delta {
-                        (d, true)
-                    } else {
-                        // Load the full NAR.
-                        match state.storage.get_nar(&narinfo.url) {
-                            Ok(Some(data)) => (data, false),
-                            Ok(None) => {
-                                tracing::warn!("StreamNars: NAR not found for {hash}, skipping");
-                                continue;
-                            },
-                            Err(e) => {
-                                tracing::warn!("StreamNars: failed to load NAR for {hash}: {e}");
-                                continue;
-                            },
-                        }
-                    }
+                    Err(e) => {
+                        tracing::warn!("StreamNars: spawn_blocking join failed for {hash}: {e}");
+                        continue;
+                    },
                 };
 
                 // Record GC access.
