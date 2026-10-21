@@ -96,15 +96,15 @@ impl CastoreBackend {
         }
 
         // Create a pool of read-only connections for concurrent queries.
-        // SQLite WAL mode supports unlimited concurrent readers.
+        // SQLite WAL mode supports unlimited concurrent readers. Cap the pool
+        // size to avoid excessive connection overhead on high-core-count machines.
         let num_readers = std::thread::available_parallelism()
             .map(std::num::NonZero::get)
             .unwrap_or(4)
-            .max(4);
+            .clamp(4, 16);
         let mut read_pool = Vec::with_capacity(num_readers);
         for _ in 0..num_readers {
-            let reader = open_db(&db_path)?;
-            reader.execute_batch("PRAGMA query_only=ON")?;
+            let reader = open_db_reader(&db_path)?;
             read_pool.push(Mutex::new(reader));
         }
 
@@ -1345,6 +1345,19 @@ impl StorageBackend for std::sync::Arc<CastoreBackend> {
 }
 
 // --- Database helpers ---
+
+/// Open a read-only database connection for the reader pool.
+///
+/// Skips the integrity check (already done by the write connection at startup)
+/// and uses lighter pragmas since readers don't write.
+fn open_db_reader(path: &Path) -> color_eyre::Result<Connection> {
+    let conn = Connection::open_with_flags(
+        path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    conn.execute_batch("PRAGMA journal_mode=WAL;PRAGMA busy_timeout=5000;PRAGMA query_only=ON")?;
+    Ok(conn)
+}
 
 fn open_db(path: &Path) -> color_eyre::Result<Connection> {
     tracing::log::info!("Opening database at {}", path.display());
