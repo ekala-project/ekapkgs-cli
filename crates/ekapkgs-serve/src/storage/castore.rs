@@ -72,7 +72,11 @@ impl ChunkHaveCheck {
 
 pub struct CastoreBackend {
     root: PathBuf,
+    /// Write connection — used for mutations (put_nar, eviction, access updates).
     db: Mutex<Connection>,
+    /// Pool of read-only connections for concurrent query serving.
+    /// SQLite WAL mode supports unlimited concurrent readers.
+    read_pool: Vec<Mutex<Connection>>,
 }
 
 impl CastoreBackend {
@@ -91,16 +95,55 @@ impl CastoreBackend {
             migrate_dirs_to_db(&conn, &dirs_path)?;
         }
 
+        // Create a pool of read-only connections for concurrent queries.
+        // SQLite WAL mode supports unlimited concurrent readers.
+        let num_readers = std::thread::available_parallelism()
+            .map(std::num::NonZero::get)
+            .unwrap_or(4)
+            .max(4);
+        let mut read_pool = Vec::with_capacity(num_readers);
+        for _ in 0..num_readers {
+            let reader = open_db(&db_path)?;
+            reader.execute_batch("PRAGMA query_only=ON")?;
+            read_pool.push(Mutex::new(reader));
+        }
+
         Ok(Self {
             root,
             db: Mutex::new(conn),
+            read_pool,
         })
+    }
+
+    /// Acquire a read-only connection from the pool.
+    /// Tries each connection in round-robin order; if all are busy,
+    /// falls back to blocking on one.
+    fn acquire_reader(&self) -> std::sync::MutexGuard<'_, Connection> {
+        // Use thread ID to distribute across readers and reduce contention.
+        let start = {
+            let id = std::thread::current().id();
+            let hash = {
+                use std::hash::{Hash, Hasher};
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                id.hash(&mut h);
+                h.finish()
+            };
+            hash as usize % self.read_pool.len()
+        };
+        for i in 0..self.read_pool.len() {
+            let idx = (start + i) % self.read_pool.len();
+            if let Ok(guard) = self.read_pool[idx].try_lock() {
+                return guard;
+            }
+        }
+        // All readers busy — block on the starting one.
+        self.read_pool[start].lock().expect("read pool lock")
     }
 
     /// Get a chunk by its blake3 digest (as 32 raw bytes).
     pub fn get_chunk_by_digest(&self, digest: &[u8; 32]) -> color_eyre::Result<Option<Vec<u8>>> {
         // Check SQLite for storage format and possible inline data.
-        let db = self.db.lock().expect("db lock");
+        let db = self.acquire_reader();
         let row: Option<(i64, Option<Vec<u8>>)> = db
             .query_row(
                 "SELECT storage_format, data FROM chunks WHERE digest = ?1",
@@ -141,7 +184,7 @@ impl CastoreBackend {
 
     /// Check if a chunk exists without reading its data.
     pub fn has_chunk(&self, digest: &[u8; 32]) -> color_eyre::Result<bool> {
-        let db = self.db.lock().expect("db lock");
+        let db = self.acquire_reader();
         let exists: bool = db.query_row(
             "SELECT EXISTS(SELECT 1 FROM chunks WHERE digest = ?1)",
             params![digest.as_slice()],
@@ -152,7 +195,7 @@ impl CastoreBackend {
 
     /// Get the CAS root node for a store path hash.
     pub fn get_root_node(&self, hash: &str) -> color_eyre::Result<Option<CaNode>> {
-        let db = self.db.lock().expect("db lock");
+        let db = self.acquire_reader();
         let mut stmt = db.prepare("SELECT root_node FROM cas_paths WHERE hash = ?1")?;
         let result: Option<Vec<u8>> = stmt.query_row(params![hash], |row| row.get(0)).ok();
         drop(stmt);
@@ -237,7 +280,7 @@ impl CastoreBackend {
 
     /// Return total bytes stored in chunks.
     pub fn total_chunk_bytes(&self) -> color_eyre::Result<u64> {
-        let db = self.db.lock().expect("db lock");
+        let db = self.acquire_reader();
         let total: i64 = db.query_row("SELECT COALESCE(SUM(size), 0) FROM chunks", [], |row| {
             row.get(0)
         })?;
@@ -246,21 +289,21 @@ impl CastoreBackend {
 
     /// Return total number of CAS paths stored.
     pub fn total_paths(&self) -> color_eyre::Result<u64> {
-        let db = self.db.lock().expect("db lock");
+        let db = self.acquire_reader();
         let count: i64 = db.query_row("SELECT COUNT(*) FROM cas_paths", [], |row| row.get(0))?;
         Ok(count as u64)
     }
 
     /// Return total number of unique chunks.
     pub fn total_chunks(&self) -> color_eyre::Result<u64> {
-        let db = self.db.lock().expect("db lock");
+        let db = self.acquire_reader();
         let count: i64 = db.query_row("SELECT COUNT(*) FROM chunks", [], |row| row.get(0))?;
         Ok(count as u64)
     }
 
     /// Return total logical NAR size (sum of nar_size across all paths).
     pub fn total_nar_size(&self) -> color_eyre::Result<u64> {
-        let db = self.db.lock().expect("db lock");
+        let db = self.acquire_reader();
         let total: i64 = db.query_row(
             "SELECT COALESCE(SUM(nar_size), 0) FROM cas_paths",
             [],
@@ -271,7 +314,7 @@ impl CastoreBackend {
 
     /// Return the number of unique file digests in file_chunks.
     pub fn total_unique_files(&self) -> color_eyre::Result<u64> {
-        let db = self.db.lock().expect("db lock");
+        let db = self.acquire_reader();
         let count: i64 = db.query_row(
             "SELECT COUNT(DISTINCT file_digest) FROM file_chunks",
             [],
@@ -282,14 +325,14 @@ impl CastoreBackend {
 
     /// Return total number of file-to-chunk mapping rows.
     pub fn total_file_chunk_refs(&self) -> color_eyre::Result<u64> {
-        let db = self.db.lock().expect("db lock");
+        let db = self.acquire_reader();
         let count: i64 = db.query_row("SELECT COUNT(*) FROM file_chunks", [], |row| row.get(0))?;
         Ok(count as u64)
     }
 
     /// Return total actual disk usage (compressed/raw sizes, excluding inline).
     pub fn total_disk_bytes(&self) -> color_eyre::Result<u64> {
-        let db = self.db.lock().expect("db lock");
+        let db = self.acquire_reader();
         let total: i64 = db.query_row(
             "SELECT COALESCE(SUM(disk_size), 0) FROM chunks",
             [],
@@ -300,7 +343,7 @@ impl CastoreBackend {
 
     /// Return the number of inline chunks (stored in SQLite, no disk file).
     pub fn total_inline_chunks(&self) -> color_eyre::Result<u64> {
-        let db = self.db.lock().expect("db lock");
+        let db = self.acquire_reader();
         let count: i64 = db.query_row(
             "SELECT COUNT(*) FROM chunks WHERE storage_format = 1",
             [],
@@ -311,7 +354,7 @@ impl CastoreBackend {
 
     /// Return the number of zstd-compressed chunks.
     pub fn total_compressed_chunks(&self) -> color_eyre::Result<u64> {
-        let db = self.db.lock().expect("db lock");
+        let db = self.acquire_reader();
         let count: i64 = db.query_row(
             "SELECT COUNT(*) FROM chunks WHERE storage_format = 2",
             [],
@@ -509,7 +552,7 @@ impl CastoreBackend {
 
     /// List paths ordered by last access time (oldest first), for GC.
     pub fn paths_by_access_asc(&self) -> color_eyre::Result<Vec<(String, u64)>> {
-        let db = self.db.lock().expect("db lock");
+        let db = self.acquire_reader();
         let mut stmt =
             db.prepare("SELECT hash, nar_size FROM cas_paths ORDER BY last_access ASC")?;
         let results = stmt
@@ -657,7 +700,7 @@ impl CastoreBackend {
 
     /// Load a CaDirectory from SQLite by its digest, verifying integrity.
     fn load_directory(&self, digest: &[u8; 32]) -> color_eyre::Result<CaDirectory> {
-        let db = self.db.lock().expect("db lock");
+        let db = self.acquire_reader();
         let data: Vec<u8> = db.query_row(
             "SELECT data FROM directories WHERE digest = ?1",
             params![digest.as_slice()],
@@ -843,7 +886,7 @@ impl CastoreBackend {
 
     /// Read a file's data by reading and concatenating its chunks.
     fn read_file_data(&self, file_digest: &[u8; 32]) -> color_eyre::Result<Vec<u8>> {
-        let db = self.db.lock().expect("db lock");
+        let db = self.acquire_reader();
         let mut stmt = db.prepare(
             "SELECT chunk_digest, chunk_size FROM file_chunks WHERE file_digest = ?1 ORDER BY \
              chunk_index",
@@ -901,7 +944,7 @@ impl CastoreBackend {
 
                 if file_seen.insert(file_digest) {
                     // Query file chunks once for both missing-chunk and mapping collection.
-                    let db = self.db.lock().expect("db lock");
+                    let db = self.acquire_reader();
                     let mut stmt = db.prepare(
                         "SELECT chunk_digest, chunk_size FROM file_chunks WHERE file_digest = ?1 \
                          ORDER BY chunk_index",
@@ -1035,7 +1078,7 @@ impl CastoreBackend {
 
     /// Load narinfo metadata from SQLite.
     fn load_metadata(&self, hash: &str) -> color_eyre::Result<Option<NarInfo>> {
-        let db = self.db.lock().expect("db lock");
+        let db = self.acquire_reader();
         Self::load_metadata_with_conn(&db, hash)
     }
 
@@ -1107,7 +1150,7 @@ impl StorageBackend for CastoreBackend {
     }
 
     fn has_narinfo(&self, hash: &str) -> color_eyre::Result<bool> {
-        let db = self.db.lock().expect("db lock");
+        let db = self.acquire_reader();
         let exists: bool = db.query_row(
             "SELECT EXISTS(SELECT 1 FROM cas_paths WHERE hash = ?1)",
             params![hash],
@@ -1145,7 +1188,7 @@ impl StorageBackend for CastoreBackend {
             .ok_or_else(|| color_eyre::eyre::eyre!("invalid narinfo content"))?;
 
         // Check if we already have CAS data for this path. If so, just update metadata.
-        let db = self.db.lock().expect("db lock");
+        let db = self.acquire_reader();
         let has_root: bool = db.query_row(
             "SELECT EXISTS(SELECT 1 FROM cas_paths WHERE hash = ?1)",
             params![hash],
