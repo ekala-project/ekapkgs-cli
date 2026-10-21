@@ -162,8 +162,9 @@ pub struct DeltaCache {
 }
 
 struct DeltaCacheInner {
-    /// Entries in insertion order (oldest first).
-    entries: Vec<((String, String), Vec<u8>)>,
+    /// Entries in insertion order (oldest first). Uses VecDeque for O(1)
+    /// front eviction instead of Vec's O(n) shift.
+    entries: std::collections::VecDeque<((String, String), Vec<u8>)>,
     total_bytes: usize,
 }
 
@@ -174,7 +175,7 @@ impl DeltaCache {
     pub fn new() -> Self {
         Self {
             entries: std::sync::Mutex::new(DeltaCacheInner {
-                entries: Vec::new(),
+                entries: std::collections::VecDeque::new(),
                 total_bytes: 0,
             }),
         }
@@ -190,18 +191,20 @@ impl DeltaCache {
             .iter()
             .position(|((b, t), _)| b == &base_hash && t == &target_hash)
         {
-            let (_, old) = inner.entries.remove(pos);
-            inner.total_bytes -= old.len();
+            if let Some((_, old)) = inner.entries.remove(pos) {
+                inner.total_bytes -= old.len();
+            }
         }
 
         // Evict oldest entries until we have room.
         while inner.total_bytes + delta_len > DELTA_CACHE_MAX_BYTES && !inner.entries.is_empty() {
-            let (_, evicted) = inner.entries.remove(0);
-            inner.total_bytes -= evicted.len();
+            if let Some((_, evicted)) = inner.entries.pop_front() {
+                inner.total_bytes -= evicted.len();
+            }
         }
 
         inner.total_bytes += delta_len;
-        inner.entries.push(((base_hash, target_hash), delta));
+        inner.entries.push_back(((base_hash, target_hash), delta));
     }
 
     pub fn get(&self, base_hash: &str, target_hash: &str) -> Option<Vec<u8>> {
