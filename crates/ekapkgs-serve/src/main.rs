@@ -1136,7 +1136,10 @@ fn notify_ready() {
     }
 }
 
-/// Spawn a watchdog task that pings systemd at half the configured interval.
+/// Spawn a watchdog thread that pings systemd at half the configured interval.
+///
+/// This runs on a dedicated OS thread rather than a tokio task so that watchdog
+/// pings are not blocked when the async runtime is saturated with request handling.
 fn spawn_watchdog() {
     let Some(watchdog_usec) = std::env::var("WATCHDOG_USEC")
         .ok()
@@ -1148,14 +1151,15 @@ fn spawn_watchdog() {
     let interval =
         std::time::Duration::from_micros(watchdog_usec / 2).max(std::time::Duration::from_secs(1));
 
-    tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(interval);
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        loop {
-            ticker.tick().await;
-            let _ = sd_notify::notify(false, &[sd_notify::NotifyState::Watchdog]);
-        }
-    });
+    std::thread::Builder::new()
+        .name("sd-watchdog".into())
+        .spawn(move || {
+            loop {
+                std::thread::sleep(interval);
+                let _ = sd_notify::notify(false, &[sd_notify::NotifyState::Watchdog]);
+            }
+        })
+        .expect("failed to spawn watchdog thread");
 }
 
 /// Attempt systemd socket activation via inherited file descriptors.
