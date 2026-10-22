@@ -81,7 +81,7 @@ fn load_fuzzy_candidates(conn: &Connection) -> color_eyre::Result<Vec<PackageCan
                 description: row.get::<_, Option<String>>(1)?.unwrap_or_default(),
             })
         })?
-        .filter_map(|r| r.ok())
+        .filter_map(Result::ok)
         .collect();
     Ok(entries)
 }
