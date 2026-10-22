@@ -2,6 +2,16 @@
 
 Nix CLI wrapper with a negotiated binary cache protocol. Two binaries: `ekapkgs` (client) and `ekapkgs-serve` (server). Resolves entire closures in a single gRPC round trip instead of ~3N HTTP requests.
 
+## Post-Edit Checks
+
+After every code edit, run the following commands and fix any issues before proceeding:
+
+```bash
+cargo fmt --all                          # format Rust code
+nix fmt .                                # format all files (Rust, Nix, etc.)
+cargo clippy --workspace -- -D warnings  # lint (warnings are errors)
+```
+
 ## Project
 
 - [Project Structure](docs/agents/project-structure.md) — workspace layout, crate roles, edition/MSRV
