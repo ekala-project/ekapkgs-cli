@@ -147,8 +147,8 @@ where
 
             // Determine if we need an LDM permit.
             let actual_use_ldm = if use_ldm {
-                let needs_permit = is_streaming
-                    || content_length.is_none_or(|len| len >= LARGE_BODY_THRESHOLD);
+                let needs_permit =
+                    is_streaming || content_length.is_none_or(|len| len >= LARGE_BODY_THRESHOLD);
                 if needs_permit {
                     ldm_semaphore.clone().try_acquire_owned().is_ok()
                 } else {
@@ -173,9 +173,9 @@ where
                         return;
                     };
                     if effective_window_log > 0 {
-                        let _ = encoder.set_parameter(
-                            zstd::zstd_safe::CParameter::WindowLog(effective_window_log),
-                        );
+                        let _ = encoder.set_parameter(zstd::zstd_safe::CParameter::WindowLog(
+                            effective_window_log,
+                        ));
                     }
                     if actual_use_ldm {
                         let _ = encoder.set_parameter(
@@ -211,10 +211,7 @@ where
                 });
 
                 let mut headers = parts.headers;
-                headers.insert(
-                    header::CONTENT_ENCODING,
-                    HeaderValue::from_static("zstd"),
-                );
+                headers.insert(header::CONTENT_ENCODING, HeaderValue::from_static("zstd"));
                 headers.remove(header::CONTENT_LENGTH);
                 headers.append(header::VARY, HeaderValue::from_static("accept-encoding"));
 

@@ -413,9 +413,8 @@ impl CacheService for NegotiateService {
             for hash in req.path_hashes {
                 // Acquire a NAR semaphore permit to bound memory from
                 // concurrent NAR materializations.
-                let permit = match state.nar_semaphore.clone().acquire_owned().await {
-                    Ok(p) => p,
-                    Err(_) => return, // server shutting down
+                let Ok(permit) = state.nar_semaphore.clone().acquire_owned().await else {
+                    return; // server shutting down
                 };
 
                 // Check for a cached delta first (small, already in memory).
@@ -457,8 +456,7 @@ impl CacheService for NegotiateService {
 
                 // Stream the NAR through a tokio mpsc channel — only one
                 // file's worth of data is in memory at a time.
-                let (nar_tx, mut nar_rx) =
-                    tokio::sync::mpsc::channel::<Vec<u8>>(4);
+                let (nar_tx, mut nar_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4);
 
                 let st = Arc::clone(&state);
                 let nar_url_clone = nar_url.clone();
@@ -468,10 +466,7 @@ impl CacheService for NegotiateService {
                     // Write NAR chunks into a ChannelWriter backed by
                     // blocking_send on the tokio mpsc sender.
                     let mut writer = TokioChannelWriter::new(NAR_CHUNK_SIZE, nar_tx);
-                    let mut bw = std::io::BufWriter::with_capacity(
-                        NAR_CHUNK_SIZE,
-                        &mut writer,
-                    );
+                    let mut bw = std::io::BufWriter::with_capacity(NAR_CHUNK_SIZE, &mut writer);
                     match st.storage.write_nar_to(&nar_url_clone, &mut bw) {
                         Ok(true) => {
                             let _ = std::io::Write::flush(&mut bw);
@@ -957,8 +952,7 @@ impl std::io::Write for TokioChannelWriter {
             written += n;
 
             if self.buf.len() >= self.chunk_size {
-                let chunk =
-                    std::mem::replace(&mut self.buf, Vec::with_capacity(self.chunk_size));
+                let chunk = std::mem::replace(&mut self.buf, Vec::with_capacity(self.chunk_size));
                 self.tx.blocking_send(chunk).map_err(|_| {
                     std::io::Error::new(std::io::ErrorKind::BrokenPipe, "receiver dropped")
                 })?;
