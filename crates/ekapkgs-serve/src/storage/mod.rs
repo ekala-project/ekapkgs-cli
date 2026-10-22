@@ -134,8 +134,55 @@ pub trait StorageBackend: Send + Sync {
         Ok(available)
     }
 
-    /// Get a NAR file as bytes. Returns `(data, content_type)`.
+    /// Get a NAR file as bytes.
     fn get_nar(&self, file_path: &str) -> color_eyre::Result<Option<Vec<u8>>>;
+
+    /// Check if a NAR exists without reading its data.
+    ///
+    /// Used for existence probes before streaming. Default implementation
+    /// falls back to `has_narinfo` for the path hash extracted from the URL.
+    fn has_nar(&self, file_path: &str) -> color_eyre::Result<bool> {
+        let filename = file_path.rsplit('/').next().unwrap_or(file_path);
+        let hash = filename.split('.').next().unwrap_or(filename);
+        self.has_narinfo(hash)
+    }
+
+    /// Write a NAR to the given writer, streaming where possible.
+    ///
+    /// Returns `Ok(false)` if the NAR was not found. Default implementation
+    /// falls back to `get_nar()` + `write_all()`.
+    fn write_nar_to(
+        &self,
+        file_path: &str,
+        w: &mut dyn std::io::Write,
+    ) -> color_eyre::Result<bool> {
+        match self.get_nar(file_path)? {
+            Some(data) => {
+                w.write_all(&data)?;
+                Ok(true)
+            },
+            None => Ok(false),
+        }
+    }
+
+    /// Stream a NAR into a channel as fixed-size byte chunks.
+    ///
+    /// Sends `Vec<u8>` chunks through the provided sender. Returns `false`
+    /// if the NAR was not found. The default implementation calls
+    /// `write_nar_to` with a `ChannelWriter` adapter.
+    fn stream_nar_chunks(
+        &self,
+        file_path: &str,
+        chunk_size: usize,
+        tx: &std::sync::mpsc::SyncSender<Vec<u8>>,
+    ) -> color_eyre::Result<bool> {
+        let mut writer = ChannelWriter::new(chunk_size, tx.clone());
+        let found = self.write_nar_to(file_path, &mut writer)?;
+        if found {
+            writer.flush_final()?;
+        }
+        Ok(found)
+    }
 
     /// Store a narinfo. Returns false if the backend is read-only.
     fn put_narinfo(&self, hash: &str, content: &str) -> color_eyre::Result<bool> {
@@ -167,6 +214,61 @@ pub trait StorageBackend: Send + Sync {
     /// Get the serialized CaNode root for a store path hash.
     fn get_cas_root(&self, _hash: &str) -> color_eyre::Result<Option<Vec<u8>>> {
         Ok(None)
+    }
+}
+
+/// `Write` adapter that buffers into `chunk_size` blocks and sends each
+/// completed block through a synchronous channel. Used by
+/// `stream_nar_chunks` to shuttle NAR data from a blocking writer thread
+/// to an async consumer without materializing the entire NAR.
+pub struct ChannelWriter {
+    buf: Vec<u8>,
+    chunk_size: usize,
+    tx: std::sync::mpsc::SyncSender<Vec<u8>>,
+}
+
+impl ChannelWriter {
+    pub fn new(chunk_size: usize, tx: std::sync::mpsc::SyncSender<Vec<u8>>) -> Self {
+        Self {
+            buf: Vec::with_capacity(chunk_size),
+            chunk_size,
+            tx,
+        }
+    }
+
+    /// Flush any remaining buffered data as a final (possibly short) chunk.
+    pub fn flush_final(&mut self) -> std::io::Result<()> {
+        if !self.buf.is_empty() {
+            let chunk = std::mem::take(&mut self.buf);
+            self.tx.send(chunk).map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::BrokenPipe, "receiver dropped")
+            })?;
+        }
+        Ok(())
+    }
+}
+
+impl std::io::Write for ChannelWriter {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        let mut written = 0;
+        while written < data.len() {
+            let space = self.chunk_size - self.buf.len();
+            let n = space.min(data.len() - written);
+            self.buf.extend_from_slice(&data[written..written + n]);
+            written += n;
+
+            if self.buf.len() >= self.chunk_size {
+                let chunk = std::mem::replace(&mut self.buf, Vec::with_capacity(self.chunk_size));
+                self.tx.send(chunk).map_err(|_| {
+                    std::io::Error::new(std::io::ErrorKind::BrokenPipe, "receiver dropped")
+                })?;
+            }
+        }
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
     }
 }
 

@@ -1539,6 +1539,7 @@ dependencies = [
  "ekapkgs-protocol",
  "ekapkgs-ui",
  "fastcdc",
+ "futures",
  "getrandom 0.3.4",
  "http-body-util",
  "listenfd",

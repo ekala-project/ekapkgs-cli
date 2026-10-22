@@ -504,8 +504,9 @@ fn not_found_response() -> Response {
 
 /// GET /nar/{file}
 ///
-/// Supports HTTP Range requests for resumable downloads. Returns
-/// `Accept-Ranges: bytes` and `Content-Length` on all responses.
+/// Streams NAR data directly from storage to the client. Only one file's
+/// worth of data is in memory at a time (for CAS backends). Range
+/// requests fall back to buffered reads since they are uncommon.
 pub async fn get_nar(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -515,23 +516,114 @@ pub async fn get_nar(
         return not_found_response();
     }
 
-    let nar_path = format!("nar/{file}");
+    let content_type = if file.ends_with(".zst") {
+        "application/zstd"
+    } else if file.ends_with(".xz") {
+        "application/x-xz"
+    } else {
+        "application/x-nix-nar"
+    };
 
-    // Acquire a NAR semaphore permit to bound concurrent memory-heavy
-    // operations. Each NAR download may hold the full NAR in memory.
-    let _permit = match state.nar_semaphore.acquire().await {
+    let nar_path = format!("nar/{file}");
+    let has_range = headers.get(header::RANGE).is_some();
+
+    // Probe whether the NAR exists before starting to stream. This avoids
+    // returning 200 with an empty body for missing NARs.
+    let nar_path_probe = nar_path.clone();
+    let st_probe = Arc::clone(&state);
+    let nar_exists = tokio::task::spawn_blocking(move || {
+        st_probe.storage.has_nar(&nar_path_probe).unwrap_or(false)
+    })
+    .await
+    .unwrap_or(false);
+    if !nar_exists {
+        return not_found_response();
+    }
+
+    let hash = file.split('.').next().unwrap_or(&file);
+
+    // Acquire a NAR semaphore permit to bound concurrent memory usage.
+    let permit = match state.nar_semaphore.clone().acquire_owned().await {
         Ok(p) => p,
         Err(_) => {
             return (StatusCode::SERVICE_UNAVAILABLE, "server shutting down").into_response();
         },
     };
 
-    // Offload the potentially heavy NAR read (CAS reassembly, decompression)
-    // to the blocking pool so it doesn't starve the async runtime.
+    // Range requests need the full data for slicing — fall back to buffered.
+    if has_range {
+        return get_nar_buffered(state, headers, file, nar_path, content_type, permit).await;
+    }
+
+    // Stream the NAR through a channel so only one file's worth of data is
+    // in memory at a time. The blocking thread writes into a ChannelWriter;
+    // we receive fixed-size chunks and forward them as a streaming body.
+    //
+    // Buffer up to 4 chunks (~256 KiB) to keep the writer from stalling
+    // while the async side drains to the network.
+    const STREAM_CHUNK_SIZE: usize = 64 * 1024;
+    let (chunk_tx, chunk_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(4);
+
     let storage_state = Arc::clone(&state);
+    let file_clone = file.clone();
     let nar_path_clone = nar_path.clone();
+
+    // Spawn the writer on the blocking pool.
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit; // keep permit alive during write
+        if let Err(e) =
+            storage_state
+                .storage
+                .stream_nar_chunks(&nar_path_clone, STREAM_CHUNK_SIZE, &chunk_tx)
+        {
+            tracing::error!("NAR streaming write failed for {}: {e}", file_clone);
+        }
+        // chunk_tx is dropped here → receiver will see disconnected.
+    });
+
+    // Record access for GC tracking.
+    if let Some(ref tracker) = state.gc_tracker {
+        tracker.record_access(hash);
+    }
+
+    state.metrics.nar_downloads_total.inc();
+
+    // Convert the sync receiver into an async stream for axum.
+    let stream = futures::stream::unfold(chunk_rx, |rx| async move {
+        // Yield to the runtime so the blocking writer can make progress.
+        let result = tokio::task::spawn_blocking(move || match rx.recv() {
+            Ok(chunk) => Some((chunk, rx)),
+            Err(_) => None, // channel closed
+        })
+        .await
+        .ok()
+        .flatten();
+
+        result.map(|(chunk, rx)| (Ok::<_, std::io::Error>(chunk), rx))
+    });
+    let body = axum::body::Body::from_stream(stream);
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, content_type)
+        .header(header::CACHE_CONTROL, "max-age=31536000")
+        .body(body)
+        .unwrap()
+        .into_response()
+}
+
+/// Buffered NAR download for Range requests.
+async fn get_nar_buffered(
+    state: Arc<AppState>,
+    headers: HeaderMap,
+    file: String,
+    nar_path: String,
+    content_type: &str,
+    _permit: tokio::sync::OwnedSemaphorePermit,
+) -> Response {
+    let storage_state = Arc::clone(&state);
     let nar_result =
-        tokio::task::spawn_blocking(move || storage_state.storage.get_nar(&nar_path_clone))
+        tokio::task::spawn_blocking(move || storage_state.storage.get_nar(&nar_path))
             .await
             .unwrap_or_else(|e| Err(color_eyre::eyre::eyre!("spawn_blocking join: {e}")));
 
@@ -539,23 +631,13 @@ pub async fn get_nar(
         Ok(Some(data)) => {
             state.metrics.nar_downloads_total.inc();
 
-            // Record access for GC tracking.
             if let Some(ref tracker) = state.gc_tracker {
                 let hash = file.split('.').next().unwrap_or(&file);
                 tracker.record_access(hash);
             }
 
-            let content_type = if file.ends_with(".zst") {
-                "application/zstd"
-            } else if file.ends_with(".xz") {
-                "application/x-xz"
-            } else {
-                "application/x-nix-nar"
-            };
-
             let total_len = data.len();
 
-            // Check for Range header.
             if let Some(range) = headers
                 .get(header::RANGE)
                 .and_then(|v| v.to_str().ok())

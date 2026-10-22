@@ -63,14 +63,36 @@ impl StorageBackend for FilesystemBackend {
     }
 
     fn get_nar(&self, file_path: &str) -> color_eyre::Result<Option<Vec<u8>>> {
+        let mut buf = Vec::new();
+        if self.write_nar_to(file_path, &mut buf)? {
+            Ok(Some(buf))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn has_nar(&self, file_path: &str) -> color_eyre::Result<bool> {
+        let Some(path) = self.safe_join(file_path) else {
+            return Ok(false);
+        };
+        Ok(path.exists())
+    }
+
+    fn write_nar_to(
+        &self,
+        file_path: &str,
+        w: &mut dyn std::io::Write,
+    ) -> color_eyre::Result<bool> {
         let Some(path) = self.safe_join(file_path) else {
             tracing::warn!("Rejected NAR path traversal attempt: {file_path}");
-            return Ok(None);
+            return Ok(false);
         };
         if !path.exists() {
-            return Ok(None);
+            return Ok(false);
         }
-        Ok(Some(std::fs::read(path)?))
+        let mut file = std::fs::File::open(path)?;
+        std::io::copy(&mut file, w)?;
+        Ok(true)
     }
 
     fn put_narinfo(&self, hash: &str, content: &str) -> color_eyre::Result<bool> {
