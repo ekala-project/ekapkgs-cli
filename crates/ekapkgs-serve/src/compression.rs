@@ -139,7 +139,93 @@ where
                 config.window_log.min(cap)
             };
 
-            // Collect body bytes.
+            // For streaming responses (no Content-Length), compress each
+            // chunk as it arrives via a streaming zstd encoder. For
+            // buffered responses (known size), use the original
+            // collect-then-compress path for better ratio.
+            let is_streaming = content_length.is_none();
+
+            // Determine if we need an LDM permit.
+            let actual_use_ldm = if use_ldm {
+                let needs_permit = is_streaming
+                    || content_length.is_none_or(|len| len >= LARGE_BODY_THRESHOLD);
+                if needs_permit {
+                    ldm_semaphore.clone().try_acquire_owned().is_ok()
+                } else {
+                    true
+                }
+            } else {
+                false
+            };
+
+            let level = config.level;
+
+            if is_streaming {
+                // Streaming compression: pipe body chunks through a zstd
+                // encoder on a blocking task, sending compressed frames
+                // through a channel. This avoids materializing the full
+                // response in memory.
+                let (comp_tx, comp_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4);
+
+                tokio::task::spawn_blocking(move || {
+                    let writer = BlockingSender(comp_tx);
+                    let Ok(mut encoder) = zstd::Encoder::new(writer, level) else {
+                        return;
+                    };
+                    if effective_window_log > 0 {
+                        let _ = encoder.set_parameter(
+                            zstd::zstd_safe::CParameter::WindowLog(effective_window_log),
+                        );
+                    }
+                    if actual_use_ldm {
+                        let _ = encoder.set_parameter(
+                            zstd::zstd_safe::CParameter::EnableLongDistanceMatching(true),
+                        );
+                    }
+
+                    // Collect body frames and feed them to the encoder.
+                    let rt = tokio::runtime::Handle::current();
+                    let mut body = body;
+                    loop {
+                        let frame = rt.block_on(async {
+                            use http_body_util::BodyExt as _;
+                            body.frame().await
+                        });
+                        match frame {
+                            Some(Ok(frame)) => {
+                                if let Ok(data) = frame.into_data() {
+                                    if encoder.write_all(&data).is_err() {
+                                        return;
+                                    }
+                                }
+                            },
+                            _ => break,
+                        }
+                    }
+                    let _ = encoder.finish();
+                });
+
+                let stream = futures::stream::unfold(comp_rx, |mut rx| async move {
+                    let chunk = rx.recv().await?;
+                    Some((Ok::<_, std::io::Error>(chunk), rx))
+                });
+
+                let mut headers = parts.headers;
+                headers.insert(
+                    header::CONTENT_ENCODING,
+                    HeaderValue::from_static("zstd"),
+                );
+                headers.remove(header::CONTENT_LENGTH);
+                headers.append(header::VARY, HeaderValue::from_static("accept-encoding"));
+
+                let mut response = Response::new(Body::from_stream(stream));
+                *response.status_mut() = parts.status;
+                *response.headers_mut() = headers;
+                *response.version_mut() = parts.version;
+                return Ok(response);
+            }
+
+            // Buffered path: collect body, then compress in one shot.
             let Ok(body_bytes) = collect_body(body).await else {
                 return Ok((StatusCode::INTERNAL_SERVER_ERROR, "compression error").into_response());
             };
@@ -147,27 +233,6 @@ where
             if body_bytes.is_empty() {
                 return Ok(Response::from_parts(parts, Body::from(body_bytes)));
             }
-
-            // Determine if we need an LDM permit.
-            let needs_ldm_permit = use_ldm
-                && (content_length.is_none_or(|len| len >= LARGE_BODY_THRESHOLD)
-                    || body_bytes.len() as u64 >= LARGE_BODY_THRESHOLD);
-
-            let actual_use_ldm = if needs_ldm_permit {
-                // Try to acquire non-blocking; fall back to no-LDM if unavailable.
-                match ldm_semaphore.clone().try_acquire_owned() {
-                    Ok(permit) => {
-                        // Keep permit alive during compression; drop after.
-                        let _permit = permit;
-                        true
-                    },
-                    Err(_) => false,
-                }
-            } else {
-                use_ldm
-            };
-
-            let level = config.level;
 
             // Compress: inline for small chunks, blocking pool for large.
             let compressed = if body_bytes.len() < INLINE_COMPRESS_THRESHOLD {
@@ -199,6 +264,24 @@ where
 
             Ok(response)
         })
+    }
+}
+
+/// `std::io::Write` adapter that sends bytes through a tokio mpsc channel
+/// using `blocking_send`. Used by the streaming compression path to pipe
+/// compressed output from a blocking zstd encoder to an async response body.
+struct BlockingSender(tokio::sync::mpsc::Sender<Vec<u8>>);
+
+impl std::io::Write for BlockingSender {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0
+            .blocking_send(buf.to_vec())
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "receiver dropped"))?;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
     }
 }
 
