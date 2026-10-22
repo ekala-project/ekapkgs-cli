@@ -6,51 +6,21 @@
 //! returns empty completions.
 
 use std::ffi::OsStr;
-use std::io::Read;
-use std::path::PathBuf;
 
 use clap_complete::engine::CompletionCandidate;
+use rusqlite::Connection;
 
 // ---------------------------------------------------------------------------
 // Package completions (from search index)
 // ---------------------------------------------------------------------------
 
-#[derive(serde::Deserialize)]
-struct PackageSearchEntry {
-    attr: String,
-    #[serde(default)]
-    pname: String,
-    #[serde(default)]
-    version: String,
-    #[serde(default)]
-    description: String,
-    #[serde(default)]
-    outputs: Vec<String>,
-    #[serde(default)]
-    main_program: Option<String>,
-}
-
-fn index_dir() -> PathBuf {
-    let dir = directories::ProjectDirs::from("", "", "ekapkgs")
-        .map(|d| d.cache_dir().to_path_buf())
-        .unwrap_or_else(|| {
-            let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-            PathBuf::from(home).join(".cache/ekapkgs")
-        });
-    dir.join("indexes")
-}
-
-fn load_package_index() -> Option<Vec<PackageSearchEntry>> {
-    let dir = index_dir();
-    let path = dir.join("packages-nixpkgs.json.zst");
+fn open_search_db() -> Option<Connection> {
+    let dir = crate::commands::search::cache_dir().ok()?;
+    let path = dir.join("search.db");
     if !path.exists() {
         return None;
     }
-    let compressed = std::fs::read(&path).ok()?;
-    let mut decoder = zstd::Decoder::new(compressed.as_slice()).ok()?;
-    let mut data = Vec::new();
-    decoder.read_to_end(&mut data).ok()?;
-    serde_json::from_slice(&data).ok()
+    Connection::open(&path).ok()
 }
 
 /// Complete package names from the search index.
@@ -59,32 +29,54 @@ pub fn complete_packages(current: &OsStr) -> Vec<CompletionCandidate> {
         return Vec::new();
     };
     let current_lower = current.to_lowercase();
+    let like_pattern = format!("{current_lower}%");
 
-    let Some(entries) = load_package_index() else {
+    let Some(conn) = open_search_db() else {
         return Vec::new();
     };
 
-    let mut candidates: Vec<CompletionCandidate> = entries
-        .iter()
-        .filter(|e| {
-            e.attr.to_lowercase().starts_with(&current_lower)
-                || e.pname.to_lowercase().starts_with(&current_lower)
-        })
-        .take(100)
-        .map(|e| {
-            let mut help = format!("{} ({})", e.pname, e.version);
-            if !e.outputs.is_empty() && e.outputs != ["out"] {
-                help.push_str(&format!(" [{}]", e.outputs.join(", ")));
+    let mut stmt = match conn.prepare(
+        "SELECT attr, pname, version, description, outputs, main_program
+         FROM packages
+         WHERE LOWER(attr) LIKE ?1 OR LOWER(pname) LIKE ?1
+         LIMIT 100",
+    ) {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
+
+    let mut candidates: Vec<CompletionCandidate> = stmt
+        .query_map([&like_pattern], |row| {
+            let attr: String = row.get(0)?;
+            let pname: String = row.get(1)?;
+            let version: String = row.get(2)?;
+            let description: Option<String> = row.get(3)?;
+            let outputs_json: Option<String> = row.get(4)?;
+            let main_program: Option<String> = row.get(5)?;
+
+            let outputs: Vec<String> = outputs_json
+                .and_then(|s| serde_json::from_str(&s).ok())
+                .unwrap_or_default();
+
+            let mut help = format!("{pname} ({version})");
+            if !outputs.is_empty() && outputs != ["out"] {
+                help.push_str(&format!(" [{}]", outputs.join(", ")));
             }
-            if let Some(prog) = &e.main_program {
+            if let Some(prog) = &main_program {
                 help.push_str(&format!(" bin:{prog}"));
             }
-            if !e.description.is_empty() {
-                help.push(' ');
-                help.push_str(&e.description);
+            if let Some(desc) = &description {
+                if !desc.is_empty() {
+                    help.push(' ');
+                    help.push_str(desc);
+                }
             }
-            CompletionCandidate::new(&e.attr).help(Some(help.into()))
+            Ok(CompletionCandidate::new(attr).help(Some(help.into())))
         })
+        .ok()
+        .into_iter()
+        .flatten()
+        .filter_map(|r| r.ok())
         .collect();
 
     candidates.sort();

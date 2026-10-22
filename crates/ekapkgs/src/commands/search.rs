@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use ekapkgs_nix::NixCommand;
 use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config, Matcher, Utf32Str};
+use rusqlite::Connection;
 use yansi::Paint;
 
 use crate::cli::SearchCommand;
@@ -49,16 +50,179 @@ pub(crate) fn cache_dir() -> color_eyre::Result<PathBuf> {
     Ok(index_dir)
 }
 
-pub(crate) fn index_path(name: &str) -> color_eyre::Result<PathBuf> {
-    Ok(cache_dir()?.join(format!("{name}.json.zst")))
+/// Path to the search database.
+fn db_path() -> color_eyre::Result<PathBuf> {
+    Ok(cache_dir()?.join("search.db"))
 }
 
-pub(crate) fn write_index(name: &str, data: &[u8]) -> color_eyre::Result<()> {
-    let path = index_path(name)?;
-    let compressed = zstd::encode_all(data, 3)?;
-    std::fs::write(&path, compressed)?;
-    tracing::info!("Wrote index {} ({} bytes)", path.display(), data.len());
+/// Open the search database, returning `None` if it doesn't exist.
+fn open_db() -> color_eyre::Result<Option<Connection>> {
+    let path = db_path()?;
+    if !path.exists() {
+        return Ok(None);
+    }
+    let conn = Connection::open(&path)?;
+    Ok(Some(conn))
+}
+
+/// Open the search database, creating it from nix if it doesn't exist.
+fn open_or_generate_db(flake: &str) -> color_eyre::Result<Connection> {
+    if let Some(conn) = open_db()? {
+        return Ok(conn);
+    }
+
+    // Try downloading from configured index_url.
+    if let Ok(config) = crate::config::ClientConfig::load() {
+        if let Some(url) = &config.defaults.index_url {
+            if try_download_db(url).is_ok() {
+                if let Some(conn) = open_db()? {
+                    return Ok(conn);
+                }
+            }
+        }
+    }
+
+    // Generate locally.
+    let path = db_path()?;
+    generate_local_db(&path, flake)?;
+    let conn = Connection::open(&path)?;
+    Ok(conn)
+}
+
+/// Download `search.db.zst` from a remote URL, decompress, and save.
+fn try_download_db(base_url: &str) -> color_eyre::Result<()> {
+    let url = format!("{base_url}/search.db.zst");
+    let spinner = ekapkgs_ui::progress::spinner("Downloading search index...");
+    let rt = tokio::runtime::Runtime::new()?;
+    let compressed = rt.block_on(async {
+        let resp = reqwest::Client::new().get(&url).send().await?;
+        if !resp.status().is_success() {
+            return Err(color_eyre::eyre::eyre!("HTTP {} for {url}", resp.status()));
+        }
+        let bytes = resp.bytes().await?;
+        Ok(bytes.to_vec())
+    })?;
+    spinner.finish_and_clear();
+
+    let mut decoder = zstd::Decoder::new(compressed.as_slice())?;
+    let mut data = Vec::new();
+    decoder.read_to_end(&mut data)?;
+
+    let path = db_path()?;
+    std::fs::write(&path, &data)?;
+    tracing::info!(
+        "Downloaded search index to {} ({} bytes)",
+        path.display(),
+        data.len()
+    );
     Ok(())
+}
+
+/// Generate a local search.db by running `nix search` and `nix eval`.
+fn generate_local_db(path: &std::path::Path, flake: &str) -> color_eyre::Result<()> {
+    let conn = Connection::open(path)?;
+
+    conn.execute_batch(
+        "PRAGMA journal_mode = OFF;
+         PRAGMA synchronous = OFF;
+         PRAGMA locking_mode = EXCLUSIVE;
+         PRAGMA page_size = 4096;",
+    )?;
+
+    create_schema(&conn)?;
+
+    // Generate package entries.
+    let spinner = ekapkgs_ui::progress::spinner("Generating package index...");
+    let packages = generate_package_entries(flake);
+    spinner.finish_and_clear();
+    match packages {
+        Ok(entries) => {
+            println!("Package index: {} entries", entries.len());
+            insert_packages(&conn, &entries)?;
+        },
+        Err(e) => tracing::warn!("Failed to generate package index: {e}"),
+    }
+
+    // Generate option entries.
+    let spinner = ekapkgs_ui::progress::spinner("Generating option index...");
+    let options = generate_option_entries(flake);
+    spinner.finish_and_clear();
+    match options {
+        Ok(entries) => {
+            println!("Option index: {} entries", entries.len());
+            insert_options(&conn, &entries)?;
+        },
+        Err(e) => tracing::warn!("Failed to generate option index: {e}"),
+    }
+
+    // Optimize FTS indexes.
+    conn.execute_batch(
+        "INSERT INTO packages_fts(packages_fts) VALUES('optimize');
+         INSERT INTO files_fts(files_fts) VALUES('optimize');",
+    )?;
+    conn.execute_batch("VACUUM;")?;
+
+    println!("Index saved to {}", path.display());
+    Ok(())
+}
+
+/// Create the SQLite schema (matches eka-ci's search_index crate).
+fn create_schema(conn: &Connection) -> color_eyre::Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS packages (
+            attr         TEXT PRIMARY KEY,
+            pname        TEXT NOT NULL,
+            version      TEXT NOT NULL,
+            description  TEXT,
+            outputs      TEXT,
+            main_program TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS files (
+            file    TEXT NOT NULL,
+            package TEXT NOT NULL,
+            output  TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_files_file    ON files(file);
+        CREATE INDEX IF NOT EXISTS idx_files_package ON files(package);
+
+        CREATE TABLE IF NOT EXISTS options (
+            name         TEXT PRIMARY KEY,
+            description  TEXT,
+            type         TEXT,
+            default_val  TEXT,
+            example      TEXT,
+            declarations TEXT,
+            read_only    INTEGER NOT NULL DEFAULT 0
+        );
+
+        CREATE TABLE IF NOT EXISTS metadata (
+            key   TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
+
+        CREATE VIRTUAL TABLE IF NOT EXISTS packages_fts USING fts5(
+            attr, pname, description,
+            content='packages',
+            content_rowid='rowid'
+        );
+
+        CREATE VIRTUAL TABLE IF NOT EXISTS files_fts USING fts5(
+            file, package,
+            content='files',
+            content_rowid='rowid'
+        );",
+    )?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// JSON index helpers (kept for sonames, which remain json.zst)
+// ---------------------------------------------------------------------------
+
+pub(crate) fn index_path(name: &str) -> color_eyre::Result<PathBuf> {
+    Ok(cache_dir()?.join(format!("{name}.json.zst")))
 }
 
 pub(crate) fn read_index(name: &str) -> color_eyre::Result<Option<Vec<u8>>> {
@@ -73,32 +237,6 @@ pub(crate) fn read_index(name: &str) -> color_eyre::Result<Option<Vec<u8>>> {
     Ok(Some(data))
 }
 
-fn load_or_generate_index<F>(name: &str, generate: F) -> color_eyre::Result<Vec<u8>>
-where
-    F: FnOnce() -> color_eyre::Result<Vec<u8>>,
-{
-    if let Some(data) = read_index(name)? {
-        return Ok(data);
-    }
-
-    // Try downloading from configured index_url before generating locally.
-    if let Ok(config) = crate::config::ClientConfig::load() {
-        if let Some(url) = &config.defaults.index_url {
-            if let Ok(data) = try_download_index(url, name) {
-                return Ok(data);
-            }
-        }
-    }
-
-    let spinner = ekapkgs_ui::progress::spinner(&format!("Generating {name} index..."));
-    let data = generate()?;
-    spinner.finish_and_clear();
-    write_index(name, &data)?;
-    Ok(data)
-}
-
-/// Try to download a single index from a remote URL. Returns the
-/// decompressed data on success.
 pub(crate) fn try_download_index(base_url: &str, name: &str) -> color_eyre::Result<Vec<u8>> {
     let url = format!("{base_url}/{name}.json.zst");
     let spinner = ekapkgs_ui::progress::spinner(&format!("Downloading {name} index..."));
@@ -118,7 +256,6 @@ pub(crate) fn try_download_index(base_url: &str, name: &str) -> color_eyre::Resu
     let path = dir.join(format!("{name}.json.zst"));
     std::fs::write(&path, &compressed)?;
 
-    // Decompress for the caller.
     let mut decoder = zstd::Decoder::new(compressed.as_slice())?;
     let mut data = Vec::new();
     decoder.read_to_end(&mut data)?;
@@ -129,53 +266,86 @@ pub(crate) fn try_download_index(base_url: &str, name: &str) -> color_eyre::Resu
 // Package search
 // ---------------------------------------------------------------------------
 
-#[derive(serde::Deserialize, serde::Serialize)]
-struct PackageEntry {
-    #[serde(default)]
-    pname: String,
-    #[serde(default)]
-    version: String,
-    #[serde(default)]
-    description: String,
-}
-
-fn generate_package_index(flake: &str) -> color_eyre::Result<Vec<u8>> {
-    // `nix search <flake> --json ^` returns { "attr": { pname, version, description }, ... }
-    let output = NixCommand::new(&["search"])
-        .arg(flake)
-        .arg("--json")
-        .arg("^")
-        .output()?;
-    // Convert the map format to a flat array with attr paths.
-    let map: std::collections::HashMap<String, PackageEntry> =
-        serde_json::from_slice(&output.stdout)?;
-    let entries: Vec<PackageSearchEntry> = map
-        .into_iter()
-        .map(|(attr, entry)| PackageSearchEntry {
-            attr,
-            pname: entry.pname,
-            version: entry.version,
-            description: entry.description,
-            outputs: Vec::new(),
-            main_program: None,
-        })
-        .collect();
-    Ok(serde_json::to_vec(&entries)?)
-}
-
-#[derive(serde::Deserialize, serde::Serialize)]
+#[derive(Clone, serde::Deserialize, serde::Serialize)]
 struct PackageSearchEntry {
     attr: String,
     pname: String,
     version: String,
     description: String,
-    /// Package output names (e.g., `["out", "dev", "lib"]`).
-    /// Populated by enriched indexes from CI; empty when generated locally.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     outputs: Vec<String>,
-    /// Binary name from `meta.mainProgram`, if available.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     main_program: Option<String>,
+}
+
+/// Load a PackageSearchEntry from a SQLite row.
+fn row_to_package(row: &rusqlite::Row<'_>) -> rusqlite::Result<PackageSearchEntry> {
+    let outputs_json: Option<String> = row.get(4)?;
+    let outputs: Vec<String> = outputs_json
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+    Ok(PackageSearchEntry {
+        attr: row.get(0)?,
+        pname: row.get(1)?,
+        version: row.get(2)?,
+        description: row.get::<_, Option<String>>(3)?.unwrap_or_default(),
+        outputs,
+        main_program: row.get(5)?,
+    })
+}
+
+const PKG_SELECT: &str =
+    "SELECT attr, pname, version, description, outputs, main_program FROM packages";
+
+fn query_all_packages(conn: &Connection) -> color_eyre::Result<Vec<PackageSearchEntry>> {
+    let mut stmt = conn.prepare(&format!("{PKG_SELECT} ORDER BY pname"))?;
+    let entries = stmt
+        .query_map([], |row| row_to_package(row))?
+        .filter_map(|r| r.ok())
+        .collect();
+    Ok(entries)
+}
+
+fn query_packages_matching(
+    conn: &Connection,
+    query: &str,
+) -> color_eyre::Result<Vec<(u8, PackageSearchEntry)>> {
+    let query_lower = query.to_lowercase();
+    let like_pattern = format!("%{query_lower}%");
+
+    let mut stmt = conn.prepare(&format!(
+        "{PKG_SELECT} WHERE LOWER(pname) LIKE ?1 OR LOWER(attr) LIKE ?1 OR LOWER(description) \
+         LIKE ?1"
+    ))?;
+
+    let entries: Vec<PackageSearchEntry> = stmt
+        .query_map([&like_pattern], |row| row_to_package(row))?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    let mut results: Vec<(u8, PackageSearchEntry)> = entries
+        .into_iter()
+        .map(|e| {
+            let pname_lower = e.pname.to_lowercase();
+            let attr_lower = e.attr.to_lowercase();
+            let desc_lower = e.description.to_lowercase();
+            let score = if pname_lower == query_lower {
+                0
+            } else if pname_lower.starts_with(&query_lower) {
+                1
+            } else if attr_lower.contains(&query_lower) || pname_lower.contains(&query_lower) {
+                2
+            } else if desc_lower.contains(&query_lower) {
+                3
+            } else {
+                4
+            };
+            (score, e)
+        })
+        .collect();
+
+    results.sort_by_key(|(score, e)| (*score, e.pname.clone()));
+    Ok(results)
 }
 
 fn cmd_packages(
@@ -185,48 +355,32 @@ fn cmd_packages(
     names_only: bool,
     limit: usize,
 ) -> color_eyre::Result<()> {
-    let index_name = format!("packages-{}", flake.replace(['/', '#'], "-"));
-    let data = load_or_generate_index(&index_name, || generate_package_index(flake))?;
-    let entries: Vec<PackageSearchEntry> = serde_json::from_slice(&data)?;
+    let conn = open_or_generate_db(flake)?;
 
-    // When the query is empty, return all packages (useful for piping to fzf).
-    // Override the limit to unlimited so `search packages` lists everything.
     let effective_limit = if query.is_empty() { 0 } else { limit };
 
-    let query_lower = query.to_lowercase();
-    let mut results: Vec<(u8, &PackageSearchEntry)> = if query.is_empty() {
-        // Empty query: return all entries with score 0 (sorted by name later).
-        entries.iter().map(|e| (0u8, e)).collect()
-    } else {
-        entries
-            .iter()
-            .filter_map(|e| {
-                let attr_lower = e.attr.to_lowercase();
-                let pname_lower = e.pname.to_lowercase();
-                let desc_lower = e.description.to_lowercase();
-
-                // Score: 0 = exact, 1 = prefix, 2 = contains, 3 = desc contains
-                if pname_lower == query_lower {
-                    Some((0, e))
-                } else if pname_lower.starts_with(&query_lower) {
-                    Some((1, e))
-                } else if attr_lower.contains(&query_lower) || pname_lower.contains(&query_lower) {
-                    Some((2, e))
-                } else if desc_lower.contains(&query_lower) {
-                    Some((3, e))
-                } else {
-                    None
-                }
-            })
+    let mut results: Vec<(u8, PackageSearchEntry)> = if query.is_empty() {
+        query_all_packages(&conn)?
+            .into_iter()
+            .map(|e| (0u8, e))
             .collect()
+    } else {
+        query_packages_matching(&conn, query)?
     };
 
     // If substring matching found few results, add fuzzy matches as tier 4.
     if !query.is_empty() && results.len() < effective_limit.max(1) {
-        let fuzzy = fuzzy_match_entries(&entries, query, effective_limit);
-        for (_, e) in &fuzzy {
-            if !results.iter().any(|(_, r)| std::ptr::eq(*r, *e)) {
-                results.push((4, e));
+        // Load pname + attr for fuzzy matching (lightweight query).
+        let mut stmt = conn.prepare(&format!("{PKG_SELECT} ORDER BY pname"))?;
+        let all_entries: Vec<PackageSearchEntry> = stmt
+            .query_map([], |row| row_to_package(row))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        let fuzzy = fuzzy_match_entries(&all_entries, query, effective_limit);
+        for (_, e) in fuzzy {
+            if !results.iter().any(|(_, r)| r.attr == e.attr) {
+                results.push((4, e.clone()));
             }
         }
     }
@@ -237,7 +391,7 @@ fn cmd_packages(
     }
 
     if json_output {
-        let out: Vec<&PackageSearchEntry> = results.iter().map(|(_, e)| *e).collect();
+        let out: Vec<&PackageSearchEntry> = results.iter().map(|(_, e)| e).collect();
         println!("{}", serde_json::to_string_pretty(&out)?);
         return Ok(());
     }
@@ -318,6 +472,85 @@ fn highlight_match(text: &str, query: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Local generation helpers
+// ---------------------------------------------------------------------------
+
+/// Raw shape of each entry returned by `nix search --json`.
+#[derive(serde::Deserialize)]
+struct NixSearchEntry {
+    #[serde(default)]
+    pname: String,
+    #[serde(default)]
+    version: String,
+    #[serde(default)]
+    description: String,
+}
+
+fn generate_package_entries(flake: &str) -> color_eyre::Result<Vec<PackageSearchEntry>> {
+    let output = NixCommand::new(&["search"])
+        .arg(flake)
+        .arg("--json")
+        .arg("^")
+        .output()?;
+    let map: std::collections::HashMap<String, NixSearchEntry> =
+        serde_json::from_slice(&output.stdout)?;
+    let entries: Vec<PackageSearchEntry> = map
+        .into_iter()
+        .map(|(attr, entry)| PackageSearchEntry {
+            attr,
+            pname: entry.pname,
+            version: entry.version,
+            description: entry.description,
+            outputs: Vec::new(),
+            main_program: None,
+        })
+        .collect();
+    Ok(entries)
+}
+
+fn insert_packages(conn: &Connection, entries: &[PackageSearchEntry]) -> color_eyre::Result<()> {
+    let mut stmt = conn.prepare(
+        "INSERT OR REPLACE INTO packages (attr, pname, version, description, outputs, \
+         main_program)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+    )?;
+    let mut fts_stmt = conn.prepare(
+        "INSERT INTO packages_fts (rowid, attr, pname, description)
+         VALUES (?1, ?2, ?3, ?4)",
+    )?;
+
+    for pkg in entries {
+        let outputs = if pkg.outputs.is_empty() {
+            None
+        } else {
+            Some(serde_json::to_string(&pkg.outputs).unwrap_or_default())
+        };
+        let desc = if pkg.description.is_empty() {
+            None
+        } else {
+            Some(&pkg.description)
+        };
+
+        let rowid = stmt.insert(rusqlite::params![
+            pkg.attr,
+            pkg.pname,
+            pkg.version,
+            desc,
+            outputs,
+            pkg.main_program,
+        ])?;
+
+        fts_stmt.execute(rusqlite::params![
+            rowid,
+            pkg.attr,
+            pkg.pname,
+            pkg.description,
+        ])?;
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Option search
 // ---------------------------------------------------------------------------
 
@@ -347,9 +580,7 @@ fn escape_nix_string(s: &str) -> String {
         .replace("${", "\\${")
 }
 
-fn generate_option_index(flake: &str) -> color_eyre::Result<Vec<u8>> {
-    // Use nix eval with an inline expression that serializes options.
-    // This works with any flake that has an ekaos-style options tree.
+fn generate_option_entries(flake: &str) -> color_eyre::Result<Vec<OptionSearchEntry>> {
     let escaped_flake = escape_nix_string(flake);
     let expr = format!(
         r#"
@@ -386,18 +617,64 @@ fn generate_option_index(flake: &str) -> color_eyre::Result<Vec<u8>> {
 
     match output {
         Ok(out) => {
-            // nix eval --expr wraps the result in quotes since it's a string.
-            // Parse the outer string, then the inner JSON.
             let raw = String::from_utf8_lossy(&out.stdout);
             let unquoted: String = serde_json::from_str(raw.trim())?;
-            Ok(unquoted.into_bytes())
+            let entries: Vec<OptionSearchEntry> = serde_json::from_str(&unquoted)?;
+            Ok(entries)
         },
         Err(_) => {
-            // Fallback: return empty index if evaluation fails.
             tracing::warn!("Could not evaluate options for {flake}, using empty index");
-            Ok(b"[]".to_vec())
+            Ok(Vec::new())
         },
     }
+}
+
+fn insert_options(conn: &Connection, entries: &[OptionSearchEntry]) -> color_eyre::Result<()> {
+    if entries.is_empty() {
+        return Ok(());
+    }
+    let mut stmt = conn.prepare(
+        "INSERT OR REPLACE INTO options (name, description, type, default_val, example, \
+         declarations, read_only)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+    )?;
+
+    for opt in entries {
+        let declarations = if opt.declarations.is_empty() {
+            None
+        } else {
+            Some(serde_json::to_string(&opt.declarations).unwrap_or_default())
+        };
+        let default_val = if opt.default.is_null() {
+            None
+        } else {
+            Some(opt.default.to_string())
+        };
+        let example_val = if opt.example.is_null() {
+            None
+        } else {
+            Some(opt.example.to_string())
+        };
+
+        stmt.execute(rusqlite::params![
+            opt.name,
+            if opt.description.is_empty() {
+                None
+            } else {
+                Some(&opt.description)
+            },
+            if opt.option_type.is_empty() {
+                None
+            } else {
+                Some(&opt.option_type)
+            },
+            default_val,
+            example_val,
+            declarations,
+            opt.read_only as i32,
+        ])?;
+    }
+    Ok(())
 }
 
 fn cmd_options(
@@ -406,28 +683,60 @@ fn cmd_options(
     json_output: bool,
     limit: usize,
 ) -> color_eyre::Result<()> {
-    let index_name = format!("options-{}", flake.replace(['/', '#'], "-"));
-    let data = load_or_generate_index(&index_name, || generate_option_index(flake))?;
-    let entries: Vec<OptionSearchEntry> = serde_json::from_slice(&data)?;
+    let conn = open_or_generate_db(flake)?;
+
+    let like_pattern = format!("%{}%", query.to_lowercase());
+    let mut stmt = conn.prepare(
+        "SELECT name, description, type, default_val, example, declarations, read_only
+         FROM options
+         WHERE LOWER(name) LIKE ?1 OR LOWER(description) LIKE ?1",
+    )?;
+
+    let entries: Vec<OptionSearchEntry> = stmt
+        .query_map([&like_pattern], |row| {
+            let declarations_json: Option<String> = row.get(5)?;
+            let declarations: Vec<String> = declarations_json
+                .and_then(|s| serde_json::from_str(&s).ok())
+                .unwrap_or_default();
+            let default_str: Option<String> = row.get(3)?;
+            let default_val = default_str
+                .and_then(|s| serde_json::from_str(&s).ok())
+                .unwrap_or(serde_json::Value::Null);
+            let example_str: Option<String> = row.get(4)?;
+            let example_val = example_str
+                .and_then(|s| serde_json::from_str(&s).ok())
+                .unwrap_or(serde_json::Value::Null);
+            Ok(OptionSearchEntry {
+                name: row.get(0)?,
+                description: row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                option_type: row.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                default: default_val,
+                example: example_val,
+                declarations,
+                read_only: row.get::<_, i32>(6)? != 0,
+            })
+        })?
+        .filter_map(|r| r.ok())
+        .collect();
 
     let query_lower = query.to_lowercase();
-    let mut results: Vec<(u8, &OptionSearchEntry)> = entries
-        .iter()
-        .filter_map(|e| {
+    let mut results: Vec<(u8, OptionSearchEntry)> = entries
+        .into_iter()
+        .map(|e| {
             let name_lower = e.name.to_lowercase();
             let desc_lower = e.description.to_lowercase();
-
-            if name_lower == query_lower {
-                Some((0, e))
+            let score = if name_lower == query_lower {
+                0
             } else if name_lower.starts_with(&query_lower) {
-                Some((1, e))
+                1
             } else if name_lower.contains(&query_lower) {
-                Some((2, e))
+                2
             } else if desc_lower.contains(&query_lower) {
-                Some((3, e))
+                3
             } else {
-                None
-            }
+                4
+            };
+            (score, e)
         })
         .collect();
 
@@ -435,7 +744,7 @@ fn cmd_options(
     results.truncate(limit);
 
     if json_output {
-        let out: Vec<&OptionSearchEntry> = results.iter().map(|(_, e)| *e).collect();
+        let out: Vec<&OptionSearchEntry> = results.iter().map(|(_, e)| e).collect();
         println!("{}", serde_json::to_string_pretty(&out)?);
         return Ok(());
     }
@@ -451,7 +760,6 @@ fn cmd_options(
             println!("  {}: {}", "Type".dim(), entry.option_type);
         }
         if !entry.description.is_empty() {
-            // Truncate long descriptions.
             let desc = if entry.description.len() > 200 {
                 format!("{}...", &entry.description[..200])
             } else {
@@ -480,7 +788,6 @@ fn cmd_options(
 struct FileSearchEntry {
     file: String,
     package: String,
-    /// Package output containing this file (e.g., `out`, `bin`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     output: Option<String>,
 }
@@ -520,30 +827,55 @@ fn cmd_files(
     names_only: bool,
     limit: usize,
 ) -> color_eyre::Result<()> {
-    // Prefer local cached file index (instant, no external deps).
-    if let Some(data) = read_index("files")? {
-        let entries: Vec<FileSearchEntry> = serde_json::from_slice(&data)?;
-        let query_lower = query.to_lowercase();
-        let results: Vec<FileSearchEntry> = entries
-            .into_iter()
-            .filter(|e| e.file.to_lowercase().contains(&query_lower))
-            .take(limit)
-            .collect();
-        return print_file_results(&results, query, json_output, names_only);
+    // Try SQLite database first.
+    if let Some(conn) = open_db()? {
+        let has_files: bool = conn
+            .query_row("SELECT EXISTS(SELECT 1 FROM files LIMIT 1)", [], |row| {
+                row.get(0)
+            })
+            .unwrap_or(false);
+
+        if has_files {
+            let like_pattern = format!("%{}%", query.to_lowercase());
+            let mut stmt = conn.prepare(
+                "SELECT file, package, output FROM files WHERE LOWER(file) LIKE ?1 LIMIT ?2",
+            )?;
+            let results: Vec<FileSearchEntry> = stmt
+                .query_map(rusqlite::params![like_pattern, limit as i64], |row| {
+                    Ok(FileSearchEntry {
+                        file: row.get(0)?,
+                        package: row.get(1)?,
+                        output: row.get::<_, Option<String>>(2)?,
+                    })
+                })?
+                .filter_map(|r| r.ok())
+                .collect();
+            return print_file_results(&results, query, json_output, names_only);
+        }
     }
 
-    // Try downloading from remote if configured.
+    // Try downloading database from remote if configured.
     if let Ok(config) = crate::config::ClientConfig::load() {
         if let Some(url) = &config.defaults.index_url {
-            if let Ok(data) = try_download_index(url, "files") {
-                let entries: Vec<FileSearchEntry> = serde_json::from_slice(&data)?;
-                let query_lower = query.to_lowercase();
-                let results: Vec<FileSearchEntry> = entries
-                    .into_iter()
-                    .filter(|e| e.file.to_lowercase().contains(&query_lower))
-                    .take(limit)
-                    .collect();
-                return print_file_results(&results, query, json_output, names_only);
+            if try_download_db(url).is_ok() {
+                if let Some(conn) = open_db()? {
+                    let like_pattern = format!("%{}%", query.to_lowercase());
+                    let mut stmt = conn.prepare(
+                        "SELECT file, package, output FROM files WHERE LOWER(file) LIKE ?1 LIMIT \
+                         ?2",
+                    )?;
+                    let results: Vec<FileSearchEntry> = stmt
+                        .query_map(rusqlite::params![like_pattern, limit as i64], |row| {
+                            Ok(FileSearchEntry {
+                                file: row.get(0)?,
+                                package: row.get(1)?,
+                                output: row.get::<_, Option<String>>(2)?,
+                            })
+                        })?
+                        .filter_map(|r| r.ok())
+                        .collect();
+                    return print_file_results(&results, query, json_output, names_only);
+                }
             }
         }
     }
@@ -566,7 +898,6 @@ fn search_via_nix_locate(query: &str, limit: usize) -> color_eyre::Result<Vec<Fi
         .arg(query)
         .output();
 
-    // If that doesn't match, try pattern match.
     let output = match output {
         Ok(o) if o.status.success() && !o.stdout.is_empty() => o,
         _ => {
@@ -590,7 +921,6 @@ fn search_via_nix_locate(query: &str, limit: usize) -> color_eyre::Result<Vec<Fi
         .filter(|l| !l.is_empty())
         .take(limit)
         .map(|line| {
-            // nix-locate --minimal outputs "attr.output" (e.g. "cowsay.out").
             let (package, output) = match line.rsplit_once('.') {
                 Some((attr, out)) => (attr.to_owned(), Some(out.to_owned())),
                 None => (line.to_owned(), None),
@@ -611,89 +941,33 @@ fn search_via_nix_locate(query: &str, limit: usize) -> color_eyre::Result<Vec<Fi
 // ---------------------------------------------------------------------------
 
 fn cmd_update(flake: &str, remote: Option<&str>) -> color_eyre::Result<()> {
-    // Explicit --remote flag takes priority over config.
     let remote_url = remote.map(ToOwned::to_owned).or_else(|| {
         crate::config::ClientConfig::load()
             .ok()
             .and_then(|c| c.defaults.index_url)
     });
     if let Some(url) = &remote_url {
-        return download_indexes(url);
+        return download_db(url);
     }
 
-    // Generate package index.
-    let pkg_name = format!("packages-{}", flake.replace(['/', '#'], "-"));
-    let spinner = ekapkgs_ui::progress::spinner("Generating package index...");
-    match generate_package_index(flake) {
-        Ok(data) => {
-            spinner.finish_and_clear();
-            write_index(&pkg_name, &data)?;
-            println!(
-                "Package index: {} entries",
-                serde_json::from_slice::<Vec<PackageSearchEntry>>(&data)
-                    .map(|v| v.len())
-                    .unwrap_or(0)
-            );
-        },
-        Err(e) => {
-            spinner.finish_and_clear();
-            tracing::warn!("Failed to generate package index: {e}");
-        },
+    // Generate locally.
+    let path = db_path()?;
+    // Remove existing DB so we start fresh.
+    if path.exists() {
+        std::fs::remove_file(&path)?;
     }
-
-    // Generate option index.
-    let opt_name = format!("options-{}", flake.replace(['/', '#'], "-"));
-    let spinner = ekapkgs_ui::progress::spinner("Generating option index...");
-    match generate_option_index(flake) {
-        Ok(data) => {
-            spinner.finish_and_clear();
-            write_index(&opt_name, &data)?;
-            println!(
-                "Option index: {} entries",
-                serde_json::from_slice::<Vec<OptionSearchEntry>>(&data)
-                    .map(|v| v.len())
-                    .unwrap_or(0)
-            );
-        },
-        Err(e) => {
-            spinner.finish_and_clear();
-            tracing::warn!("Failed to generate option index: {e}");
-        },
-    }
-
-    println!("Indexes updated in {}", cache_dir()?.display());
+    generate_local_db(&path, flake)?;
     Ok(())
 }
 
-fn download_indexes(base_url: &str) -> color_eyre::Result<()> {
-    let rt = tokio::runtime::Runtime::new()?;
-    rt.block_on(async {
-        let client = reqwest::Client::new();
-        let dir = cache_dir()?;
-
-        for name in &["packages", "options", "files"] {
-            let url = format!("{base_url}/{name}.json.zst");
-            let spinner = ekapkgs_ui::progress::spinner(&format!("Downloading {name} index..."));
-
-            match client.get(&url).send().await {
-                Ok(resp) if resp.status().is_success() => {
-                    let bytes = resp.bytes().await?;
-                    let path = dir.join(format!("{name}.json.zst"));
-                    std::fs::write(&path, &bytes)?;
-                    spinner.finish_and_clear();
-                    println!("Downloaded {name} index ({} bytes)", bytes.len());
-                },
-                Ok(resp) => {
-                    spinner.finish_and_clear();
-                    tracing::warn!("Failed to download {name} index: HTTP {}", resp.status());
-                },
-                Err(e) => {
-                    spinner.finish_and_clear();
-                    tracing::warn!("Failed to download {name} index: {e}");
-                },
-            }
-        }
-
-        Ok(())
-    })
+fn download_db(base_url: &str) -> color_eyre::Result<()> {
+    try_download_db(base_url)?;
+    let path = db_path()?;
+    let meta = std::fs::metadata(&path)?;
+    println!(
+        "Downloaded search index ({:.1} MiB) to {}",
+        meta.len() as f64 / 1_048_576.0,
+        path.display()
+    );
+    Ok(())
 }
