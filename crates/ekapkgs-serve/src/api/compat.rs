@@ -517,6 +517,15 @@ pub async fn get_nar(
 
     let nar_path = format!("nar/{file}");
 
+    // Acquire a NAR semaphore permit to bound concurrent memory-heavy
+    // operations. Each NAR download may hold the full NAR in memory.
+    let _permit = match state.nar_semaphore.acquire().await {
+        Ok(p) => p,
+        Err(_) => {
+            return (StatusCode::SERVICE_UNAVAILABLE, "server shutting down").into_response();
+        },
+    };
+
     // Offload the potentially heavy NAR read (CAS reassembly, decompression)
     // to the blocking pool so it doesn't starve the async runtime.
     let storage_state = Arc::clone(&state);

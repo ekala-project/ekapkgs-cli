@@ -411,6 +411,13 @@ impl CacheService for NegotiateService {
         let state = Arc::clone(&self.state);
         tokio::spawn(async move {
             for hash in req.path_hashes {
+                // Acquire a NAR semaphore permit to bound memory from
+                // concurrent NAR materializations.
+                let _permit = match state.nar_semaphore.acquire().await {
+                    Ok(p) => p,
+                    Err(_) => return, // server shutting down
+                };
+
                 // Offload blocking storage I/O (narinfo lookup + NAR read) to
                 // the blocking pool so heavy CAS reassembly doesn't stall the
                 // async runtime.

@@ -148,6 +148,10 @@ pub struct AppState {
     pub priority: u32,
     /// Virtual store directory advertised to clients.
     pub store_dir: String,
+    /// Semaphore limiting concurrent memory-heavy operations (NAR
+    /// downloads, gRPC streaming, delta computation). Each permit
+    /// represents a slot that may hold a full NAR in memory.
+    pub nar_semaphore: Arc<tokio::sync::Semaphore>,
 }
 
 /// Cache for computed delta NARs, keyed by (base_hash, target_hash).
@@ -331,10 +335,12 @@ fn build_http_router(
 
     // Limit concurrent in-flight requests to prevent resource exhaustion
     // under load. Requests beyond this limit are queued by tower.
+    // Kept moderate since memory-heavy operations (NAR serving) have their
+    // own dedicated semaphore.
     let max_concurrent = std::thread::available_parallelism()
         .map(std::num::NonZero::get)
         .unwrap_or(8)
-        * 64;
+        * 8;
 
     let router = router
         .layer(http_metrics::HttpMetricsLayer::new(
@@ -1034,6 +1040,10 @@ async fn cmd_serve(cli: Cli) -> color_eyre::Result<()> {
         metrics: server_metrics,
         priority,
         store_dir,
+        // Allow a limited number of concurrent NAR-serving operations.
+        // Each may hold a full NAR in memory; 8 concurrent × ~200 MiB
+        // average ≈ 1.6 GiB worst-case from NAR serving alone.
+        nar_semaphore: Arc::new(tokio::sync::Semaphore::new(8)),
     });
 
     // Validate TLS config consistency.
