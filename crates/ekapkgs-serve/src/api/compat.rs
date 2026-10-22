@@ -543,11 +543,8 @@ pub async fn get_nar(
     let hash = file.split('.').next().unwrap_or(&file);
 
     // Acquire a NAR semaphore permit to bound concurrent memory usage.
-    let permit = match state.nar_semaphore.clone().acquire_owned().await {
-        Ok(p) => p,
-        Err(_) => {
-            return (StatusCode::SERVICE_UNAVAILABLE, "server shutting down").into_response();
-        },
+    let Ok(permit) = state.nar_semaphore.clone().acquire_owned().await else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "server shutting down").into_response();
     };
 
     // Range requests need the full data for slicing — fall back to buffered.
@@ -622,10 +619,9 @@ async fn get_nar_buffered(
     _permit: tokio::sync::OwnedSemaphorePermit,
 ) -> Response {
     let storage_state = Arc::clone(&state);
-    let nar_result =
-        tokio::task::spawn_blocking(move || storage_state.storage.get_nar(&nar_path))
-            .await
-            .unwrap_or_else(|e| Err(color_eyre::eyre::eyre!("spawn_blocking join: {e}")));
+    let nar_result = tokio::task::spawn_blocking(move || storage_state.storage.get_nar(&nar_path))
+        .await
+        .unwrap_or_else(|e| Err(color_eyre::eyre::eyre!("spawn_blocking join: {e}")));
 
     match nar_result {
         Ok(Some(data)) => {
