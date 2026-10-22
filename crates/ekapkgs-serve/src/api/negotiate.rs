@@ -413,92 +413,113 @@ impl CacheService for NegotiateService {
             for hash in req.path_hashes {
                 // Acquire a NAR semaphore permit to bound memory from
                 // concurrent NAR materializations.
-                let _permit = match state.nar_semaphore.acquire().await {
+                let permit = match state.nar_semaphore.clone().acquire_owned().await {
                     Ok(p) => p,
                     Err(_) => return, // server shutting down
                 };
 
-                // Offload blocking storage I/O (narinfo lookup + NAR read) to
-                // the blocking pool so heavy CAS reassembly doesn't stall the
-                // async runtime.
+                // Check for a cached delta first (small, already in memory).
+                let delta = state.delta_cache.get_for_target(&hash);
+                if let Some(delta_data) = delta {
+                    drop(permit);
+                    send_nar_chunks(&tx, &hash, &delta_data, true).await;
+                    if let Some(ref tracker) = state.gc_tracker {
+                        tracker.record_access(&hash);
+                    }
+                    continue;
+                }
+
+                // Resolve narinfo to get the NAR URL and size.
                 let st = Arc::clone(&state);
                 let h = hash.clone();
-                let loaded = tokio::task::spawn_blocking(move || {
-                    let narinfo = match st.storage.get_narinfo(&h) {
-                        Ok(Some(ni)) => ni,
-                        Ok(None) => return Ok(None),
-                        Err(e) => return Err(e),
-                    };
-
-                    let delta = st.delta_cache.get_for_target(&h);
-                    if let Some(d) = delta {
-                        return Ok(Some((d, true)));
-                    }
-
-                    match st.storage.get_nar(&narinfo.url) {
-                        Ok(Some(data)) => Ok(Some((data, false))),
-                        Ok(None) => Ok(None),
-                        Err(e) => Err(e),
-                    }
+                let info = tokio::task::spawn_blocking(move || {
+                    st.storage
+                        .get_narinfo(&h)
+                        .map(|opt| opt.map(|ni| (ni.url, ni.nar_size)))
                 })
                 .await;
 
-                let (stream_data, is_delta) = match loaded {
+                let (nar_url, nar_size) = match info {
                     Ok(Ok(Some(pair))) => pair,
                     Ok(Ok(None)) => {
                         tracing::warn!("StreamNars: path {hash} not found, skipping");
                         continue;
                     },
                     Ok(Err(e)) => {
-                        tracing::warn!("StreamNars: failed to load {hash}: {e}");
+                        tracing::warn!("StreamNars: narinfo failed for {hash}: {e}");
                         continue;
                     },
                     Err(e) => {
-                        tracing::warn!("StreamNars: spawn_blocking join failed for {hash}: {e}");
+                        tracing::warn!("StreamNars: join failed for {hash}: {e}");
                         continue;
                     },
                 };
 
-                // Record GC access.
-                if let Some(ref tracker) = state.gc_tracker {
-                    tracker.record_access(&hash);
-                }
+                // Stream the NAR through a tokio mpsc channel — only one
+                // file's worth of data is in memory at a time.
+                let (nar_tx, mut nar_rx) =
+                    tokio::sync::mpsc::channel::<Vec<u8>>(4);
 
-                // Split into chunks and stream.
-                let total = stream_data.len();
-                let mut offset = 0;
+                let st = Arc::clone(&state);
+                let nar_url_clone = nar_url.clone();
+                let h2 = hash.clone();
+                tokio::task::spawn_blocking(move || {
+                    let _permit = permit; // keep permit alive during write
+                    // Write NAR chunks into a ChannelWriter backed by
+                    // blocking_send on the tokio mpsc sender.
+                    let mut writer = TokioChannelWriter::new(NAR_CHUNK_SIZE, nar_tx);
+                    let mut bw = std::io::BufWriter::with_capacity(
+                        NAR_CHUNK_SIZE,
+                        &mut writer,
+                    );
+                    match st.storage.write_nar_to(&nar_url_clone, &mut bw) {
+                        Ok(true) => {
+                            let _ = std::io::Write::flush(&mut bw);
+                            drop(bw);
+                            writer.flush_final();
+                        },
+                        Ok(false) => {
+                            tracing::warn!("StreamNars: NAR not found for {h2}");
+                        },
+                        Err(e) => {
+                            tracing::error!("StreamNars: stream failed for {h2}: {e}");
+                        },
+                    }
+                    // writer/nar_tx dropped → receiver sees closed.
+                });
+
+                // Receive chunks and forward as gRPC NarChunk messages.
+                // Put file_size (from narinfo) on the first chunk so the
+                // client can show progress.
                 let mut first = true;
-
-                while offset < total {
-                    let end = (offset + NAR_CHUNK_SIZE).min(total);
-                    let last = end == total;
-
+                while let Some(chunk_data) = nar_rx.recv().await {
                     let chunk = NarChunk {
                         path_hash: hash.clone(),
-                        data: stream_data[offset..end].to_vec(),
-                        last,
-                        file_size: if first { total as u64 } else { 0 },
-                        is_delta,
+                        data: chunk_data,
+                        last: false,
+                        file_size: if first { nar_size } else { 0 },
+                        is_delta: false,
                     };
                     first = false;
-                    offset = end;
-
                     if tx.send(Ok(chunk)).await.is_err() {
                         return;
                     }
                 }
 
-                if total == 0 {
-                    let chunk = NarChunk {
-                        path_hash: hash.clone(),
-                        data: Vec::new(),
-                        last: true,
-                        file_size: 0,
-                        is_delta,
-                    };
-                    if tx.send(Ok(chunk)).await.is_err() {
-                        return;
-                    }
+                // Send terminal empty chunk to signal end of stream.
+                let final_chunk = NarChunk {
+                    path_hash: hash.clone(),
+                    data: Vec::new(),
+                    last: true,
+                    file_size: 0,
+                    is_delta: false,
+                };
+                if tx.send(Ok(final_chunk)).await.is_err() {
+                    return;
+                }
+
+                if let Some(ref tracker) = state.gc_tracker {
+                    tracker.record_access(&hash);
                 }
             }
         });
@@ -897,6 +918,100 @@ fn compress_with_dict(data: &[u8], dict: &[u8]) -> Option<Vec<u8>> {
     let mut encoder = zstd::Encoder::with_dictionary(Vec::new(), 3, dict).ok()?;
     encoder.write_all(data).ok()?;
     encoder.finish().ok()
+}
+
+/// `Write` adapter that buffers into fixed-size chunks and sends each
+/// completed block through a tokio mpsc sender using `blocking_send`.
+///
+/// Must only be called from a blocking context (e.g., `spawn_blocking`).
+struct TokioChannelWriter {
+    buf: Vec<u8>,
+    chunk_size: usize,
+    tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+}
+
+impl TokioChannelWriter {
+    fn new(chunk_size: usize, tx: tokio::sync::mpsc::Sender<Vec<u8>>) -> Self {
+        Self {
+            buf: Vec::with_capacity(chunk_size),
+            chunk_size,
+            tx,
+        }
+    }
+
+    fn flush_final(&mut self) {
+        if !self.buf.is_empty() {
+            let chunk = std::mem::take(&mut self.buf);
+            let _ = self.tx.blocking_send(chunk);
+        }
+    }
+}
+
+impl std::io::Write for TokioChannelWriter {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        let mut written = 0;
+        while written < data.len() {
+            let space = self.chunk_size - self.buf.len();
+            let n = space.min(data.len() - written);
+            self.buf.extend_from_slice(&data[written..written + n]);
+            written += n;
+
+            if self.buf.len() >= self.chunk_size {
+                let chunk =
+                    std::mem::replace(&mut self.buf, Vec::with_capacity(self.chunk_size));
+                self.tx.blocking_send(chunk).map_err(|_| {
+                    std::io::Error::new(std::io::ErrorKind::BrokenPipe, "receiver dropped")
+                })?;
+            }
+        }
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Send pre-buffered data as gRPC NarChunk messages (used for deltas).
+async fn send_nar_chunks(
+    tx: &tokio::sync::mpsc::Sender<Result<NarChunk, Status>>,
+    hash: &str,
+    data: &[u8],
+    is_delta: bool,
+) {
+    let total = data.len();
+    let mut offset = 0;
+    let mut first = true;
+
+    while offset < total {
+        let end = (offset + NAR_CHUNK_SIZE).min(total);
+        let last = end == total;
+
+        let chunk = NarChunk {
+            path_hash: hash.to_owned(),
+            data: data[offset..end].to_vec(),
+            last,
+            file_size: if first { total as u64 } else { 0 },
+            is_delta,
+        };
+        first = false;
+        offset = end;
+
+        if tx.send(Ok(chunk)).await.is_err() {
+            return;
+        }
+    }
+
+    if total == 0 {
+        let chunk = NarChunk {
+            path_hash: hash.to_owned(),
+            data: Vec::new(),
+            last: true,
+            file_size: 0,
+            is_delta,
+        };
+        let _ = tx.send(Ok(chunk)).await;
+    }
 }
 
 /// Decompress `data` that was compressed with `dict` as a zstd dictionary.

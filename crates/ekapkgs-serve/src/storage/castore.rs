@@ -1168,19 +1168,34 @@ impl StorageBackend for CastoreBackend {
     }
 
     fn get_nar(&self, file_path: &str) -> color_eyre::Result<Option<Vec<u8>>> {
+        let mut buf = Vec::new();
+        if self.write_nar_to(file_path, &mut buf)? {
+            Ok(Some(buf))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn write_nar_to(
+        &self,
+        file_path: &str,
+        w: &mut dyn std::io::Write,
+    ) -> color_eyre::Result<bool> {
         // Extract hash from NAR file path (e.g., "nar/abc123.nar").
         let filename = file_path.rsplit('/').next().unwrap_or(file_path);
         let hash = filename.split('.').next().unwrap_or(filename);
 
         let Some(root_node) = self.get_root_node(hash)? else {
-            return Ok(None);
+            return Ok(false);
         };
 
         // Stream the NAR directly from CAS chunks — only one file's data is
-        // in memory at a time.
-        let mut buf = Vec::new();
-        write_nar_streaming(&mut buf, &root_node, self)?;
-        Ok(Some(buf))
+        // in memory at a time. Use a BufWriter to coalesce the many small
+        // NAR framing writes into larger OS write calls.
+        let mut bw = std::io::BufWriter::with_capacity(256 * 1024, w);
+        write_nar_streaming(&mut bw, &root_node, self)?;
+        bw.flush()?;
+        Ok(true)
     }
 
     fn put_narinfo(&self, hash: &str, content: &str) -> color_eyre::Result<bool> {
@@ -1314,6 +1329,14 @@ impl StorageBackend for std::sync::Arc<CastoreBackend> {
 
     fn get_nar(&self, file_path: &str) -> color_eyre::Result<Option<Vec<u8>>> {
         (**self).get_nar(file_path)
+    }
+
+    fn write_nar_to(
+        &self,
+        file_path: &str,
+        w: &mut dyn std::io::Write,
+    ) -> color_eyre::Result<bool> {
+        (**self).write_nar_to(file_path, w)
     }
 
     fn put_narinfo(&self, hash: &str, content: &str) -> color_eyre::Result<bool> {
