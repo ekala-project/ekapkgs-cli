@@ -1,28 +1,39 @@
 //! Package name validation against the search index with fuzzy suggestions.
 
-use std::io::Read;
-use std::path::PathBuf;
+use rusqlite::Connection;
 
 /// Validate a package name against the search index. Returns `Ok(())` if the
 /// package exists, or an error with "did you mean?" suggestions if not.
 ///
 /// Gracefully degrades: if no index is available, validation is skipped.
 pub fn validate_package_name(name: &str, flake: &str) -> color_eyre::Result<()> {
-    let Some(entries) = load_package_index(flake)? else {
+    let Some(conn) = open_search_db()? else {
         return Ok(()); // No index, skip validation
     };
 
     // Exact match on pname.
-    if entries.iter().any(|e| e.pname == name) {
+    let found: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM packages WHERE pname = ?1)",
+        [name],
+        |row| row.get(0),
+    )?;
+    if found {
         return Ok(());
     }
 
     // Exact match on attr path suffix.
-    if entries.iter().any(|e| e.attr.ends_with(name)) {
+    let suffix_pattern = format!("%{name}");
+    let found: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM packages WHERE attr LIKE ?1)",
+        [&suffix_pattern],
+        |row| row.get(0),
+    )?;
+    if found {
         return Ok(());
     }
 
-    // Fuzzy match.
+    // Load candidates for fuzzy matching.
+    let entries = load_fuzzy_candidates(&conn)?;
     let suggestions = fuzzy_match_packages(&entries, name, 5);
     if suggestions.is_empty() {
         return Err(color_eyre::eyre::eyre!(
@@ -46,50 +57,47 @@ pub fn validate_package_name(name: &str, flake: &str) -> color_eyre::Result<()> 
     ))
 }
 
-#[derive(serde::Deserialize)]
-struct PackageSearchEntry {
-    attr: String,
-    pname: String,
-    #[serde(default)]
-    description: String,
-}
-
-fn index_dir() -> PathBuf {
-    let dir = directories::ProjectDirs::from("", "", "ekapkgs")
-        .map(|d| d.cache_dir().to_path_buf())
-        .unwrap_or_else(|| {
-            let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-            PathBuf::from(home).join(".cache/ekapkgs")
-        });
-    dir.join("indexes")
-}
-
-fn load_package_index(flake: &str) -> color_eyre::Result<Option<Vec<PackageSearchEntry>>> {
-    let index_name = format!("packages-{}", flake.replace(['/', '#'], "-"));
-    let path = index_dir().join(format!("{index_name}.json.zst"));
+fn open_search_db() -> color_eyre::Result<Option<Connection>> {
+    let dir = crate::commands::search::cache_dir()?;
+    let path = dir.join("search.db");
     if !path.exists() {
         return Ok(None);
     }
-    let compressed = std::fs::read(&path)?;
-    let mut decoder = zstd::Decoder::new(compressed.as_slice())?;
-    let mut data = Vec::new();
-    decoder.read_to_end(&mut data)?;
-    let entries: Vec<PackageSearchEntry> = serde_json::from_slice(&data)?;
-    Ok(Some(entries))
+    let conn = Connection::open(&path)?;
+    Ok(Some(conn))
+}
+
+struct PackageCandidate {
+    pname: String,
+    description: String,
+}
+
+fn load_fuzzy_candidates(conn: &Connection) -> color_eyre::Result<Vec<PackageCandidate>> {
+    let mut stmt = conn.prepare("SELECT pname, description FROM packages")?;
+    let entries = stmt
+        .query_map([], |row| {
+            Ok(PackageCandidate {
+                pname: row.get(0)?,
+                description: row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+            })
+        })?
+        .filter_map(|r| r.ok())
+        .collect();
+    Ok(entries)
 }
 
 fn fuzzy_match_packages<'a>(
-    entries: &'a [PackageSearchEntry],
+    entries: &'a [PackageCandidate],
     query: &str,
     max_results: usize,
-) -> Vec<&'a PackageSearchEntry> {
+) -> Vec<&'a PackageCandidate> {
     use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
     use nucleo_matcher::{Config, Matcher, Utf32Str};
 
     let mut matcher = Matcher::new(Config::DEFAULT.match_paths());
     let pattern = Pattern::parse(query, CaseMatching::Ignore, Normalization::Smart);
 
-    let mut scored: Vec<(u32, &PackageSearchEntry)> = entries
+    let mut scored: Vec<(u32, &PackageCandidate)> = entries
         .iter()
         .filter_map(|entry| {
             let mut buf = Vec::new();
