@@ -169,7 +169,12 @@ struct DeltaCacheInner {
 }
 
 /// Maximum total bytes stored in the delta cache.
-const DELTA_CACHE_MAX_BYTES: usize = 256 * 1024 * 1024;
+const DELTA_CACHE_MAX_BYTES: usize = 64 * 1024 * 1024;
+
+/// Maximum size of a single delta entry (16 MiB). Deltas larger than this
+/// are not worth caching — they consume disproportionate memory for
+/// marginal transfer savings.
+const DELTA_ENTRY_MAX_BYTES: usize = 16 * 1024 * 1024;
 
 impl DeltaCache {
     pub fn new() -> Self {
@@ -182,8 +187,14 @@ impl DeltaCache {
     }
 
     pub fn insert(&self, base_hash: String, target_hash: String, delta: Vec<u8>) {
-        let mut inner = self.entries.lock().expect("delta cache lock");
         let delta_len = delta.len();
+
+        // Reject oversized entries that would waste cache space.
+        if delta_len > DELTA_ENTRY_MAX_BYTES {
+            return;
+        }
+
+        let mut inner = self.entries.lock().expect("delta cache lock");
 
         // Remove existing entry for this key if present.
         if let Some(pos) = inner
