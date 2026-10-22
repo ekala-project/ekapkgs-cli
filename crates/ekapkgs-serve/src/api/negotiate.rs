@@ -750,6 +750,11 @@ const DELTA_MAX_RATIO: f64 = 0.80;
 /// CPU and memory usage from untrusted clients.
 const MAX_DELTAS_PER_REQUEST: usize = 32;
 
+/// Maximum NAR size eligible for delta computation (64 MiB).
+/// Loading two NARs for delta computation is O(2 * nar_size) memory;
+/// skipping large NARs prevents OOM from packages like chromium.
+const DELTA_MAX_NAR_SIZE: u64 = 64 * 1024 * 1024;
+
 /// Scan available paths for delta transfer opportunities against the client's
 /// `have` set. For each match, compress the new NAR using the old NAR as a zstd
 /// dictionary and store the result in the delta cache.
@@ -797,6 +802,12 @@ fn compute_deltas(
 
         // Don't delta against ourselves.
         if *base_hash == target_hash {
+            continue;
+        }
+
+        // Skip large NARs — loading two into memory for delta computation
+        // would use too much RAM.
+        if entry.nar_size > DELTA_MAX_NAR_SIZE {
             continue;
         }
 
