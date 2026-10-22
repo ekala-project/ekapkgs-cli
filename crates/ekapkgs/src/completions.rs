@@ -35,14 +35,13 @@ pub fn complete_packages(current: &OsStr) -> Vec<CompletionCandidate> {
         return Vec::new();
     };
 
-    let mut stmt = match conn.prepare(
+    let Ok(mut stmt) = conn.prepare(
         "SELECT attr, pname, version, description, outputs, main_program
          FROM packages
          WHERE LOWER(attr) LIKE ?1 OR LOWER(pname) LIKE ?1
          LIMIT 100",
-    ) {
-        Ok(s) => s,
-        Err(_) => return Vec::new(),
+    ) else {
+        return Vec::new();
     };
 
     let mut candidates: Vec<CompletionCandidate> = stmt
@@ -76,7 +75,7 @@ pub fn complete_packages(current: &OsStr) -> Vec<CompletionCandidate> {
         .ok()
         .into_iter()
         .flatten()
-        .filter_map(|r| r.ok())
+        .filter_map(Result::ok)
         .collect();
 
     candidates.sort();

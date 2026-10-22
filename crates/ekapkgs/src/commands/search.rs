@@ -300,8 +300,8 @@ const PKG_SELECT: &str =
 fn query_all_packages(conn: &Connection) -> color_eyre::Result<Vec<PackageSearchEntry>> {
     let mut stmt = conn.prepare(&format!("{PKG_SELECT} ORDER BY pname"))?;
     let entries = stmt
-        .query_map([], |row| row_to_package(row))?
-        .filter_map(|r| r.ok())
+        .query_map([], row_to_package)?
+        .filter_map(Result::ok)
         .collect();
     Ok(entries)
 }
@@ -319,8 +319,8 @@ fn query_packages_matching(
     ))?;
 
     let entries: Vec<PackageSearchEntry> = stmt
-        .query_map([&like_pattern], |row| row_to_package(row))?
-        .filter_map(|r| r.ok())
+        .query_map([&like_pattern], row_to_package)?
+        .filter_map(Result::ok)
         .collect();
 
     let mut results: Vec<(u8, PackageSearchEntry)> = entries
@@ -373,8 +373,8 @@ fn cmd_packages(
         // Load pname + attr for fuzzy matching (lightweight query).
         let mut stmt = conn.prepare(&format!("{PKG_SELECT} ORDER BY pname"))?;
         let all_entries: Vec<PackageSearchEntry> = stmt
-            .query_map([], |row| row_to_package(row))?
-            .filter_map(|r| r.ok())
+            .query_map([], row_to_package)?
+            .filter_map(Result::ok)
             .collect();
 
         let fuzzy = fuzzy_match_entries(&all_entries, query, effective_limit);
@@ -716,7 +716,7 @@ fn cmd_options(
                 read_only: row.get::<_, i32>(6)? != 0,
             })
         })?
-        .filter_map(|r| r.ok())
+        .filter_map(Result::ok)
         .collect();
 
     let query_lower = query.to_lowercase();
@@ -848,7 +848,7 @@ fn cmd_files(
                         output: row.get::<_, Option<String>>(2)?,
                     })
                 })?
-                .filter_map(|r| r.ok())
+                .filter_map(Result::ok)
                 .collect();
             return print_file_results(&results, query, json_output, names_only);
         }
@@ -872,7 +872,7 @@ fn cmd_files(
                                 output: row.get::<_, Option<String>>(2)?,
                             })
                         })?
-                        .filter_map(|r| r.ok())
+                        .filter_map(Result::ok)
                         .collect();
                     return print_file_results(&results, query, json_output, names_only);
                 }
