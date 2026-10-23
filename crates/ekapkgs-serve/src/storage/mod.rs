@@ -110,6 +110,9 @@ impl NarInfo {
     }
 }
 
+/// Return type for batch narinfo queries: `(available, unavailable)`.
+type BatchNarInfoResult = (Vec<(String, NarInfo)>, Vec<String>);
+
 /// Abstract storage backend for the binary cache server.
 pub trait StorageBackend: Send + Sync {
     /// Downcast to a concrete type for backend-specific operations.
@@ -132,6 +135,27 @@ pub trait StorageBackend: Send + Sync {
             }
         }
         Ok(available)
+    }
+
+    /// Batch fetch narinfos for multiple hashes at once.
+    ///
+    /// Returns `(available, unavailable)` where `available` contains
+    /// `(hash, NarInfo)` pairs and `unavailable` contains hashes that
+    /// were not found or errored. Default falls back to serial calls.
+    #[allow(clippy::type_complexity)]
+    fn batch_get_narinfo(
+        &self,
+        hashes: &[String],
+    ) -> color_eyre::Result<(Vec<(String, NarInfo)>, Vec<String>)> {
+        let mut available = Vec::new();
+        let mut unavailable = Vec::new();
+        for hash in hashes {
+            match self.get_narinfo(hash) {
+                Ok(Some(ni)) => available.push((hash.clone(), ni)),
+                Ok(None) | Err(_) => unavailable.push(hash.clone()),
+            }
+        }
+        Ok((available, unavailable))
     }
 
     /// Get a NAR file as bytes.
@@ -202,7 +226,9 @@ pub trait StorageBackend: Send + Sync {
     }
 
     /// Get a chunk by its blake3 digest.
-    fn get_chunk(&self, _digest: &[u8]) -> color_eyre::Result<Option<Vec<u8>>> {
+    ///
+    /// Returns `Bytes` for zero-copy handoff to the HTTP response layer.
+    fn get_chunk(&self, _digest: &[u8]) -> color_eyre::Result<Option<bytes::Bytes>> {
         Ok(None)
     }
 

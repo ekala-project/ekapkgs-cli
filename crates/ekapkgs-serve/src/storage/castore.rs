@@ -24,7 +24,7 @@ use ekapkgs_protocol::ekapkgs::v1::{
 use prost::Message;
 use rusqlite::{Connection, params};
 
-use super::{NarInfo, StorageBackend};
+use super::{BatchNarInfoResult, NarInfo, StorageBackend};
 
 /// A file digest and its ordered list of (chunk_digest, chunk_size) pairs.
 type FileChunkMap = Vec<([u8; 32], Vec<([u8; 32], u64)>)>;
@@ -235,7 +235,15 @@ impl CastoreBackend {
     }
 
     /// Check if a chunk exists without reading its data.
+    ///
+    /// Uses the in-memory bloom filter for fast negative lookups. If the
+    /// bloom filter says "maybe", confirms with a real SQLite query.
     pub fn has_chunk(&self, digest: &[u8; 32]) -> color_eyre::Result<bool> {
+        // Fast path: bloom filter says definitely absent.
+        if !self.bloom_maybe_contains(digest) {
+            return Ok(false);
+        }
+        // Bloom filter says maybe -- confirm with SQLite.
         let db = self.acquire_reader();
         let exists: bool = db.query_row(
             "SELECT EXISTS(SELECT 1 FROM chunks WHERE digest = ?1)",
@@ -312,18 +320,27 @@ impl CastoreBackend {
     }
 
     /// Update `last_access` for a batch of store path hashes.
+    ///
+    /// Deduplicates hashes within the batch so each path is updated at most
+    /// once per flush, and quantizes timestamps to 1-hour granularity since
+    /// LRU eviction doesn't need second-level precision.
     pub fn update_access(&self, hashes: &[String]) {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
+        // Quantize to 1-hour granularity.
+        let quantized = now - (now % 3600);
+
+        // Deduplicate: each hash only needs one UPDATE per flush.
+        let unique: HashSet<&str> = hashes.iter().map(String::as_str).collect();
 
         let Ok(db) = self.db.lock() else { return };
         if let Ok(tx) = db.unchecked_transaction() {
-            for hash in hashes {
+            for hash in &unique {
                 let _ = tx.execute(
                     "UPDATE cas_paths SET last_access = ?1 WHERE hash = ?2",
-                    params![now as i64, hash],
+                    params![quantized as i64, *hash],
                 );
             }
             let _ = tx.commit();
@@ -771,6 +788,8 @@ impl CastoreBackend {
         };
         let db = self.db.lock().expect("db lock");
         Self::insert_chunk_row(&db, &digest, data.len(), zstd_level, disk_size, inline_data)?;
+        // Update the bloom filter so subsequent has_chunk calls see this chunk.
+        self.bloom_insert(&digest);
         Ok(digest)
     }
 
@@ -952,6 +971,8 @@ impl CastoreBackend {
                         disk_size,
                         inline,
                     )?;
+                    // Update the bloom filter so subsequent has_chunk calls see this chunk.
+                    self.bloom_insert(&digest);
                     chunk_digests.push((digest, chunk.length as u64));
                     total_size += chunk.length as u64;
                 }
@@ -1347,6 +1368,99 @@ impl CastoreBackend {
     }
 }
 
+impl CastoreBackend {
+    /// Batch-load narinfo metadata for multiple hashes using SQL IN clause.
+    ///
+    /// Chunks the query into batches of 500 to stay within SQLite's variable
+    /// limit. Returns `(available, unavailable)`.
+    #[allow(clippy::type_complexity)]
+    fn batch_load_metadata(
+        &self,
+        hashes: &[String],
+    ) -> color_eyre::Result<(Vec<(String, NarInfo)>, Vec<String>)> {
+        const BATCH_SIZE: usize = 500;
+
+        let mut available = Vec::new();
+        let mut found_set = HashSet::with_capacity(hashes.len());
+
+        for chunk in hashes.chunks(BATCH_SIZE) {
+            let placeholders: String = (0..chunk.len())
+                .map(|i| format!("?{}", i + 1))
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                "SELECT hash, store_path, nar_hash, nar_size, references_, signatures, ca, \
+                 deriver FROM cas_paths WHERE hash IN ({placeholders})"
+            );
+
+            let db = self.acquire_reader();
+            let mut stmt = db.prepare(&sql)?;
+            let params: Vec<&dyn rusqlite::types::ToSql> = chunk
+                .iter()
+                .map(|h| h as &dyn rusqlite::types::ToSql)
+                .collect();
+            let rows = stmt.query_map(params.as_slice(), |row| {
+                let hash: String = row.get(0)?;
+                let store_path: String = row.get(1)?;
+                let nar_hash: String = row.get(2)?;
+                let nar_size: i64 = row.get(3)?;
+                let refs_str: String = row.get(4)?;
+                let sigs_str: String = row.get(5)?;
+                let ca: String = row.get(6)?;
+                let deriver: String = row.get(7)?;
+                Ok((
+                    hash, store_path, nar_hash, nar_size, refs_str, sigs_str, ca, deriver,
+                ))
+            })?;
+
+            for row in rows {
+                let (hash, store_path, nar_hash, nar_size, refs_str, sigs_str, ca, deriver) = row?;
+
+                let references: Vec<String> = if refs_str.is_empty() {
+                    Vec::new()
+                } else {
+                    refs_str.split(' ').map(String::from).collect()
+                };
+
+                let signatures: Vec<String> = if sigs_str.is_empty() {
+                    Vec::new()
+                } else {
+                    sigs_str.split('\n').map(String::from).collect()
+                };
+
+                let ni = NarInfo {
+                    store_path,
+                    url: format!("nar/{hash}.nar"),
+                    compression: "none".to_owned(),
+                    file_hash: String::new(),
+                    file_size: 0,
+                    nar_hash,
+                    nar_size: nar_size as u64,
+                    references,
+                    deriver: if deriver.is_empty() {
+                        None
+                    } else {
+                        Some(deriver)
+                    },
+                    signatures,
+                    ca: if ca.is_empty() { None } else { Some(ca) },
+                };
+
+                found_set.insert(hash.clone());
+                available.push((hash, ni));
+            }
+        }
+
+        let unavailable: Vec<String> = hashes
+            .iter()
+            .filter(|h| !found_set.contains(h.as_str()))
+            .cloned()
+            .collect();
+
+        Ok((available, unavailable))
+    }
+}
+
 impl StorageBackend for CastoreBackend {
     fn as_any(&self) -> &dyn std::any::Any {
         self
@@ -1364,6 +1478,14 @@ impl StorageBackend for CastoreBackend {
 
     fn get_narinfo(&self, hash: &str) -> color_eyre::Result<Option<NarInfo>> {
         self.load_metadata(hash)
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn batch_get_narinfo(
+        &self,
+        hashes: &[String],
+    ) -> color_eyre::Result<(Vec<(String, NarInfo)>, Vec<String>)> {
+        self.batch_load_metadata(hashes)
     }
 
     fn get_narinfo_text(&self, hash: &str) -> color_eyre::Result<Option<String>> {
@@ -1524,6 +1646,14 @@ impl StorageBackend for std::sync::Arc<CastoreBackend> {
 
     fn get_narinfo(&self, hash: &str) -> color_eyre::Result<Option<NarInfo>> {
         (**self).get_narinfo(hash)
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn batch_get_narinfo(
+        &self,
+        hashes: &[String],
+    ) -> color_eyre::Result<(Vec<(String, NarInfo)>, Vec<String>)> {
+        (**self).batch_get_narinfo(hashes)
     }
 
     fn get_narinfo_text(&self, hash: &str) -> color_eyre::Result<Option<String>> {

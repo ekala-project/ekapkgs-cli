@@ -60,22 +60,17 @@ impl CacheService for NegotiateService {
 
         // Batch-query narinfo for all wanted paths on the blocking pool
         // so we don't block the async runtime during DB I/O.
+        // Uses SQL IN clause batching when the backend supports it.
         let query_state = Arc::clone(&self.state);
         let want_hashes_owned = want_hashes.clone();
         let (mut narinfo_results, unavailable) = tokio::task::spawn_blocking(move || {
-            let mut avail = Vec::new();
-            let mut unavail = Vec::new();
-            for hash in &want_hashes_owned {
-                match query_state.storage.get_narinfo(hash) {
-                    Ok(Some(ni)) => avail.push((hash.clone(), ni)),
-                    Ok(None) => unavail.push(hash.clone()),
-                    Err(e) => {
-                        tracing::warn!("Failed to query narinfo for {hash}: {e}");
-                        unavail.push(hash.clone());
-                    },
-                }
-            }
-            (avail, unavail)
+            query_state
+                .storage
+                .batch_get_narinfo(&want_hashes_owned)
+                .unwrap_or_else(|e| {
+                    tracing::warn!("batch_get_narinfo failed: {e}");
+                    (Vec::new(), want_hashes_owned)
+                })
         })
         .await
         .map_err(|e| Status::internal(format!("spawn_blocking join: {e}")))?;
