@@ -159,16 +159,24 @@ pub struct AppState {
 /// Populated during negotiate when the server finds a suitable delta candidate,
 /// consumed by the delta HTTP endpoint and StreamNars handler.
 ///
-/// Capped at 256 MiB total. When the cap is exceeded, the oldest entries are
-/// evicted until usage drops below the limit.
+/// Uses a `HashMap` for O(1) lookups by key and a secondary `HashMap`
+/// index by target hash for `get_for_target`. A `VecDeque` of keys
+/// maintains insertion order for LRU eviction.
+///
+/// Capped at 64 MiB total. When the cap is exceeded, the oldest entries
+/// are evicted until usage drops below the limit.
 pub struct DeltaCache {
-    entries: std::sync::Mutex<DeltaCacheInner>,
+    inner: std::sync::Mutex<DeltaCacheInner>,
 }
 
 struct DeltaCacheInner {
-    /// Entries in insertion order (oldest first). Uses VecDeque for O(1)
-    /// front eviction instead of Vec's O(n) shift.
-    entries: std::collections::VecDeque<((String, String), Vec<u8>)>,
+    /// Primary lookup: (base_hash, target_hash) -> delta bytes.
+    map: std::collections::HashMap<(String, String), Vec<u8>>,
+    /// Secondary index: target_hash -> (base_hash, target_hash) for
+    /// `get_for_target` O(1) lookups.
+    by_target: std::collections::HashMap<String, (String, String)>,
+    /// Insertion order (oldest first) for LRU eviction.
+    order: std::collections::VecDeque<(String, String)>,
     total_bytes: usize,
 }
 
@@ -183,8 +191,10 @@ const DELTA_ENTRY_MAX_BYTES: usize = 16 * 1024 * 1024;
 impl DeltaCache {
     pub fn new() -> Self {
         Self {
-            entries: std::sync::Mutex::new(DeltaCacheInner {
-                entries: std::collections::VecDeque::new(),
+            inner: std::sync::Mutex::new(DeltaCacheInner {
+                map: std::collections::HashMap::new(),
+                by_target: std::collections::HashMap::new(),
+                order: std::collections::VecDeque::new(),
                 total_bytes: 0,
             }),
         }
@@ -198,47 +208,44 @@ impl DeltaCache {
             return;
         }
 
-        let mut inner = self.entries.lock().expect("delta cache lock");
+        let mut inner = self.inner.lock().expect("delta cache lock");
 
         // Remove existing entry for this key if present.
-        if let Some(pos) = inner
-            .entries
-            .iter()
-            .position(|((b, t), _)| b == &base_hash && t == &target_hash)
-        {
-            if let Some((_, old)) = inner.entries.remove(pos) {
-                inner.total_bytes -= old.len();
-            }
+        let key = (base_hash, target_hash);
+        if let Some(old) = inner.map.remove(&key) {
+            inner.total_bytes -= old.len();
+            inner.by_target.remove(&key.1);
+            inner.order.retain(|k| k != &key);
         }
 
         // Evict oldest entries until we have room.
-        while inner.total_bytes + delta_len > DELTA_CACHE_MAX_BYTES && !inner.entries.is_empty() {
-            if let Some((_, evicted)) = inner.entries.pop_front() {
+        while inner.total_bytes + delta_len > DELTA_CACHE_MAX_BYTES {
+            let Some(evict_key) = inner.order.pop_front() else {
+                break;
+            };
+            if let Some(evicted) = inner.map.remove(&evict_key) {
                 inner.total_bytes -= evicted.len();
+                inner.by_target.remove(&evict_key.1);
             }
         }
 
         inner.total_bytes += delta_len;
-        inner.entries.push_back(((base_hash, target_hash), delta));
+        inner.by_target.insert(key.1.clone(), key.clone());
+        inner.order.push_back(key.clone());
+        inner.map.insert(key, delta);
     }
 
     pub fn get(&self, base_hash: &str, target_hash: &str) -> Option<Vec<u8>> {
-        let inner = self.entries.lock().expect("delta cache lock");
-        inner
-            .entries
-            .iter()
-            .find(|((b, t), _)| b == base_hash && t == target_hash)
-            .map(|(_, delta)| delta.clone())
+        let inner = self.inner.lock().expect("delta cache lock");
+        let key = (base_hash.to_owned(), target_hash.to_owned());
+        inner.map.get(&key).cloned()
     }
 
     /// Find any cached delta targeting the given hash.
     pub fn get_for_target(&self, target_hash: &str) -> Option<Vec<u8>> {
-        let inner = self.entries.lock().expect("delta cache lock");
-        inner
-            .entries
-            .iter()
-            .find(|((_, t), _)| t == target_hash)
-            .map(|(_, delta)| delta.clone())
+        let inner = self.inner.lock().expect("delta cache lock");
+        let key = inner.by_target.get(target_hash)?;
+        inner.map.get(key).cloned()
     }
 }
 
