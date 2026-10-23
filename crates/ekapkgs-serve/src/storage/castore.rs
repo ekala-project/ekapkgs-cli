@@ -1507,7 +1507,10 @@ fn open_db_reader(path: &Path) -> color_eyre::Result<Connection> {
         path,
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )?;
-    conn.execute_batch("PRAGMA journal_mode=WAL;PRAGMA busy_timeout=5000;PRAGMA query_only=ON")?;
+    conn.execute_batch(
+        "PRAGMA journal_mode=WAL;PRAGMA busy_timeout=5000;PRAGMA query_only=ON;PRAGMA \
+         cache_size=-131072;PRAGMA mmap_size=1073741824;PRAGMA synchronous=NORMAL",
+    )?;
     Ok(conn)
 }
 
