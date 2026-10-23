@@ -1,3 +1,4 @@
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use ekapkgs_nix::installable::Installable;
@@ -192,7 +193,7 @@ fn cmd_push(paths: &[String], cache_name: Option<&str>) -> color_eyre::Result<()
     let (server_url, token) = resolve_cache_for_action(&config, cache_name)?;
     let base_url = server_url.trim_end_matches('/');
 
-    let store_paths = resolve_store_paths(paths)?;
+    let (top_level_paths, store_paths) = resolve_store_paths(paths)?;
 
     if store_paths.is_empty() {
         tracing::info!("Nothing to push");
@@ -200,22 +201,24 @@ fn cmd_push(paths: &[String], cache_name: Option<&str>) -> color_eyre::Result<()
     }
 
     // Compute total closure size up front.
+    let store_paths: Vec<String> = store_paths.into_iter().collect();
     let total_closure_size = closure_nar_size(&store_paths);
 
     // Pre-push summary: "Pushing <first> (size) and N others (total) to <cache>"
-    let first_name = store_paths
-        .first()
-        .map(|p| store::parse_store_path_name(p))
-        .map(|(name, ver)| {
-            if ver.is_empty() {
-                name.to_owned()
-            } else {
-                format!("{name}-{ver}")
-            }
-        })
-        .unwrap_or_default();
+    // Use the top-level (user-provided) paths for display, not an arbitrary
+    // closure dependency.
+    let display_path = top_level_paths
+        .iter()
+        .next()
+        .unwrap_or_else(|| &store_paths[0]);
+    let (name, ver) = store::parse_store_path_name(display_path);
+    let first_name = if ver.is_empty() {
+        name.to_owned()
+    } else {
+        format!("{name}-{ver}")
+    };
 
-    let first_size = store_paths.first().map(|p| single_nar_size(p)).unwrap_or(0);
+    let first_size = single_nar_size(display_path);
 
     if store_paths.len() == 1 {
         tracing::info!(
@@ -319,9 +322,7 @@ fn closure_nar_size(paths: &[String]) -> u64 {
         }
         if let Ok(output) = cmd.output() {
             let stdout = String::from_utf8_lossy(&output.stdout);
-            if let Ok(infos) =
-                serde_json::from_str::<std::collections::HashMap<String, Info>>(&stdout)
-            {
+            if let Ok(infos) = serde_json::from_str::<HashMap<String, Info>>(&stdout) {
                 total += infos.values().map(|i| i.nar_size).sum::<u64>();
             }
         }
@@ -725,18 +726,28 @@ async fn try_cas_push(
     Ok(true)
 }
 
-fn resolve_store_paths(inputs: &[String]) -> color_eyre::Result<Vec<String>> {
-    let mut paths = Vec::new();
+/// Returns `(top_level_paths, all_closure_paths)`.
+///
+/// `top_level_paths` are the direct inputs (or build outputs) before closure
+/// expansion — these are the paths the user actually asked to push and should
+/// be used for display purposes.  `all_closure_paths` is the deduplicated full
+/// closure that must actually be uploaded.
+fn resolve_store_paths(
+    inputs: &[String],
+) -> color_eyre::Result<(HashSet<String>, HashSet<String>)> {
+    let mut top_level = HashSet::new();
+    let mut paths = HashSet::new();
 
     for input in inputs {
         if input.starts_with("/nix/store/") {
+            top_level.insert(input.clone());
+
             let output = NixCommand::new(&["path-info", "--recursive", "--json"])
                 .arg(input)
                 .output()?;
             let stdout = String::from_utf8_lossy(&output.stdout);
 
-            let entries: std::collections::HashMap<String, serde_json::Value> =
-                serde_json::from_str(&stdout)?;
+            let entries: HashMap<String, serde_json::Value> = serde_json::from_str(&stdout)?;
             paths.extend(entries.into_keys());
         } else {
             tracing::info!("Building {input}...");
@@ -749,28 +760,28 @@ fn resolve_store_paths(inputs: &[String]) -> color_eyre::Result<Vec<String>> {
             #[derive(serde::Deserialize)]
             #[serde(rename_all = "camelCase")]
             struct BuildOutput {
-                outputs: std::collections::HashMap<String, String>,
+                outputs: HashMap<String, String>,
             }
             let outputs: Vec<BuildOutput> = serde_json::from_str(&stdout)?;
 
             for build in outputs {
-                for out_path in build.outputs.values() {
+                for out_path in build.outputs.into_values() {
                     let closure_output = NixCommand::new(&["path-info", "--recursive", "--json"])
-                        .arg(out_path)
+                        .arg(&out_path)
                         .output()?;
                     let closure_str = String::from_utf8_lossy(&closure_output.stdout);
 
-                    let entries: std::collections::HashMap<String, serde_json::Value> =
+                    let entries: HashMap<String, serde_json::Value> =
                         serde_json::from_str(&closure_str)?;
                     paths.extend(entries.into_keys());
+
+                    top_level.insert(out_path);
                 }
             }
         }
     }
 
-    paths.sort();
-    paths.dedup();
-    Ok(paths)
+    Ok((top_level, paths))
 }
 
 // --- pull ---
