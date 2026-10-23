@@ -182,6 +182,12 @@ async fn cas_gc_loop(
                     if let Err(e) = cas_maybe_run_gc(&be, max_size, target_size, m.as_ref()) {
                         tracing::error!("CAS GC failed: {e}");
                     }
+
+                    // Background recompression: upgrade hot-path (level 1)
+                    // chunks to cold level (level 9) in small batches.
+                    if let Err(e) = be.recompress_batch(100) {
+                        tracing::warn!("Background recompression failed: {e}");
+                    }
                 }).await;
             }
         }

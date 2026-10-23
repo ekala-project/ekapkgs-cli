@@ -582,25 +582,25 @@ fn cmd_compress_chunks(
     // Ensure new columns exist (idempotent migration).
     storage::castore::ensure_compression_columns(&conn)?;
 
-    // Count total work.
+    // Count total work: hot-path (level 1) chunks eligible for recompression.
     let total: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM chunks WHERE storage_format = 0",
+        "SELECT COUNT(*) FROM chunks WHERE zstd_level = 1",
         [],
         |row| row.get(0),
     )?;
 
     if total == 0 {
-        tracing::info!("All chunks already compressed or inlined");
+        tracing::info!("All chunks already at target compression level");
         return Ok(());
     }
 
     tracing::info!(
-        "{total} chunks to process with {jobs} workers{}",
+        "{total} chunks to recompress with {jobs} workers{}",
         if dry_run { " (dry run)" } else { "" }
     );
 
-    let mut stmt = conn
-        .prepare("SELECT digest, size FROM chunks WHERE storage_format = 0 ORDER BY size DESC")?;
+    let mut stmt =
+        conn.prepare("SELECT digest, size FROM chunks WHERE zstd_level = 1 ORDER BY size DESC")?;
     let chunks: Vec<([u8; 32], i64)> = stmt
         .query_map([], |row| {
             let digest: Vec<u8> = row.get(0)?;
@@ -617,32 +617,24 @@ fn cmd_compress_chunks(
 
     // Result of processing a single chunk (sent from workers to main thread).
     enum ChunkResult {
-        /// Chunk inlined into DB. Contains (digest, original_data).
-        Inline {
-            digest: [u8; 32],
-            data: Vec<u8>,
-            size: u64,
-        },
-        /// Chunk compressed and written to temp file.
-        Compressed {
+        /// Chunk recompressed at level 9 and written to temp file.
+        Recompressed {
             digest: [u8; 32],
             temp_path: std::path::PathBuf,
             final_path: std::path::PathBuf,
-            compressed_size: u64,
-            original_size: u64,
+            new_size: u64,
+            old_size: u64,
         },
-        /// Chunk is incompressible — just update disk_size.
-        Incompressible { digest: [u8; 32], size: u64 },
-        /// Chunk file was missing on disk — skip.
+        /// Level 9 was not smaller — mark as level 9 anyway (already optimal).
+        AlreadyOptimal { digest: [u8; 32], size: u64 },
+        /// Chunk file was missing or errored — skip.
         Skipped,
     }
 
-    let inlined = AtomicU64::new(0);
-    let compressed_count = AtomicU64::new(0);
-    let incompressible_count = AtomicU64::new(0);
+    let recompressed_count = AtomicU64::new(0);
+    let optimal_count = AtomicU64::new(0);
     let bytes_saved = AtomicU64::new(0);
     let bytes_processed = AtomicU64::new(0);
-    let files_removed = AtomicU64::new(0);
     let processed = AtomicU64::new(0);
 
     let chunk_path_fn = |digest: &[u8; 32]| -> std::path::PathBuf {
@@ -663,66 +655,68 @@ fn cmd_compress_chunks(
         .map_err(|e| color_eyre::eyre::eyre!("failed to create thread pool: {e}"))?;
 
     for batch in chunks.chunks(BATCH_SIZE) {
-        // Workers: read, compress, write temp files in parallel.
+        // Workers: decompress level-1, recompress at level 9.
         let results: Vec<ChunkResult> = pool.install(|| {
             use rayon::prelude::*;
             batch
                 .par_iter()
-                .map(|(digest, size)| {
+                .map(|(digest, _size)| {
                     let file_path = chunk_path_fn(digest);
 
                     if !file_path.exists() {
                         return ChunkResult::Skipped;
                     }
 
-                    let Ok(data) = std::fs::read(&file_path) else {
+                    let Ok(compressed_l1) = std::fs::read(&file_path) else {
+                        return ChunkResult::Skipped;
+                    };
+                    let old_size = compressed_l1.len() as u64;
+
+                    // Decompress the level-1 data.
+                    let Ok(raw) = zstd::bulk::decompress(&compressed_l1, 256 * 1024 * 2) else {
                         return ChunkResult::Skipped;
                     };
 
-                    if (*size as usize) < 1024 {
-                        ChunkResult::Inline {
+                    // Recompress at level 9.
+                    let Ok(compressed_l9) = zstd::bulk::compress(&raw, 9) else {
+                        return ChunkResult::Skipped;
+                    };
+
+                    let new_size = compressed_l9.len() as u64;
+                    if new_size < old_size {
+                        if dry_run {
+                            return ChunkResult::Recompressed {
+                                digest: *digest,
+                                temp_path: std::path::PathBuf::new(),
+                                final_path: file_path,
+                                new_size,
+                                old_size,
+                            };
+                        }
+                        let Some(parent) = file_path.parent() else {
+                            return ChunkResult::Skipped;
+                        };
+                        let tmp = match tempfile::NamedTempFile::new_in(parent) {
+                            Ok(mut t) => {
+                                if t.write_all(&compressed_l9).is_err() {
+                                    return ChunkResult::Skipped;
+                                }
+                                t
+                            },
+                            Err(_) => return ChunkResult::Skipped,
+                        };
+                        let temp_path = tmp.into_temp_path().to_path_buf();
+                        ChunkResult::Recompressed {
                             digest: *digest,
-                            data,
-                            size: *size as u64,
+                            temp_path,
+                            final_path: file_path,
+                            new_size,
+                            old_size,
                         }
                     } else {
-                        match zstd::bulk::compress(&data, 1) {
-                            Ok(compressed_data) if compressed_data.len() < data.len() => {
-                                if dry_run {
-                                    return ChunkResult::Compressed {
-                                        digest: *digest,
-                                        temp_path: std::path::PathBuf::new(),
-                                        final_path: file_path,
-                                        compressed_size: compressed_data.len() as u64,
-                                        original_size: *size as u64,
-                                    };
-                                }
-                                // Write compressed data to temp file.
-                                let Some(parent) = file_path.parent() else {
-                                    return ChunkResult::Skipped;
-                                };
-                                let tmp = match tempfile::NamedTempFile::new_in(parent) {
-                                    Ok(mut t) => {
-                                        if t.write_all(&compressed_data).is_err() {
-                                            return ChunkResult::Skipped;
-                                        }
-                                        t
-                                    },
-                                    Err(_) => return ChunkResult::Skipped,
-                                };
-                                let temp_path = tmp.into_temp_path().to_path_buf();
-                                ChunkResult::Compressed {
-                                    digest: *digest,
-                                    temp_path,
-                                    final_path: file_path,
-                                    compressed_size: compressed_data.len() as u64,
-                                    original_size: *size as u64,
-                                }
-                            },
-                            _ => ChunkResult::Incompressible {
-                                digest: *digest,
-                                size: *size as u64,
-                            },
+                        ChunkResult::AlreadyOptimal {
+                            digest: *digest,
+                            size: old_size,
                         }
                     }
                 })
@@ -734,27 +728,17 @@ fn cmd_compress_chunks(
             let tx = conn.unchecked_transaction()?;
             for result in &results {
                 match result {
-                    ChunkResult::Inline { digest, data, .. } => {
-                        tx.execute(
-                            "UPDATE chunks SET storage_format = 1, disk_size = 0, data = ?1 WHERE \
-                             digest = ?2",
-                            params![data.as_slice(), digest.as_slice()],
-                        )?;
-                    },
-                    ChunkResult::Compressed {
-                        digest,
-                        compressed_size,
-                        ..
+                    ChunkResult::Recompressed {
+                        digest, new_size, ..
                     } => {
                         tx.execute(
-                            "UPDATE chunks SET storage_format = 2, disk_size = ?1 WHERE digest = \
-                             ?2",
-                            params![*compressed_size as i64, digest.as_slice()],
+                            "UPDATE chunks SET zstd_level = 9, disk_size = ?1 WHERE digest = ?2",
+                            params![*new_size as i64, digest.as_slice()],
                         )?;
                     },
-                    ChunkResult::Incompressible { digest, size } => {
+                    ChunkResult::AlreadyOptimal { digest, size } => {
                         tx.execute(
-                            "UPDATE chunks SET disk_size = ?1 WHERE digest = ?2",
+                            "UPDATE chunks SET zstd_level = 9, disk_size = ?1 WHERE digest = ?2",
                             params![*size as i64, digest.as_slice()],
                         )?;
                     },
@@ -767,32 +751,23 @@ fn cmd_compress_chunks(
         // After DB commit: finalize file operations.
         for result in &results {
             match result {
-                ChunkResult::Inline { digest, size, .. } => {
-                    if !dry_run {
-                        let _ = std::fs::remove_file(chunk_path_fn(digest));
-                    }
-                    inlined.fetch_add(1, Ordering::Relaxed);
-                    files_removed.fetch_add(1, Ordering::Relaxed);
-                    bytes_saved.fetch_add(*size, Ordering::Relaxed);
-                    bytes_processed.fetch_add(*size, Ordering::Relaxed);
-                },
-                ChunkResult::Compressed {
+                ChunkResult::Recompressed {
                     temp_path,
                     final_path,
-                    compressed_size,
-                    original_size,
+                    new_size,
+                    old_size,
                     ..
                 } => {
                     if !dry_run {
                         let _ = std::fs::rename(temp_path, final_path);
                     }
-                    let saved = original_size - compressed_size;
-                    compressed_count.fetch_add(1, Ordering::Relaxed);
+                    let saved = old_size - new_size;
+                    recompressed_count.fetch_add(1, Ordering::Relaxed);
                     bytes_saved.fetch_add(saved, Ordering::Relaxed);
-                    bytes_processed.fetch_add(*original_size, Ordering::Relaxed);
+                    bytes_processed.fetch_add(*old_size, Ordering::Relaxed);
                 },
-                ChunkResult::Incompressible { size, .. } => {
-                    incompressible_count.fetch_add(1, Ordering::Relaxed);
+                ChunkResult::AlreadyOptimal { size, .. } => {
+                    optimal_count.fetch_add(1, Ordering::Relaxed);
                     bytes_processed.fetch_add(*size, Ordering::Relaxed);
                 },
                 ChunkResult::Skipped => {},
@@ -825,17 +800,15 @@ fn cmd_compress_chunks(
         0.0
     };
     tracing::info!(
-        "{}Done: {} inlined, {} compressed, {} incompressible",
+        "{}Done: {} recompressed, {} already optimal",
         if dry_run { "Dry run " } else { "" },
-        inlined.load(Ordering::Relaxed),
-        compressed_count.load(Ordering::Relaxed),
-        incompressible_count.load(Ordering::Relaxed),
+        recompressed_count.load(Ordering::Relaxed),
+        optimal_count.load(Ordering::Relaxed),
     );
     tracing::info!(
-        "Space saved: {} of {} ({ratio:.1}%, {} files removed)",
+        "Space saved: {} of {} ({ratio:.1}%)",
         gc::format_bytes(bs),
         gc::format_bytes(bp),
-        files_removed.load(Ordering::Relaxed),
     );
 
     Ok(())
