@@ -226,7 +226,7 @@ pub trait StorageBackend: Send + Sync {
     /// Get a chunk by its blake3 digest.
     ///
     /// Returns `Bytes` for zero-copy handoff to the HTTP response layer.
-    fn get_chunk(&self, _digest: &[u8]) -> color_eyre::Result<Option<Vec<u8>>> {
+    fn get_chunk(&self, _digest: &[u8]) -> color_eyre::Result<Option<bytes::Bytes>> {
         Ok(None)
     }
 
