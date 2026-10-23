@@ -40,16 +40,12 @@ const CHUNK_MAX: u32 = 256 * 1024; // 256 KiB
 /// Chunks smaller than this are stored inline in SQLite instead of as files.
 const INLINE_THRESHOLD: usize = 1024;
 
-/// How a chunk is persisted on the server.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum StorageFormat {
-    /// Raw uncompressed file on disk (legacy and incompressible chunks).
-    Raw = 0,
-    /// Data stored inline in the SQLite `data` BLOB column.
-    Inline = 1,
-    /// Zstd-compressed file on disk.
-    Compressed = 2,
-}
+/// Zstd compression level stored in the `zstd_level` column.
+///
+/// `NULL` in SQLite means either inline (when `data IS NOT NULL`) or
+/// incompressible (when `data IS NULL`) — never attempt compression again.
+const ZSTD_LEVEL_HOT: i32 = 1;
+const ZSTD_LEVEL_COLD: i32 = 9;
 
 /// Represents the client's set of already-cached chunk digests.
 ///
@@ -142,11 +138,11 @@ impl CastoreBackend {
 
     /// Get a chunk by its blake3 digest (as 32 raw bytes).
     pub fn get_chunk_by_digest(&self, digest: &[u8; 32]) -> color_eyre::Result<Option<Vec<u8>>> {
-        // Check SQLite for storage format and possible inline data.
+        // Check SQLite for zstd_level and possible inline data.
         let db = self.acquire_reader();
-        let row: Option<(i64, Option<Vec<u8>>)> = db
+        let row: Option<(Option<i32>, Option<Vec<u8>>)> = db
             .query_row(
-                "SELECT storage_format, data FROM chunks WHERE digest = ?1",
+                "SELECT zstd_level, data FROM chunks WHERE digest = ?1",
                 params![digest.as_slice()],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
@@ -154,31 +150,32 @@ impl CastoreBackend {
         drop(db);
 
         match row {
-            Some((1, Some(data))) => Ok(Some(data)),
-            Some((1, None)) => Err(color_eyre::eyre::eyre!(
-                "inline chunk {} has NULL data",
-                hex_encode(digest)
-            )),
-            Some((2, _)) => {
+            // Inline chunk: data column is populated.
+            Some((_, Some(data))) => Ok(Some(data)),
+            // On-disk chunk: zstd_level determines how to read.
+            Some((zstd_level, None)) => {
                 let path = self.chunk_path(&hex_encode(digest));
                 if !path.exists() {
                     return Ok(None);
                 }
-                let compressed = std::fs::read(&path)?;
-                let decompressed = zstd::bulk::decompress(&compressed, CHUNK_MAX as usize * 2)
-                    .map_err(|e| {
-                        color_eyre::eyre::eyre!("corrupt zstd chunk {}: {e}", hex_encode(digest))
-                    })?;
-                Ok(Some(decompressed))
-            },
-            _ => {
-                // Raw on disk (format=0 or legacy row).
-                let path = self.chunk_path(&hex_encode(digest));
-                if !path.exists() {
-                    return Ok(None);
+                let file_bytes = std::fs::read(&path)?;
+                if zstd_level.is_some() {
+                    // Any non-NULL zstd_level means the file is zstd-compressed.
+                    // Zstd frames are self-describing so the level doesn't matter.
+                    let decompressed = zstd::bulk::decompress(&file_bytes, CHUNK_MAX as usize * 2)
+                        .map_err(|e| {
+                            color_eyre::eyre::eyre!(
+                                "corrupt zstd chunk {}: {e}",
+                                hex_encode(digest)
+                            )
+                        })?;
+                    Ok(Some(decompressed))
+                } else {
+                    // NULL zstd_level + no inline data = incompressible raw file.
+                    Ok(Some(file_bytes))
                 }
-                Ok(Some(std::fs::read(path)?))
             },
+            None => Ok(None),
         }
     }
 
@@ -345,22 +342,152 @@ impl CastoreBackend {
     pub fn total_inline_chunks(&self) -> color_eyre::Result<u64> {
         let db = self.acquire_reader();
         let count: i64 = db.query_row(
-            "SELECT COUNT(*) FROM chunks WHERE storage_format = 1",
+            "SELECT COUNT(*) FROM chunks WHERE data IS NOT NULL",
             [],
             |row| row.get(0),
         )?;
         Ok(count as u64)
     }
 
-    /// Return the number of zstd-compressed chunks.
+    /// Return the number of zstd-compressed chunks (any level).
     pub fn total_compressed_chunks(&self) -> color_eyre::Result<u64> {
         let db = self.acquire_reader();
         let count: i64 = db.query_row(
-            "SELECT COUNT(*) FROM chunks WHERE storage_format = 2",
+            "SELECT COUNT(*) FROM chunks WHERE zstd_level IS NOT NULL",
             [],
             |row| row.get(0),
         )?;
         Ok(count as u64)
+    }
+
+    /// Recompress a batch of hot-path (level 1) chunks at the cold level.
+    ///
+    /// Returns `(chunks_processed, bytes_saved)`. Chunks where level-9
+    /// compression is not smaller are marked as level 9 anyway (already
+    /// optimal).
+    pub fn recompress_batch(&self, batch_size: usize) -> color_eyre::Result<(u64, u64)> {
+        // Fetch candidates from a read connection.
+        let reader = self.acquire_reader();
+        let mut stmt =
+            reader.prepare("SELECT digest, size FROM chunks WHERE zstd_level = ?1 LIMIT ?2")?;
+        let candidates: Vec<([u8; 32], i64)> = stmt
+            .query_map(params![ZSTD_LEVEL_HOT, batch_size as i64], |row| {
+                let digest: Vec<u8> = row.get(0)?;
+                let size: i64 = row.get(1)?;
+                Ok((digest, size))
+            })?
+            .filter_map(|r| {
+                let (dv, sz) = r.ok()?;
+                let d: [u8; 32] = dv.as_slice().try_into().ok()?;
+                Some((d, sz))
+            })
+            .collect();
+        drop(stmt);
+        drop(reader);
+
+        if candidates.is_empty() {
+            return Ok((0, 0));
+        }
+
+        struct RecompressResult {
+            digest: [u8; 32],
+            new_disk_size: u64,
+            bytes_saved: u64,
+            temp_path: Option<std::path::PathBuf>,
+            final_path: std::path::PathBuf,
+        }
+
+        let results: Vec<Option<RecompressResult>> = candidates
+            .iter()
+            .map(|(digest, _size)| {
+                let hex = hex_encode(digest);
+                let path = self.chunk_path(&hex);
+                if !path.exists() {
+                    return None;
+                }
+
+                let Ok(compressed_l1) = std::fs::read(&path) else {
+                    return None;
+                };
+                let old_size = compressed_l1.len() as u64;
+
+                // Decompress the level-1 data.
+                let Ok(raw) = zstd::bulk::decompress(&compressed_l1, CHUNK_MAX as usize * 2) else {
+                    return None;
+                };
+
+                // Recompress at the cold level.
+                let Ok(compressed_l9) = zstd::bulk::compress(&raw, ZSTD_LEVEL_COLD) else {
+                    return None;
+                };
+
+                let new_size = compressed_l9.len() as u64;
+                if new_size < old_size {
+                    // Write to temp file for atomic rename.
+                    let parent = path.parent()?;
+                    let mut tmp = tempfile::NamedTempFile::new_in(parent).ok()?;
+                    std::io::Write::write_all(&mut tmp, &compressed_l9).ok()?;
+                    let temp_path = tmp.into_temp_path().to_path_buf();
+                    Some(RecompressResult {
+                        digest: *digest,
+                        new_disk_size: new_size,
+                        bytes_saved: old_size - new_size,
+                        temp_path: Some(temp_path),
+                        final_path: path,
+                    })
+                } else {
+                    // Already optimal at level 1 — mark as level 9 with no file change.
+                    Some(RecompressResult {
+                        digest: *digest,
+                        new_disk_size: old_size,
+                        bytes_saved: 0,
+                        temp_path: None,
+                        final_path: path,
+                    })
+                }
+            })
+            .collect();
+
+        // Commit DB updates in a single transaction, then finalize files.
+        let db = self.db.lock().expect("db lock");
+        let tx = db.unchecked_transaction()?;
+        let mut total_processed = 0u64;
+        let mut total_saved = 0u64;
+
+        for result in &results {
+            let Some(r) = result else { continue };
+            tx.execute(
+                "UPDATE chunks SET zstd_level = ?1, disk_size = ?2 WHERE digest = ?3 AND \
+                 zstd_level = ?4",
+                params![
+                    ZSTD_LEVEL_COLD,
+                    r.new_disk_size as i64,
+                    r.digest.as_slice(),
+                    ZSTD_LEVEL_HOT,
+                ],
+            )?;
+            total_processed += 1;
+            total_saved += r.bytes_saved;
+        }
+        tx.commit()?;
+        drop(db);
+
+        // After DB commit: rename temp files over originals.
+        for result in results {
+            let Some(r) = result else { continue };
+            if let Some(temp_path) = r.temp_path {
+                let _ = std::fs::rename(&temp_path, &r.final_path);
+            }
+        }
+
+        if total_processed > 0 {
+            tracing::info!(
+                "Recompressed {total_processed} chunks, saved {} bytes",
+                total_saved
+            );
+        }
+
+        Ok((total_processed, total_saved))
     }
 
     /// Evict a store path and its exclusively-referenced data.
@@ -581,29 +708,30 @@ impl CastoreBackend {
     /// When called outside a transaction (e.g. from external chunk uploads),
     /// acquires the DB lock internally.
     fn store_chunk(&self, data: &[u8]) -> color_eyre::Result<[u8; 32]> {
-        let (digest, format, disk_size) = self.write_chunk_file(data)?;
-        let inline_data = if format == StorageFormat::Inline {
+        let (digest, zstd_level, disk_size) = self.write_chunk_file(data)?;
+        let inline_data = if data.len() < INLINE_THRESHOLD {
             Some(data)
         } else {
             None
         };
         let db = self.db.lock().expect("db lock");
-        Self::insert_chunk_row(&db, &digest, data.len(), format, disk_size, inline_data)?;
+        Self::insert_chunk_row(&db, &digest, data.len(), zstd_level, disk_size, inline_data)?;
         Ok(digest)
     }
 
-    /// Prepare a chunk for storage, returning its digest, storage format, and
+    /// Prepare a chunk for storage, returning its digest, zstd level, and
     /// disk size (0 for inline chunks).
     ///
     /// Chunks smaller than `INLINE_THRESHOLD` are not written to disk — the
     /// caller stores the data in SQLite. Larger chunks are compressed with
-    /// zstd; if compression doesn't reduce size, they are stored raw.
-    fn write_chunk_file(&self, data: &[u8]) -> color_eyre::Result<([u8; 32], StorageFormat, u64)> {
+    /// zstd level 1; if compression doesn't reduce size, they are stored raw
+    /// and marked incompressible (`zstd_level = NULL`).
+    fn write_chunk_file(&self, data: &[u8]) -> color_eyre::Result<([u8; 32], Option<i32>, u64)> {
         let hash = blake3::hash(data);
         let digest = *hash.as_bytes();
 
         if data.len() < INLINE_THRESHOLD {
-            return Ok((digest, StorageFormat::Inline, 0));
+            return Ok((digest, None, 0));
         }
 
         let hex = hex_encode(&digest);
@@ -613,14 +741,15 @@ impl CastoreBackend {
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent)?;
 
-                // Try zstd compression.
-                let compressed = zstd::bulk::compress(data, 1)
+                // Try zstd compression at the hot-path level.
+                let compressed = zstd::bulk::compress(data, ZSTD_LEVEL_HOT)
                     .map_err(|e| color_eyre::eyre::eyre!("zstd compress failed: {e}"))?;
 
-                let (bytes_to_write, format) = if compressed.len() < data.len() {
-                    (compressed.as_slice(), StorageFormat::Compressed)
+                let (bytes_to_write, zstd_level) = if compressed.len() < data.len() {
+                    (compressed.as_slice(), Some(ZSTD_LEVEL_HOT))
                 } else {
-                    (data, StorageFormat::Raw)
+                    // Incompressible: store raw, mark NULL permanently.
+                    (data, None)
                 };
 
                 let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
@@ -631,15 +760,15 @@ impl CastoreBackend {
                     Err(e) => return Err(e.error.into()),
                 }
 
-                return Ok((digest, format, bytes_to_write.len() as u64));
+                return Ok((digest, zstd_level, bytes_to_write.len() as u64));
             }
         }
 
         // File already exists — return current disk size. The actual
-        // storage_format is whatever was set when the chunk was first inserted;
+        // zstd_level is whatever was set when the chunk was first inserted;
         // INSERT OR IGNORE in the caller preserves it.
         let disk_size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-        Ok((digest, StorageFormat::Raw, disk_size))
+        Ok((digest, None, disk_size))
     }
 
     /// Insert a row into the chunks table. Caller must hold a connection.
@@ -647,17 +776,17 @@ impl CastoreBackend {
         conn: &Connection,
         digest: &[u8; 32],
         size: usize,
-        format: StorageFormat,
+        zstd_level: Option<i32>,
         disk_size: u64,
         inline_data: Option<&[u8]>,
     ) -> color_eyre::Result<()> {
         conn.execute(
-            "INSERT OR IGNORE INTO chunks (digest, size, ref_count, storage_format, disk_size, \
-             data) VALUES (?1, ?2, 1, ?3, ?4, ?5)",
+            "INSERT OR IGNORE INTO chunks (digest, size, ref_count, zstd_level, disk_size, data) \
+             VALUES (?1, ?2, 1, ?3, ?4, ?5)",
             params![
                 digest.as_slice(),
                 size as i64,
-                format as i64,
+                zstd_level,
                 disk_size as i64,
                 inline_data,
             ],
@@ -735,8 +864,8 @@ impl CastoreBackend {
 
                 for chunk in chunks {
                     let chunk_data = &data[chunk.offset..chunk.offset + chunk.length];
-                    let (digest, format, disk_size) = self.write_chunk_file(chunk_data)?;
-                    let inline = if format == StorageFormat::Inline {
+                    let (digest, zstd_level, disk_size) = self.write_chunk_file(chunk_data)?;
+                    let inline = if chunk_data.len() < INLINE_THRESHOLD {
                         Some(chunk_data)
                     } else {
                         None
@@ -745,7 +874,7 @@ impl CastoreBackend {
                         conn,
                         &digest,
                         chunk_data.len(),
-                        format,
+                        zstd_level,
                         disk_size,
                         inline,
                     )?;
@@ -1397,7 +1526,7 @@ fn create_tables(conn: &Connection) -> color_eyre::Result<()> {
             digest         BLOB PRIMARY KEY,
             size           INTEGER NOT NULL,
             ref_count      INTEGER NOT NULL DEFAULT 1,
-            storage_format INTEGER NOT NULL DEFAULT 0,
+            zstd_level     INTEGER DEFAULT NULL,
             disk_size      INTEGER NOT NULL DEFAULT 0,
             data           BLOB DEFAULT NULL
         );
@@ -1432,14 +1561,37 @@ fn create_tables(conn: &Connection) -> color_eyre::Result<()> {
     Ok(())
 }
 
-/// Add chunk compression columns if missing (existing DBs).
+/// Migrate chunk compression columns to the `zstd_level` scheme.
+///
+/// Handles three cases:
+/// - Fresh DB: `zstd_level` already exists from CREATE TABLE.
+/// - Old DB with `storage_format`: migrate to `zstd_level`.
+/// - Very old DB with neither: add `zstd_level`, `disk_size`, `data`.
 pub fn ensure_compression_columns(conn: &Connection) -> color_eyre::Result<()> {
-    let has_format: bool = conn
+    let has_zstd_level: bool = conn
+        .prepare("SELECT zstd_level FROM chunks LIMIT 0")
+        .is_ok();
+    if has_zstd_level {
+        return Ok(());
+    }
+
+    let has_storage_format: bool = conn
         .prepare("SELECT storage_format FROM chunks LIMIT 0")
         .is_ok();
-    if !has_format {
+
+    if has_storage_format {
+        // Migrate from storage_format to zstd_level.
+        // storage_format=0 (Raw) -> NULL (incompressible)
+        // storage_format=1 (Inline) -> NULL (inline, data IS NOT NULL)
+        // storage_format=2 (Compressed) -> 1 (hot-path, eligible for background recompression)
         conn.execute_batch(
-            "ALTER TABLE chunks ADD COLUMN storage_format INTEGER NOT NULL DEFAULT 0;
+            "ALTER TABLE chunks ADD COLUMN zstd_level INTEGER DEFAULT NULL;
+             UPDATE chunks SET zstd_level = 1 WHERE storage_format = 2;",
+        )?;
+    } else {
+        // Very old DB: add all compression columns.
+        conn.execute_batch(
+            "ALTER TABLE chunks ADD COLUMN zstd_level INTEGER DEFAULT NULL;
              ALTER TABLE chunks ADD COLUMN disk_size INTEGER NOT NULL DEFAULT 0;
              ALTER TABLE chunks ADD COLUMN data BLOB DEFAULT NULL;",
         )?;
