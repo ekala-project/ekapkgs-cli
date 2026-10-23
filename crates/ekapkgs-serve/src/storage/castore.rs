@@ -132,6 +132,10 @@ pub struct CastoreBackend {
     /// checks. ~9 MiB for 5M chunks at 0.1% FPR. Negative lookups avoid
     /// SQLite entirely; positive lookups are confirmed with a real query.
     chunk_bloom: Mutex<BloomFilter>,
+    /// Bloom filter of store path hashes for fast has_narinfo rejection.
+    /// Definite negatives skip SQLite entirely; positives are confirmed
+    /// with a real query to avoid false-positive narinfo lookups.
+    path_bloom: Mutex<BloomFilter>,
 }
 
 impl CastoreBackend {
@@ -170,11 +174,15 @@ impl CastoreBackend {
             next_reader: AtomicUsize::new(0),
             dir_cache: Mutex::new(DirCache::new(DIR_CACHE_CAPACITY)),
             chunk_bloom: Mutex::new(BloomFilter::new(1024)),
+            path_bloom: Mutex::new(BloomFilter::new(1024)),
         };
 
         // Build the bloom filter from existing chunks.
         let bloom = backend.build_chunk_bloom();
         *backend.chunk_bloom.lock().expect("chunk bloom lock") = bloom;
+
+        let path_bloom = backend.build_path_bloom();
+        *backend.path_bloom.lock().expect("path bloom lock") = path_bloom;
 
         Ok(backend)
     }
@@ -200,7 +208,10 @@ impl CastoreBackend {
     /// Get a chunk by its blake3 digest (as 32 raw bytes).
     /// Returns `Bytes` for zero-copy handoff to the HTTP layer.
     /// `Bytes::from(vec)` takes ownership without copying.
-    pub fn get_chunk_by_digest(&self, digest: &[u8; 32]) -> color_eyre::Result<Option<Vec<u8>>> {
+    pub fn get_chunk_by_digest(
+        &self,
+        digest: &[u8; 32],
+    ) -> color_eyre::Result<Option<bytes::Bytes>> {
         // Check SQLite for zstd_level and possible inline data.
         let db = self.acquire_reader();
         let row: Option<(Option<i32>, Option<Vec<u8>>)> = db
@@ -214,7 +225,7 @@ impl CastoreBackend {
 
         match row {
             // Inline chunk: data column is populated.
-            Some((_, Some(data))) => Ok(Some(data)),
+            Some((_, Some(data))) => Ok(Some(bytes::Bytes::from(data))),
             // On-disk chunk: zstd_level determines how to read.
             Some((zstd_level, None)) => {
                 let path = self.chunk_path(&hex_encode(digest));
@@ -232,10 +243,10 @@ impl CastoreBackend {
                                 hex_encode(digest)
                             )
                         })?;
-                    Ok(Some(decompressed))
+                    Ok(Some(bytes::Bytes::from(decompressed)))
                 } else {
                     // NULL zstd_level + no inline data = incompressible raw file.
-                    Ok(Some(file_bytes))
+                    Ok(Some(bytes::Bytes::from(file_bytes)))
                 }
             },
             None => Ok(None),
@@ -247,6 +258,10 @@ impl CastoreBackend {
     /// Uses the in-memory bloom filter for fast negative lookups. If the
     /// bloom filter says "maybe", confirms with a real SQLite query.
     pub fn has_chunk(&self, digest: &[u8; 32]) -> color_eyre::Result<bool> {
+        // Fast path: bloom filter says definitely not present.
+        if !self.bloom_maybe_contains(digest) {
+            return Ok(false);
+        }
         // Bloom filter says maybe -- confirm with SQLite.
         let db = self.acquire_reader();
         let exists: bool = db.query_row(
@@ -1254,7 +1269,9 @@ impl CastoreBackend {
         root_node: &CaNode,
     ) -> color_eyre::Result<()> {
         let db = self.db.lock().expect("db lock");
-        Self::store_metadata_with_conn(&db, hash, narinfo, root_node)
+        Self::store_metadata_with_conn(&db, hash, narinfo, root_node)?;
+        self.path_bloom_insert(hash);
+        Ok(())
     }
 
     /// Store narinfo metadata using an existing connection (for use inside
@@ -1493,6 +1510,56 @@ impl CastoreBackend {
         bloom
     }
 
+    /// Build a bloom filter from all store path hashes in cas_paths.
+    fn build_path_bloom(&self) -> BloomFilter {
+        let db = self.acquire_reader();
+        let count: i64 = db
+            .query_row("SELECT COUNT(*) FROM cas_paths", [], |row| row.get(0))
+            .unwrap_or(0);
+
+        let mut bloom = BloomFilter::with_fpr((count as usize).max(1024), 0.001);
+
+        let Ok(mut stmt) = db.prepare("SELECT hash FROM cas_paths") else {
+            return bloom;
+        };
+        let Ok(rows) = stmt.query_map([], |row| {
+            let hash: String = row.get(0)?;
+            Ok(hash)
+        }) else {
+            return bloom;
+        };
+
+        let mut loaded = 0u64;
+        for hash in rows.flatten() {
+            let digest = blake3::hash(hash.as_bytes());
+            bloom.insert(digest.as_bytes());
+            loaded += 1;
+        }
+
+        tracing::info!("Built path bloom filter with {loaded} entries");
+        bloom
+    }
+
+    /// Insert a path hash into the path bloom filter.
+    fn path_bloom_insert(&self, hash: &str) {
+        if let Ok(mut bloom) = self.path_bloom.lock() {
+            let digest = blake3::hash(hash.as_bytes());
+            bloom.insert(digest.as_bytes());
+        }
+    }
+
+    /// Check the path bloom filter. Returns false if the path is
+    /// definitely not present, true if it might be.
+    fn path_bloom_maybe_contains(&self, hash: &str) -> bool {
+        match self.path_bloom.lock() {
+            Ok(bloom) => {
+                let digest = blake3::hash(hash.as_bytes());
+                bloom.maybe_contains(digest.as_bytes())
+            },
+            Err(_) => true,
+        }
+    }
+
     /// Insert a digest into the chunk bloom filter.
     pub fn bloom_insert(&self, digest: &[u8; 32]) {
         if let Ok(mut bloom) = self.chunk_bloom.lock() {
@@ -1515,6 +1582,10 @@ impl StorageBackend for CastoreBackend {
     }
 
     fn has_narinfo(&self, hash: &str) -> color_eyre::Result<bool> {
+        // Fast path: bloom filter says definitely not present.
+        if !self.path_bloom_maybe_contains(hash) {
+            return Ok(false);
+        }
         let db = self.acquire_reader();
         let exists: bool = db.query_row(
             "SELECT EXISTS(SELECT 1 FROM cas_paths WHERE hash = ?1)",
@@ -1647,7 +1718,7 @@ impl StorageBackend for CastoreBackend {
         true
     }
 
-    fn get_chunk(&self, digest: &[u8]) -> color_eyre::Result<Option<Vec<u8>>> {
+    fn get_chunk(&self, digest: &[u8]) -> color_eyre::Result<Option<bytes::Bytes>> {
         let d: [u8; 32] = digest
             .try_into()
             .map_err(|_| color_eyre::eyre::eyre!("invalid digest length"))?;
@@ -1732,7 +1803,7 @@ impl StorageBackend for std::sync::Arc<CastoreBackend> {
         (**self).supports_cas()
     }
 
-    fn get_chunk(&self, digest: &[u8]) -> color_eyre::Result<Option<Vec<u8>>> {
+    fn get_chunk(&self, digest: &[u8]) -> color_eyre::Result<Option<bytes::Bytes>> {
         (**self).get_chunk(digest)
     }
 
