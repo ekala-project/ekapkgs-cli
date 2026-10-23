@@ -171,7 +171,8 @@ pub struct DeltaCache {
 
 struct DeltaCacheInner {
     /// Primary lookup: (base_hash, target_hash) -> delta bytes.
-    map: std::collections::HashMap<(String, String), Vec<u8>>,
+    /// `Arc<[u8]>` avoids full copies on cache reads.
+    map: std::collections::HashMap<(String, String), Arc<[u8]>>,
     /// Secondary index: target_hash -> (base_hash, target_hash) for
     /// `get_for_target` O(1) lookups.
     by_target: std::collections::HashMap<String, (String, String)>,
@@ -208,6 +209,7 @@ impl DeltaCache {
             return;
         }
 
+        let delta: Arc<[u8]> = delta.into();
         let mut inner = self.inner.lock().expect("delta cache lock");
 
         // Remove existing entry for this key if present.
@@ -235,17 +237,17 @@ impl DeltaCache {
         inner.map.insert(key, delta);
     }
 
-    pub fn get(&self, base_hash: &str, target_hash: &str) -> Option<Vec<u8>> {
+    pub fn get(&self, base_hash: &str, target_hash: &str) -> Option<Arc<[u8]>> {
         let inner = self.inner.lock().expect("delta cache lock");
         let key = (base_hash.to_owned(), target_hash.to_owned());
-        inner.map.get(&key).cloned()
+        inner.map.get(&key).map(Arc::clone)
     }
 
     /// Find any cached delta targeting the given hash.
-    pub fn get_for_target(&self, target_hash: &str) -> Option<Vec<u8>> {
+    pub fn get_for_target(&self, target_hash: &str) -> Option<Arc<[u8]>> {
         let inner = self.inner.lock().expect("delta cache lock");
         let key = inner.by_target.get(target_hash)?;
-        inner.map.get(key).cloned()
+        inner.map.get(key).map(Arc::clone)
     }
 }
 
