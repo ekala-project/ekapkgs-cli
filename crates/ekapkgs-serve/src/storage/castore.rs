@@ -128,6 +128,10 @@ pub struct CastoreBackend {
     /// LRU cache for directory blobs to avoid repeated SQLite reads
     /// during CAS tree walks.
     dir_cache: Mutex<DirCache>,
+    /// Server-side bloom filter of all chunk digests for fast non-existence
+    /// checks. ~9 MiB for 5M chunks at 0.1% FPR. Negative lookups avoid
+    /// SQLite entirely; positive lookups are confirmed with a real query.
+    chunk_bloom: Mutex<BloomFilter>,
 }
 
 impl CastoreBackend {
@@ -159,13 +163,20 @@ impl CastoreBackend {
             read_pool.push(Mutex::new(reader));
         }
 
-        Ok(Self {
+        let backend = Self {
             root,
             db: Mutex::new(conn),
             read_pool,
             next_reader: AtomicUsize::new(0),
             dir_cache: Mutex::new(DirCache::new(DIR_CACHE_CAPACITY)),
-        })
+            chunk_bloom: Mutex::new(BloomFilter::new(1024)),
+        };
+
+        // Build the bloom filter from existing chunks.
+        let bloom = backend.build_chunk_bloom();
+        *backend.chunk_bloom.lock().expect("chunk bloom lock") = bloom;
+
+        Ok(backend)
     }
 
     /// Acquire a read-only connection from the pool.
@@ -1450,6 +1461,54 @@ impl CastoreBackend {
     }
 }
 
+impl CastoreBackend {
+    /// Populate a bloom filter with all chunk digests currently in the database.
+    fn build_chunk_bloom(&self) -> BloomFilter {
+        let db = self.acquire_reader();
+        let count: i64 = db
+            .query_row("SELECT COUNT(*) FROM chunks", [], |row| row.get(0))
+            .unwrap_or(0);
+
+        let mut bloom = BloomFilter::with_fpr((count as usize).max(1024), 0.001);
+
+        let Ok(mut stmt) = db.prepare("SELECT digest FROM chunks") else {
+            return bloom;
+        };
+        let Ok(rows) = stmt.query_map([], |row| {
+            let digest: Vec<u8> = row.get(0)?;
+            Ok(digest)
+        }) else {
+            return bloom;
+        };
+
+        let mut loaded = 0u64;
+        for digest_vec in rows.flatten() {
+            if let Ok(d) = <[u8; 32]>::try_from(digest_vec.as_slice()) {
+                bloom.insert(&d);
+                loaded += 1;
+            }
+        }
+
+        tracing::info!("Built chunk bloom filter with {loaded} entries");
+        bloom
+    }
+
+    /// Insert a digest into the chunk bloom filter.
+    pub fn bloom_insert(&self, digest: &[u8; 32]) {
+        if let Ok(mut bloom) = self.chunk_bloom.lock() {
+            bloom.insert(digest);
+        }
+    }
+
+    /// Check the bloom filter for a chunk digest.
+    pub fn bloom_maybe_contains(&self, digest: &[u8; 32]) -> bool {
+        match self.chunk_bloom.lock() {
+            Ok(bloom) => bloom.maybe_contains(digest),
+            Err(_) => true,
+        }
+    }
+}
+
 impl StorageBackend for CastoreBackend {
     fn as_any(&self) -> &dyn std::any::Any {
         self
@@ -2278,8 +2337,22 @@ mod tests {
         backend.put_nar("nar/ord1.nar", &write_nar(&node1)).unwrap();
         backend.put_nar("nar/ord2.nar", &write_nar(&node2)).unwrap();
 
-        // Update access for ord2 so it's more recent.
-        backend.update_access(&["ord2".to_owned()]);
+        // Set distinguishable access times directly. update_access now
+        // quantizes to 1-hour granularity, so paths created in the same
+        // second would get the same timestamp.
+        {
+            let db = backend.db.lock().expect("db lock");
+            db.execute(
+                "UPDATE cas_paths SET last_access = 1000 WHERE hash = 'ord1'",
+                [],
+            )
+            .unwrap();
+            db.execute(
+                "UPDATE cas_paths SET last_access = 2000 WHERE hash = 'ord2'",
+                [],
+            )
+            .unwrap();
+        }
 
         let paths = backend.paths_by_access_asc().unwrap();
         assert_eq!(paths.len(), 2);

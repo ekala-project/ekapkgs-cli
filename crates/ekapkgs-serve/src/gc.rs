@@ -348,6 +348,10 @@ fn now_unix() -> u64 {
 }
 
 /// Batch update last_access for a set of hashes.
+///
+/// Deduplicates hashes within the batch so each path is updated at most
+/// once per flush, and quantizes timestamps to 1-hour granularity since
+/// LRU eviction doesn't need second-level precision.
 fn flush_accesses(db_path: &Path, hashes: &[String]) {
     let conn = match open_db(db_path) {
         Ok(c) => c,
@@ -357,12 +361,18 @@ fn flush_accesses(db_path: &Path, hashes: &[String]) {
         },
     };
 
+    // Quantize to 1-hour granularity.
     let now = now_unix();
+    let quantized = now - (now % 3600);
+
+    // Deduplicate: each hash only needs one UPDATE per flush.
+    let unique: HashSet<&str> = hashes.iter().map(String::as_str).collect();
+
     if let Ok(tx) = conn.unchecked_transaction() {
-        for hash in hashes {
+        for hash in &unique {
             let _ = tx.execute(
                 "UPDATE store_paths SET last_access = ?1 WHERE hash = ?2",
-                params![now as i64, hash],
+                params![quantized as i64, *hash],
             );
         }
         let _ = tx.commit();

@@ -42,6 +42,24 @@ impl BloomFilter {
         }
     }
 
+    /// Create a bloom filter sized for `num_items` with a custom
+    /// false-positive rate (e.g., `0.001` for 0.1%).
+    pub fn with_fpr(num_items: usize, fpr: f64) -> Self {
+        let fpr = fpr.clamp(1e-10, 0.5);
+        // bits = -n * ln(fpr) / (ln(2))^2
+        let raw_bits = ((-(num_items as f64) * fpr.ln() / (core::f64::consts::LN_2.powi(2))).ceil()
+            as u64)
+            .max(64);
+        let num_bytes = raw_bits.div_ceil(8) as usize;
+        let num_bits = num_bytes as u64 * 8;
+        let num_hashes = optimal_k(num_bits, num_items as u64);
+        Self {
+            bits: vec![0u8; num_bytes],
+            num_bits,
+            num_hashes,
+        }
+    }
+
     /// Reconstruct a bloom filter from its serialized form.
     pub fn from_bytes(data: &[u8], num_hashes: u32) -> Self {
         let num_bits = data.len() as u64 * 8;
