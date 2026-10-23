@@ -807,6 +807,7 @@ impl CastoreBackend {
         };
         let db = self.db.lock().expect("db lock");
         Self::insert_chunk_row(&db, &digest, data.len(), zstd_level, disk_size, inline_data)?;
+        self.bloom_insert(&digest);
         Ok(digest)
     }
 
@@ -988,6 +989,7 @@ impl CastoreBackend {
                         disk_size,
                         inline,
                     )?;
+                    self.bloom_insert(&digest);
                     chunk_digests.push((digest, chunk.length as u64));
                     total_size += chunk.length as u64;
                 }
@@ -1711,6 +1713,7 @@ impl StorageBackend for CastoreBackend {
         }
 
         tx.commit()?;
+        self.path_bloom_insert(hash);
         Ok(true)
     }
 
@@ -2118,7 +2121,7 @@ mod tests {
         let digest = backend.store_chunk(data).unwrap();
 
         let retrieved = backend.get_chunk_by_digest(&digest).unwrap().unwrap();
-        assert_eq!(retrieved, data);
+        assert_eq!(retrieved, &data[..]);
     }
 
     #[test]
@@ -2443,7 +2446,7 @@ mod tests {
 
         // Should still be readable.
         let retrieved = backend.get_chunk_by_digest(&digest).unwrap().unwrap();
-        assert_eq!(retrieved, small_data);
+        assert_eq!(retrieved, &small_data[..]);
 
         // has_chunk should return true.
         assert!(backend.has_chunk(&digest).unwrap());
@@ -2468,7 +2471,7 @@ mod tests {
 
         // Should decompress to original data.
         let retrieved = backend.get_chunk_by_digest(&digest).unwrap().unwrap();
-        assert_eq!(retrieved, data);
+        assert_eq!(retrieved, &data[..]);
     }
 
     #[test]
@@ -2489,7 +2492,7 @@ mod tests {
         assert_eq!(count_chunk_files(&backend.root), 1);
 
         let retrieved = backend.get_chunk_by_digest(&digest).unwrap().unwrap();
-        assert_eq!(retrieved, data);
+        assert_eq!(retrieved, &data[..]);
     }
 
     #[test]
