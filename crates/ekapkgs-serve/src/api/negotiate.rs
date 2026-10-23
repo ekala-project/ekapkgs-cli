@@ -386,6 +386,13 @@ impl CacheService for NegotiateService {
 
         let total_chunk_size: u64 = missing_chunks.iter().map(|c| c.size).sum();
 
+        // Record accesses for GC tracking on successful chunk negotiations.
+        if let Some(ref tracker) = self.state.gc_tracker {
+            for mapping in &path_mappings {
+                tracker.record_access(&mapping.store_path_hash);
+            }
+        }
+
         Ok(Response::new(ChunkNegotiateResponse {
             path_mappings,
             missing_chunks,

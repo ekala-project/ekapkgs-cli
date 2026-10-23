@@ -143,6 +143,7 @@ pub struct AppState {
     /// Path to token store file for persisting minted tokens.
     pub token_store_path: PathBuf,
     pub delta_cache: DeltaCache,
+    pub narinfo_cache: NarInfoCache,
     pub metrics: metrics::Metrics,
     /// Cache priority advertised in nix-cache-info.
     pub priority: u32,
@@ -252,6 +253,62 @@ impl DeltaCache {
 }
 
 impl Default for DeltaCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Cache for signed narinfo text, keyed by store path hash.
+///
+/// After the first request for a given hash, the fully signed narinfo
+/// text is stored here so subsequent requests skip re-serialization
+/// and re-signing. Bounded by entry count.
+pub struct NarInfoCache {
+    inner: std::sync::Mutex<NarInfoCacheInner>,
+}
+
+struct NarInfoCacheInner {
+    map: std::collections::HashMap<String, Arc<str>>,
+    order: std::collections::VecDeque<String>,
+    capacity: usize,
+}
+
+const NARINFO_CACHE_CAPACITY: usize = 8192;
+
+impl NarInfoCache {
+    pub fn new() -> Self {
+        Self {
+            inner: std::sync::Mutex::new(NarInfoCacheInner {
+                map: std::collections::HashMap::with_capacity(NARINFO_CACHE_CAPACITY),
+                order: std::collections::VecDeque::with_capacity(NARINFO_CACHE_CAPACITY),
+                capacity: NARINFO_CACHE_CAPACITY,
+            }),
+        }
+    }
+
+    pub fn get(&self, hash: &str) -> Option<Arc<str>> {
+        let inner = self.inner.lock().ok()?;
+        inner.map.get(hash).map(Arc::clone)
+    }
+
+    pub fn insert(&self, hash: String, text: Arc<str>) {
+        let Ok(mut inner) = self.inner.lock() else {
+            return;
+        };
+        if inner.map.contains_key(&hash) {
+            return;
+        }
+        if inner.map.len() >= inner.capacity {
+            if let Some(evicted) = inner.order.pop_front() {
+                inner.map.remove(&evicted);
+            }
+        }
+        inner.order.push_back(hash.clone());
+        inner.map.insert(hash, text);
+    }
+}
+
+impl Default for NarInfoCache {
     fn default() -> Self {
         Self::new()
     }
@@ -1019,6 +1076,7 @@ async fn cmd_serve(cli: Cli) -> color_eyre::Result<()> {
         admin_token,
         token_store_path,
         delta_cache: DeltaCache::new(),
+        narinfo_cache: NarInfoCache::new(),
         metrics: server_metrics,
         priority,
         store_dir,

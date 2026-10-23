@@ -37,6 +37,7 @@ subtle.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
 rusqlite.workspace = true
+bytes.workspace = true
 blake3.workspace = true
 fastcdc.workspace = true
 zstd.workspace = true

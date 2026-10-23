@@ -1528,6 +1528,7 @@ dependencies = [
  "axum 0.8.9",
  "axum-server",
  "blake3",
+ "bytes",
  "bzip2",
  "clap",
  "clap-verbosity-flag",

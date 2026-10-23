@@ -24,7 +24,7 @@ use ekapkgs_protocol::ekapkgs::v1::{
 use prost::Message;
 use rusqlite::{Connection, params};
 
-use super::{BatchNarInfoResult, NarInfo, StorageBackend};
+use super::{NarInfo, StorageBackend};
 
 /// A file digest and its ordered list of (chunk_digest, chunk_size) pairs.
 type FileChunkMap = Vec<([u8; 32], Vec<([u8; 32], u64)>)>;
@@ -189,10 +189,7 @@ impl CastoreBackend {
     /// Get a chunk by its blake3 digest (as 32 raw bytes).
     /// Returns `Bytes` for zero-copy handoff to the HTTP layer.
     /// `Bytes::from(vec)` takes ownership without copying.
-    pub fn get_chunk_by_digest(
-        &self,
-        digest: &[u8; 32],
-    ) -> color_eyre::Result<Option<bytes::Bytes>> {
+    pub fn get_chunk_by_digest(&self, digest: &[u8; 32]) -> color_eyre::Result<Option<Vec<u8>>> {
         // Check SQLite for zstd_level and possible inline data.
         let db = self.acquire_reader();
         let row: Option<(Option<i32>, Option<Vec<u8>>)> = db
@@ -206,7 +203,7 @@ impl CastoreBackend {
 
         match row {
             // Inline chunk: data column is populated.
-            Some((_, Some(data))) => Ok(Some(bytes::Bytes::from(data))),
+            Some((_, Some(data))) => Ok(Some(data)),
             // On-disk chunk: zstd_level determines how to read.
             Some((zstd_level, None)) => {
                 let path = self.chunk_path(&hex_encode(digest));
@@ -224,10 +221,10 @@ impl CastoreBackend {
                                 hex_encode(digest)
                             )
                         })?;
-                    Ok(Some(bytes::Bytes::from(decompressed)))
+                    Ok(Some(decompressed))
                 } else {
                     // NULL zstd_level + no inline data = incompressible raw file.
-                    Ok(Some(bytes::Bytes::from(file_bytes)))
+                    Ok(Some(file_bytes))
                 }
             },
             None => Ok(None),
@@ -239,10 +236,6 @@ impl CastoreBackend {
     /// Uses the in-memory bloom filter for fast negative lookups. If the
     /// bloom filter says "maybe", confirms with a real SQLite query.
     pub fn has_chunk(&self, digest: &[u8; 32]) -> color_eyre::Result<bool> {
-        // Fast path: bloom filter says definitely absent.
-        if !self.bloom_maybe_contains(digest) {
-            return Ok(false);
-        }
         // Bloom filter says maybe -- confirm with SQLite.
         let db = self.acquire_reader();
         let exists: bool = db.query_row(
@@ -788,8 +781,6 @@ impl CastoreBackend {
         };
         let db = self.db.lock().expect("db lock");
         Self::insert_chunk_row(&db, &digest, data.len(), zstd_level, disk_size, inline_data)?;
-        // Update the bloom filter so subsequent has_chunk calls see this chunk.
-        self.bloom_insert(&digest);
         Ok(digest)
     }
 
@@ -971,8 +962,6 @@ impl CastoreBackend {
                         disk_size,
                         inline,
                     )?;
-                    // Update the bloom filter so subsequent has_chunk calls see this chunk.
-                    self.bloom_insert(&digest);
                     chunk_digests.push((digest, chunk.length as u64));
                     total_size += chunk.length as u64;
                 }
@@ -1599,7 +1588,7 @@ impl StorageBackend for CastoreBackend {
         true
     }
 
-    fn get_chunk(&self, digest: &[u8]) -> color_eyre::Result<Option<bytes::Bytes>> {
+    fn get_chunk(&self, digest: &[u8]) -> color_eyre::Result<Option<Vec<u8>>> {
         let d: [u8; 32] = digest
             .try_into()
             .map_err(|_| color_eyre::eyre::eyre!("invalid digest length"))?;
@@ -1684,7 +1673,7 @@ impl StorageBackend for std::sync::Arc<CastoreBackend> {
         (**self).supports_cas()
     }
 
-    fn get_chunk(&self, digest: &[u8]) -> color_eyre::Result<Option<bytes::Bytes>> {
+    fn get_chunk(&self, digest: &[u8]) -> color_eyre::Result<Option<Vec<u8>>> {
         (**self).get_chunk(digest)
     }
 

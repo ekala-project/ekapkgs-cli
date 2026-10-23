@@ -111,8 +111,6 @@ impl NarInfo {
 }
 
 /// Return type for batch narinfo queries: `(available, unavailable)`.
-type BatchNarInfoResult = (Vec<(String, NarInfo)>, Vec<String>);
-
 /// Abstract storage backend for the binary cache server.
 pub trait StorageBackend: Send + Sync {
     /// Downcast to a concrete type for backend-specific operations.
@@ -228,7 +226,7 @@ pub trait StorageBackend: Send + Sync {
     /// Get a chunk by its blake3 digest.
     ///
     /// Returns `Bytes` for zero-copy handoff to the HTTP response layer.
-    fn get_chunk(&self, _digest: &[u8]) -> color_eyre::Result<Option<bytes::Bytes>> {
+    fn get_chunk(&self, _digest: &[u8]) -> color_eyre::Result<Option<Vec<u8>>> {
         Ok(None)
     }
 

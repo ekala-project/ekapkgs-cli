@@ -373,6 +373,35 @@ pub async fn get_narinfo(
         .with_label_values(&["attempt"])
         .inc();
 
+    // Fast path: serve from narinfo text cache (skips DB + signing).
+    if query.json.is_none() {
+        if let Some(cached_text) = state.narinfo_cache.get(hash) {
+            if let Some(ref tracker) = state.gc_tracker {
+                tracker.record_access(hash);
+            }
+            state
+                .metrics
+                .narinfo_requests_total
+                .with_label_values(&["hit"])
+                .inc();
+            let nar_link = cached_text
+                .lines()
+                .find_map(|l| l.strip_prefix("URL: "))
+                .unwrap_or("")
+                .to_owned();
+            return (
+                StatusCode::OK,
+                [
+                    (header::CONTENT_TYPE, "text/x-nix-narinfo".to_owned()),
+                    (header::CACHE_CONTROL, "max-age=86400".to_owned()),
+                    (HeaderName::from_static("nix-link"), nar_link),
+                ],
+                cached_text.to_string(),
+            )
+                .into_response();
+        }
+    }
+
     let narinfo = match state.storage.get_narinfo(hash) {
         Ok(Some(mut ni)) => {
             // Re-sign with our key if the narinfo doesn't already have our sig.
@@ -429,6 +458,11 @@ pub async fn get_narinfo(
 
     let nar_link = &narinfo.url;
     let body = narinfo.to_narinfo_string();
+
+    // Cache the signed narinfo text for future requests.
+    let body_arc: std::sync::Arc<str> = body.clone().into();
+    state.narinfo_cache.insert(hash.to_owned(), body_arc);
+
     (
         StatusCode::OK,
         [
