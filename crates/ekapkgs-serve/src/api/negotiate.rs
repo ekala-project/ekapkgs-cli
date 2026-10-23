@@ -208,11 +208,12 @@ impl CacheService for NegotiateService {
         // Compute delta transfers: for each available path, check if the client
         // has an older version of the same package that can serve as a delta base.
         compute_deltas(
-            &self.state,
+            Arc::clone(&self.state),
             &req.have,
             &mut available,
             &mut total_download_size,
-        );
+        )
+        .await;
 
         Ok(Response::new(NegotiateResponse {
             available,
@@ -780,40 +781,81 @@ const MAX_DELTAS_PER_REQUEST: usize = 32;
 /// skipping large NARs prevents OOM from packages like chromium.
 const DELTA_MAX_NAR_SIZE: u64 = 64 * 1024 * 1024;
 
+/// Maximum number of concurrent delta computations. Each holds up to
+/// 2 * `DELTA_MAX_NAR_SIZE` in memory, so 4 concurrent = ~512 MiB worst case.
+const DELTA_CONCURRENT: usize = 4;
+
+/// Result of a single delta computation task.
+struct DeltaResult {
+    /// Index into the `available` slice for this entry.
+    idx: usize,
+    base_hash: String,
+    target_hash: String,
+    delta: Vec<u8>,
+    file_size: u64,
+}
+
 /// Scan available paths for delta transfer opportunities against the client's
 /// `have` set. For each match, compress the new NAR using the old NAR as a zstd
 /// dictionary and store the result in the delta cache.
-fn compute_deltas(
-    state: &crate::AppState,
+///
+/// Delta computations run in parallel on the blocking pool, gated by a
+/// semaphore to cap concurrent memory usage. Cache insertion is serialized
+/// after all tasks complete.
+async fn compute_deltas(
+    state: Arc<crate::AppState>,
     have_hashes: &[String],
     available: &mut [PathManifestEntry],
     total_download_size: &mut u64,
 ) {
-    // Build a map of pname → (hash, store_path) from the client's `have` set.
-    let mut have_by_pname: HashMap<String, (String, String)> = HashMap::new();
-    for hash in have_hashes {
-        if let Ok(Some(ni)) = state.storage.get_narinfo(hash) {
-            if let Some(pname) = extract_pname(&ni.store_path) {
-                have_by_pname.insert(pname, (hash.clone(), ni.store_path.clone()));
+    // Build have_by_pname on the blocking pool to avoid blocking the async
+    // runtime during DB I/O.
+    let state_ref = Arc::clone(&state);
+    let have_hashes_owned: Vec<String> = have_hashes.to_vec();
+    let have_by_pname: HashMap<String, (String, String, u64)> =
+        match tokio::task::spawn_blocking(move || {
+            let mut map: HashMap<String, (String, String, u64)> = HashMap::new();
+            for hash in &have_hashes_owned {
+                if let Ok(Some(ni)) = state_ref.storage.get_narinfo(hash) {
+                    if let Some(pname) = extract_pname(&ni.store_path) {
+                        map.insert(pname, (hash.clone(), ni.store_path.clone(), ni.nar_size));
+                    }
+                }
             }
-        }
-    }
+            map
+        })
+        .await
+        {
+            Ok(map) => map,
+            Err(_) => return,
+        };
 
     if have_by_pname.is_empty() {
         return;
     }
 
-    let mut deltas_computed = 0usize;
+    // Collect candidates: entries that have a matching pname in the have set,
+    // pass size gates, and aren't self-deltas.
+    struct DeltaCandidate {
+        idx: usize,
+        base_hash: String,
+        target_hash: String,
+        target_url: String,
+        file_size: u64,
+        store_path: String,
+    }
 
-    for entry in available.iter_mut() {
-        if deltas_computed >= MAX_DELTAS_PER_REQUEST {
+    let mut candidates = Vec::new();
+    for (idx, entry) in available.iter().enumerate() {
+        if candidates.len() >= MAX_DELTAS_PER_REQUEST {
             break;
         }
         let Some(target_pname) = extract_pname(&entry.store_path) else {
             continue;
         };
 
-        let Some((base_hash, _base_store_path)) = have_by_pname.get(&target_pname) else {
+        let Some((base_hash, _base_store_path, base_nar_size)) = have_by_pname.get(&target_pname)
+        else {
             continue;
         };
 
@@ -830,50 +872,93 @@ fn compute_deltas(
             continue;
         }
 
-        // Skip large NARs — loading two into memory for delta computation
-        // would use too much RAM.
-        if entry.nar_size > DELTA_MAX_NAR_SIZE {
+        // Skip large NARs — gate on both base and target sizes.
+        if entry.nar_size > DELTA_MAX_NAR_SIZE || *base_nar_size > DELTA_MAX_NAR_SIZE {
             continue;
         }
 
-        // Load both NARs.
-        let Ok(Some(base_nar)) = state.storage.get_nar(&format!("nar/{base_hash}.nar")) else {
+        candidates.push(DeltaCandidate {
+            idx,
+            base_hash: base_hash.clone(),
+            target_hash,
+            target_url: entry.url.clone(),
+            file_size: entry.file_size,
+            store_path: entry.store_path.clone(),
+        });
+    }
+
+    if candidates.is_empty() {
+        return;
+    }
+
+    // Compute deltas in parallel using spawn_blocking, gated by a semaphore
+    // to limit concurrent memory usage from NAR loading + compression.
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(DELTA_CONCURRENT));
+    let mut handles = Vec::with_capacity(candidates.len());
+
+    for candidate in candidates {
+        let sem = Arc::clone(&semaphore);
+        let st = Arc::clone(&state);
+
+        let handle = tokio::task::spawn_blocking(move || {
+            // Acquire the semaphore to bound total concurrent delta memory.
+            let Ok(_permit) = sem.try_acquire() else {
+                return None;
+            };
+
+            let Ok(Some(base_nar)) = st
+                .storage
+                .get_nar(&format!("nar/{}.nar", candidate.base_hash))
+            else {
+                return None;
+            };
+            let Ok(Some(target_nar)) = st.storage.get_nar(&candidate.target_url) else {
+                return None;
+            };
+
+            let delta = compress_with_dict(&target_nar, &base_nar)?;
+
+            if !target_nar.is_empty()
+                && (delta.len() as f64 / target_nar.len() as f64) < DELTA_MAX_RATIO
+            {
+                tracing::debug!(
+                    "Delta available for {}: {} -> {} bytes (base: {})",
+                    candidate.store_path,
+                    candidate.file_size,
+                    delta.len(),
+                    candidate.base_hash,
+                );
+                Some(DeltaResult {
+                    idx: candidate.idx,
+                    base_hash: candidate.base_hash,
+                    target_hash: candidate.target_hash,
+                    delta,
+                    file_size: candidate.file_size,
+                })
+            } else {
+                None
+            }
+        });
+        handles.push(handle);
+    }
+
+    // Collect results and apply to entries. Cache insertion is serialized here.
+    for handle in handles {
+        let Ok(Some(result)) = handle.await else {
             continue;
         };
-        let Ok(Some(target_nar)) = state.storage.get_nar(&entry.url) else {
-            continue;
-        };
 
-        // Compress the target NAR using the base NAR as a zstd dictionary.
-        let Some(delta) = compress_with_dict(&target_nar, &base_nar) else {
-            continue;
-        };
+        let entry = &mut available[result.idx];
+        *total_download_size = total_download_size.saturating_sub(result.file_size);
+        *total_download_size += result.delta.len() as u64;
 
-        // Only offer the delta if it's meaningfully smaller.
-        if !target_nar.is_empty()
-            && (delta.len() as f64 / target_nar.len() as f64) < DELTA_MAX_RATIO
-        {
-            // Update download size tracking.
-            *total_download_size = total_download_size.saturating_sub(entry.file_size);
-            *total_download_size += delta.len() as u64;
+        entry.delta_base_hash = result.base_hash.clone();
+        entry.delta_url = format!("delta/{}/{}", result.base_hash, result.target_hash);
+        entry.delta_size = result.delta.len() as u64;
 
-            entry.delta_base_hash = base_hash.clone();
-            entry.delta_url = format!("delta/{base_hash}/{target_hash}");
-            entry.delta_size = delta.len() as u64;
-
-            state
-                .delta_cache
-                .insert(base_hash.clone(), target_hash, delta);
-
-            deltas_computed += 1;
-
-            tracing::debug!(
-                "Delta available for {}: {} -> {} bytes (base: {base_hash})",
-                entry.store_path,
-                entry.file_size,
-                entry.delta_size,
-            );
-        }
+        state
+            .delta_cache
+            .insert(result.base_hash, result.target_hash, result.delta);
     }
 }
 
