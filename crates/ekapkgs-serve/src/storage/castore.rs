@@ -13,6 +13,7 @@ use std::collections::HashSet;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use ekapkgs_nix::bloom::BloomFilter;
 use ekapkgs_nix::nar::{ChunkReader, NarDirectoryEntry, NarNode, parse_nar, write_nar_streaming};
@@ -122,6 +123,8 @@ pub struct CastoreBackend {
     /// Pool of read-only connections for concurrent query serving.
     /// SQLite WAL mode supports unlimited concurrent readers.
     read_pool: Vec<Mutex<Connection>>,
+    /// Atomic counter for lock-free round-robin reader selection.
+    next_reader: AtomicUsize,
     /// LRU cache for directory blobs to avoid repeated SQLite reads
     /// during CAS tree walks.
     dir_cache: Mutex<DirCache>,
@@ -160,25 +163,19 @@ impl CastoreBackend {
             root,
             db: Mutex::new(conn),
             read_pool,
+            next_reader: AtomicUsize::new(0),
             dir_cache: Mutex::new(DirCache::new(DIR_CACHE_CAPACITY)),
         })
     }
 
     /// Acquire a read-only connection from the pool.
-    /// Tries each connection in round-robin order; if all are busy,
-    /// falls back to blocking on one.
+    ///
+    /// Uses an atomic counter for lock-free round-robin selection,
+    /// avoiding the overhead of hashing thread IDs. Falls back to
+    /// blocking if all connections are busy.
     fn acquire_reader(&self) -> std::sync::MutexGuard<'_, Connection> {
-        // Use thread ID to distribute across readers and reduce contention.
-        let start = {
-            let id = std::thread::current().id();
-            let hash = {
-                use std::hash::{Hash, Hasher};
-                let mut h = std::collections::hash_map::DefaultHasher::new();
-                id.hash(&mut h);
-                h.finish()
-            };
-            hash as usize % self.read_pool.len()
-        };
+        let start = self.next_reader.fetch_add(1, Ordering::Relaxed) % self.read_pool.len();
+        // Try each connection starting from the round-robin index.
         for i in 0..self.read_pool.len() {
             let idx = (start + i) % self.read_pool.len();
             if let Ok(guard) = self.read_pool[idx].try_lock() {
@@ -190,7 +187,12 @@ impl CastoreBackend {
     }
 
     /// Get a chunk by its blake3 digest (as 32 raw bytes).
-    pub fn get_chunk_by_digest(&self, digest: &[u8; 32]) -> color_eyre::Result<Option<Vec<u8>>> {
+    /// Returns `Bytes` for zero-copy handoff to the HTTP layer.
+    /// `Bytes::from(vec)` takes ownership without copying.
+    pub fn get_chunk_by_digest(
+        &self,
+        digest: &[u8; 32],
+    ) -> color_eyre::Result<Option<bytes::Bytes>> {
         // Check SQLite for zstd_level and possible inline data.
         let db = self.acquire_reader();
         let row: Option<(Option<i32>, Option<Vec<u8>>)> = db
@@ -204,7 +206,7 @@ impl CastoreBackend {
 
         match row {
             // Inline chunk: data column is populated.
-            Some((_, Some(data))) => Ok(Some(data)),
+            Some((_, Some(data))) => Ok(Some(bytes::Bytes::from(data))),
             // On-disk chunk: zstd_level determines how to read.
             Some((zstd_level, None)) => {
                 let path = self.chunk_path(&hex_encode(digest));
@@ -222,10 +224,10 @@ impl CastoreBackend {
                                 hex_encode(digest)
                             )
                         })?;
-                    Ok(Some(decompressed))
+                    Ok(Some(bytes::Bytes::from(decompressed)))
                 } else {
                     // NULL zstd_level + no inline data = incompressible raw file.
-                    Ok(Some(file_bytes))
+                    Ok(Some(bytes::Bytes::from(file_bytes)))
                 }
             },
             None => Ok(None),
@@ -1475,7 +1477,7 @@ impl StorageBackend for CastoreBackend {
         true
     }
 
-    fn get_chunk(&self, digest: &[u8]) -> color_eyre::Result<Option<Vec<u8>>> {
+    fn get_chunk(&self, digest: &[u8]) -> color_eyre::Result<Option<bytes::Bytes>> {
         let d: [u8; 32] = digest
             .try_into()
             .map_err(|_| color_eyre::eyre::eyre!("invalid digest length"))?;
@@ -1552,7 +1554,7 @@ impl StorageBackend for std::sync::Arc<CastoreBackend> {
         (**self).supports_cas()
     }
 
-    fn get_chunk(&self, digest: &[u8]) -> color_eyre::Result<Option<Vec<u8>>> {
+    fn get_chunk(&self, digest: &[u8]) -> color_eyre::Result<Option<bytes::Bytes>> {
         (**self).get_chunk(digest)
     }
 
