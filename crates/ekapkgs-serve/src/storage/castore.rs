@@ -66,6 +66,55 @@ impl ChunkHaveCheck {
     }
 }
 
+/// Simple bounded LRU cache for CAS directory blobs.
+///
+/// Keyed by blake3 digest. Capped by entry count (not bytes) since
+/// directories are small (typically < 4 KiB). Uses a `HashMap` for O(1)
+/// lookup and a `VecDeque` for LRU eviction order.
+struct DirCache {
+    map: std::collections::HashMap<[u8; 32], CaDirectory>,
+    order: std::collections::VecDeque<[u8; 32]>,
+    capacity: usize,
+}
+
+/// Maximum number of directory entries in the LRU cache.
+const DIR_CACHE_CAPACITY: usize = 4096;
+
+impl DirCache {
+    fn new(capacity: usize) -> Self {
+        Self {
+            map: std::collections::HashMap::with_capacity(capacity),
+            order: std::collections::VecDeque::with_capacity(capacity),
+            capacity,
+        }
+    }
+
+    fn get(&mut self, digest: &[u8; 32]) -> Option<CaDirectory> {
+        if self.map.contains_key(digest) {
+            // Move to back (most recently used).
+            self.order.retain(|d| d != digest);
+            self.order.push_back(*digest);
+            self.map.get(digest).cloned()
+        } else {
+            None
+        }
+    }
+
+    fn insert(&mut self, digest: [u8; 32], dir: CaDirectory) {
+        if self.map.contains_key(&digest) {
+            // Already present — update and move to back.
+            self.order.retain(|d| d != &digest);
+        } else if self.map.len() >= self.capacity {
+            // Evict the least recently used entry.
+            if let Some(evicted) = self.order.pop_front() {
+                self.map.remove(&evicted);
+            }
+        }
+        self.order.push_back(digest);
+        self.map.insert(digest, dir);
+    }
+}
+
 pub struct CastoreBackend {
     root: PathBuf,
     /// Write connection — used for mutations (put_nar, eviction, access updates).
@@ -73,6 +122,9 @@ pub struct CastoreBackend {
     /// Pool of read-only connections for concurrent query serving.
     /// SQLite WAL mode supports unlimited concurrent readers.
     read_pool: Vec<Mutex<Connection>>,
+    /// LRU cache for directory blobs to avoid repeated SQLite reads
+    /// during CAS tree walks.
+    dir_cache: Mutex<DirCache>,
 }
 
 impl CastoreBackend {
@@ -108,6 +160,7 @@ impl CastoreBackend {
             root,
             db: Mutex::new(conn),
             read_pool,
+            dir_cache: Mutex::new(DirCache::new(DIR_CACHE_CAPACITY)),
         })
     }
 
@@ -827,14 +880,26 @@ impl CastoreBackend {
         Ok(digest)
     }
 
-    /// Load a CaDirectory from SQLite by its digest, verifying integrity.
+    /// Load a CaDirectory by its digest, checking the LRU cache first.
+    ///
+    /// On cache miss, reads from SQLite and verifies the blake3 digest
+    /// before inserting into the cache.
     fn load_directory(&self, digest: &[u8; 32]) -> color_eyre::Result<CaDirectory> {
+        // Fast path: check the LRU cache.
+        if let Ok(mut cache) = self.dir_cache.lock() {
+            if let Some(dir) = cache.get(digest) {
+                return Ok(dir);
+            }
+        }
+
+        // Cache miss: read from SQLite.
         let db = self.acquire_reader();
         let data: Vec<u8> = db.query_row(
             "SELECT data FROM directories WHERE digest = ?1",
             params![digest.as_slice()],
             |row| row.get(0),
         )?;
+        drop(db);
 
         // Verify blake3 digest matches stored data to detect corruption.
         let actual = blake3::hash(&data);
@@ -846,7 +911,14 @@ impl CastoreBackend {
             ));
         }
 
-        Ok(CaDirectory::decode(data.as_slice())?)
+        let dir = CaDirectory::decode(data.as_slice())?;
+
+        // Insert into cache.
+        if let Ok(mut cache) = self.dir_cache.lock() {
+            cache.insert(*digest, dir.clone());
+        }
+
+        Ok(dir)
     }
 
     /// Ingest a NarNode tree into CAS, returning the root CaNode.
