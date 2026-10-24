@@ -136,39 +136,58 @@ pub async fn ekapkgs_cache_info(State(state): State<Arc<AppState>>) -> impl Into
             .as_any()
             .downcast_ref::<crate::storage::castore::CastoreBackend>()
         {
-            let paths = cas.total_paths().unwrap_or(0);
-            let nar_size = cas.total_nar_size().unwrap_or(0);
-            let chunks = cas.total_chunks().unwrap_or(0);
-            let chunk_bytes = cas.total_chunk_bytes().unwrap_or(0);
-            let files = cas.total_unique_files().unwrap_or(0);
-            let refs = cas.total_file_chunk_refs().unwrap_or(0);
+            let s = cas.cache_stats();
 
-            lines.push(format!("StorePaths: {paths}"));
-            lines.push(format!("TotalNarSize: {}", format_bytes(nar_size)));
-            lines.push(format!("Chunks: {chunks}"));
-            lines.push(format!("ChunkBytes: {}", format_bytes(chunk_bytes)));
-            lines.push(format!("UniqueFiles: {files}"));
-            lines.push(format!("FileChunkRefs: {refs}"));
+            lines.push(format!("StorePaths: {}", s.paths));
+            lines.push(format!("TotalNarSize: {}", format_bytes(s.nar_size)));
+            lines.push(format!("Chunks: {}", s.chunks));
+            lines.push(format!("ChunkBytes: {}", format_bytes(s.chunk_bytes)));
+            lines.push(format!("UniqueFiles: {}", s.unique_files));
+            lines.push(format!("FileChunkRefs: {}", s.file_chunk_refs));
+            lines.push(format!("DiskBytes: {}", format_bytes(s.disk_bytes)));
+            lines.push(format!("InlineChunks: {}", s.inline_chunks));
+            lines.push(format!("CompressedChunks: {}", s.compressed_chunks));
 
-            let disk_bytes = cas.total_disk_bytes().unwrap_or(0);
-            let inline = cas.total_inline_chunks().unwrap_or(0);
-            let compressed = cas.total_compressed_chunks().unwrap_or(0);
-            lines.push(format!("DiskBytes: {}", format_bytes(disk_bytes)));
-            lines.push(format!("InlineChunks: {inline}"));
-            lines.push(format!("CompressedChunks: {compressed}"));
-
-            if nar_size > 0 {
-                let saved = nar_size.saturating_sub(chunk_bytes);
-                let ratio = (saved as f64 / nar_size as f64) * 100.0;
+            if s.nar_size > 0 {
+                let saved = s.nar_size.saturating_sub(s.chunk_bytes);
+                let ratio = (saved as f64 / s.nar_size as f64) * 100.0;
                 lines.push(format!("DedupSaved: {} ({ratio:.1}%)", format_bytes(saved)));
             }
-            if chunk_bytes > 0 && disk_bytes < chunk_bytes {
-                let saved = chunk_bytes - disk_bytes;
-                let ratio = (saved as f64 / chunk_bytes as f64) * 100.0;
+            if s.chunk_bytes > 0 && s.disk_bytes < s.chunk_bytes {
+                let saved = s.chunk_bytes - s.disk_bytes;
+                let ratio = (saved as f64 / s.chunk_bytes as f64) * 100.0;
                 lines.push(format!(
                     "CompressionSaved: {} ({ratio:.1}%)",
                     format_bytes(saved)
                 ));
+            }
+
+            // Per-level compression breakdown (zstd 1 vs 9).
+            if s.logical_bytes_zstd1 > 0 {
+                let ratio =
+                    (1.0 - s.disk_bytes_zstd1 as f64 / s.logical_bytes_zstd1 as f64) * 100.0;
+                lines.push(format!(
+                    "Zstd1: {} -> {} ({ratio:.1}% saved)",
+                    format_bytes(s.logical_bytes_zstd1),
+                    format_bytes(s.disk_bytes_zstd1)
+                ));
+            }
+            if s.logical_bytes_zstd9 > 0 {
+                let ratio =
+                    (1.0 - s.disk_bytes_zstd9 as f64 / s.logical_bytes_zstd9 as f64) * 100.0;
+                lines.push(format!(
+                    "Zstd9: {} -> {} ({ratio:.1}% saved)",
+                    format_bytes(s.logical_bytes_zstd9),
+                    format_bytes(s.disk_bytes_zstd9)
+                ));
+            }
+            if s.disk_bytes_zstd1 > 0 && s.disk_bytes_zstd9 > 0 && s.logical_bytes_zstd1 > 0 {
+                let z1_ratio = s.disk_bytes_zstd1 as f64 / s.logical_bytes_zstd1 as f64;
+                let estimated_at_z1 = (s.logical_bytes_zstd9 as f64 * z1_ratio) as u64;
+                if estimated_at_z1 > s.disk_bytes_zstd9 {
+                    let extra_saved = estimated_at_z1 - s.disk_bytes_zstd9;
+                    lines.push(format!("Zstd1ToZstd9Saved: {}", format_bytes(extra_saved)));
+                }
             }
         }
     } else if storage

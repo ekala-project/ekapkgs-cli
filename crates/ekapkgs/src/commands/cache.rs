@@ -164,6 +164,41 @@ fn cmd_status(cache_name: Option<&str>) -> color_eyre::Result<()> {
         if response.compressed_chunks > 0 {
             println!("    Compressed (zstd): {}", response.compressed_chunks);
         }
+
+        // Per-level compression breakdown.
+        let lz1 = response.logical_bytes_zstd1;
+        let dz1 = response.disk_bytes_zstd1;
+        let lz9 = response.logical_bytes_zstd9;
+        let dz9 = response.disk_bytes_zstd9;
+        if lz1 > 0 || lz9 > 0 {
+            println!();
+            println!("  Compression levels:");
+            if lz1 > 0 {
+                let ratio = (1.0 - dz1 as f64 / lz1 as f64) * 100.0;
+                println!(
+                    "    zstd-1 (hot):  {} -> {} ({ratio:.1}% saved)",
+                    fb(lz1),
+                    fb(dz1)
+                );
+            }
+            if lz9 > 0 {
+                let ratio = (1.0 - dz9 as f64 / lz9 as f64) * 100.0;
+                println!(
+                    "    zstd-9 (cold): {} -> {} ({ratio:.1}% saved)",
+                    fb(lz9),
+                    fb(dz9)
+                );
+            }
+            if dz1 > 0 && dz9 > 0 && lz1 > 0 {
+                let z1_ratio = dz1 as f64 / lz1 as f64;
+                let estimated_at_z1 = (lz9 as f64 * z1_ratio) as u64;
+                if estimated_at_z1 > dz9 {
+                    let extra = estimated_at_z1 - dz9;
+                    println!("    Saved by recompression (1->9): {}", fb(extra));
+                }
+            }
+        }
+
         println!("  Unique files: {}", response.unique_files);
         println!(
             "  File-chunk references: {}",
