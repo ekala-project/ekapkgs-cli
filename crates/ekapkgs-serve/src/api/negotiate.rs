@@ -596,15 +596,20 @@ impl CacheService for NegotiateService {
                 .as_any()
                 .downcast_ref::<crate::storage::castore::CastoreBackend>()
             {
-                resp.store_paths = cas.total_paths().unwrap_or(0);
-                resp.total_nar_size = cas.total_nar_size().unwrap_or(0);
-                resp.chunks = cas.total_chunks().unwrap_or(0);
-                resp.chunk_bytes = cas.total_chunk_bytes().unwrap_or(0);
-                resp.unique_files = cas.total_unique_files().unwrap_or(0);
-                resp.total_file_chunk_refs = cas.total_file_chunk_refs().unwrap_or(0);
-                resp.disk_bytes = cas.total_disk_bytes().unwrap_or(0);
-                resp.inline_chunks = cas.total_inline_chunks().unwrap_or(0);
-                resp.compressed_chunks = cas.total_compressed_chunks().unwrap_or(0);
+                let s = cas.cache_stats();
+                resp.store_paths = s.paths;
+                resp.total_nar_size = s.nar_size;
+                resp.chunks = s.chunks;
+                resp.chunk_bytes = s.chunk_bytes;
+                resp.unique_files = s.unique_files;
+                resp.total_file_chunk_refs = s.file_chunk_refs;
+                resp.disk_bytes = s.disk_bytes;
+                resp.inline_chunks = s.inline_chunks;
+                resp.compressed_chunks = s.compressed_chunks;
+                resp.disk_bytes_zstd1 = s.disk_bytes_zstd1;
+                resp.disk_bytes_zstd9 = s.disk_bytes_zstd9;
+                resp.logical_bytes_zstd1 = s.logical_bytes_zstd1;
+                resp.logical_bytes_zstd9 = s.logical_bytes_zstd9;
             }
         } else if storage
             .as_any()

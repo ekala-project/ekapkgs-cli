@@ -14,6 +14,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Instant;
 
 use ekapkgs_nix::bloom::BloomFilter;
 use ekapkgs_nix::nar::{ChunkReader, NarDirectoryEntry, NarNode, parse_nar, write_nar_streaming};
@@ -116,6 +117,27 @@ impl DirCache {
     }
 }
 
+/// How long cached storage stats remain valid before recomputation.
+const CACHE_STATS_TTL: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
+/// Snapshot of aggregate storage statistics, computed once and cached.
+#[derive(Clone, Default)]
+pub struct CacheStats {
+    pub paths: u64,
+    pub nar_size: u64,
+    pub chunks: u64,
+    pub chunk_bytes: u64,
+    pub unique_files: u64,
+    pub file_chunk_refs: u64,
+    pub disk_bytes: u64,
+    pub inline_chunks: u64,
+    pub compressed_chunks: u64,
+    pub disk_bytes_zstd1: u64,
+    pub disk_bytes_zstd9: u64,
+    pub logical_bytes_zstd1: u64,
+    pub logical_bytes_zstd9: u64,
+}
+
 pub struct CastoreBackend {
     root: PathBuf,
     /// Write connection — used for mutations (put_nar, eviction, access updates).
@@ -136,6 +158,8 @@ pub struct CastoreBackend {
     /// Definite negatives skip SQLite entirely; positives are confirmed
     /// with a real query to avoid false-positive narinfo lookups.
     path_bloom: Mutex<BloomFilter>,
+    /// Cached aggregate stats with TTL to avoid repeated full-table scans.
+    stats_cache: Mutex<(Instant, CacheStats)>,
 }
 
 impl CastoreBackend {
@@ -175,6 +199,8 @@ impl CastoreBackend {
             dir_cache: Mutex::new(DirCache::new(DIR_CACHE_CAPACITY)),
             chunk_bloom: Mutex::new(BloomFilter::new(1024)),
             path_bloom: Mutex::new(BloomFilter::new(1024)),
+            // Seed with epoch so the first call to cache_stats() triggers a refresh.
+            stats_cache: Mutex::new((Instant::now(), CacheStats::default())),
         };
 
         // Build the bloom filter from existing chunks.
@@ -183,6 +209,10 @@ impl CastoreBackend {
 
         let path_bloom = backend.build_path_bloom();
         *backend.path_bloom.lock().expect("path bloom lock") = path_bloom;
+
+        // Eagerly compute stats so the first request is fast.
+        let stats = backend.compute_stats()?;
+        *backend.stats_cache.lock().expect("stats cache lock") = (Instant::now(), stats);
 
         Ok(backend)
     }
@@ -366,7 +396,7 @@ impl CastoreBackend {
         }
     }
 
-    /// Return total bytes stored in chunks.
+    /// Return total bytes stored in chunks (live query, used by GC).
     pub fn total_chunk_bytes(&self) -> color_eyre::Result<u64> {
         let db = self.acquire_reader();
         let total: i64 = db.query_row("SELECT COALESCE(SUM(size), 0) FROM chunks", [], |row| {
@@ -375,80 +405,111 @@ impl CastoreBackend {
         Ok(total as u64)
     }
 
-    /// Return total number of CAS paths stored.
+    /// Return total number of CAS paths stored (live query, used by GC).
     pub fn total_paths(&self) -> color_eyre::Result<u64> {
         let db = self.acquire_reader();
         let count: i64 = db.query_row("SELECT COUNT(*) FROM cas_paths", [], |row| row.get(0))?;
         Ok(count as u64)
     }
 
-    /// Return total number of unique chunks.
-    pub fn total_chunks(&self) -> color_eyre::Result<u64> {
+    /// Compute all aggregate storage stats in a single DB round trip.
+    fn compute_stats(&self) -> color_eyre::Result<CacheStats> {
         let db = self.acquire_reader();
-        let count: i64 = db.query_row("SELECT COUNT(*) FROM chunks", [], |row| row.get(0))?;
-        Ok(count as u64)
-    }
 
-    /// Return total logical NAR size (sum of nar_size across all paths).
-    pub fn total_nar_size(&self) -> color_eyre::Result<u64> {
-        let db = self.acquire_reader();
-        let total: i64 = db.query_row(
+        // Single scan of the chunks table for all aggregate stats.
+        type I9 = (i64, i64, i64, i64, i64, i64, i64, i64, i64);
+        let (
+            chunks,
+            chunk_bytes,
+            disk_bytes,
+            inline_chunks,
+            compressed_chunks,
+            dz1,
+            dz9,
+            lz1,
+            lz9,
+        ): I9 = db.query_row(
+            "SELECT \
+                COUNT(*), \
+                COALESCE(SUM(size), 0), \
+                COALESCE(SUM(disk_size), 0), \
+                COUNT(CASE WHEN data IS NOT NULL THEN 1 END), \
+                COUNT(CASE WHEN zstd_level IS NOT NULL THEN 1 END), \
+                COALESCE(SUM(CASE WHEN zstd_level = ?1 THEN disk_size END), 0), \
+                COALESCE(SUM(CASE WHEN zstd_level = ?2 THEN disk_size END), 0), \
+                COALESCE(SUM(CASE WHEN zstd_level = ?1 THEN size END), 0), \
+                COALESCE(SUM(CASE WHEN zstd_level = ?2 THEN size END), 0) \
+             FROM chunks",
+            params![ZSTD_LEVEL_HOT, ZSTD_LEVEL_COLD],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                ))
+            },
+        )?;
+
+        let paths: i64 = db.query_row("SELECT COUNT(*) FROM cas_paths", [], |row| row.get(0))?;
+        let nar_size: i64 = db.query_row(
             "SELECT COALESCE(SUM(nar_size), 0) FROM cas_paths",
             [],
             |row| row.get(0),
         )?;
-        Ok(total as u64)
-    }
-
-    /// Return the number of unique file digests in file_chunks.
-    pub fn total_unique_files(&self) -> color_eyre::Result<u64> {
-        let db = self.acquire_reader();
-        let count: i64 = db.query_row(
+        let unique_files: i64 = db.query_row(
             "SELECT COUNT(DISTINCT file_digest) FROM file_chunks",
             [],
             |row| row.get(0),
         )?;
-        Ok(count as u64)
+        let file_chunk_refs: i64 =
+            db.query_row("SELECT COUNT(*) FROM file_chunks", [], |row| row.get(0))?;
+
+        Ok(CacheStats {
+            paths: paths as u64,
+            nar_size: nar_size as u64,
+            chunks: chunks as u64,
+            chunk_bytes: chunk_bytes as u64,
+            unique_files: unique_files as u64,
+            file_chunk_refs: file_chunk_refs as u64,
+            disk_bytes: disk_bytes as u64,
+            inline_chunks: inline_chunks as u64,
+            compressed_chunks: compressed_chunks as u64,
+            disk_bytes_zstd1: dz1 as u64,
+            disk_bytes_zstd9: dz9 as u64,
+            logical_bytes_zstd1: lz1 as u64,
+            logical_bytes_zstd9: lz9 as u64,
+        })
     }
 
-    /// Return total number of file-to-chunk mapping rows.
-    pub fn total_file_chunk_refs(&self) -> color_eyre::Result<u64> {
-        let db = self.acquire_reader();
-        let count: i64 = db.query_row("SELECT COUNT(*) FROM file_chunks", [], |row| row.get(0))?;
-        Ok(count as u64)
+    /// Return cached storage stats, refreshing if older than 5 minutes.
+    pub fn cache_stats(&self) -> CacheStats {
+        let mut cached = self.stats_cache.lock().expect("stats cache lock");
+        if cached.0.elapsed() < CACHE_STATS_TTL {
+            return cached.1.clone();
+        }
+        match self.compute_stats() {
+            Ok(stats) => {
+                *cached = (Instant::now(), stats.clone());
+                stats
+            },
+            Err(e) => {
+                tracing::warn!("Failed to refresh cache stats: {e}");
+                cached.1.clone()
+            },
+        }
     }
 
-    /// Return total actual disk usage (compressed/raw sizes, excluding inline).
-    pub fn total_disk_bytes(&self) -> color_eyre::Result<u64> {
-        let db = self.acquire_reader();
-        let total: i64 = db.query_row(
-            "SELECT COALESCE(SUM(disk_size), 0) FROM chunks",
-            [],
-            |row| row.get(0),
-        )?;
-        Ok(total as u64)
-    }
-
-    /// Return the number of inline chunks (stored in SQLite, no disk file).
-    pub fn total_inline_chunks(&self) -> color_eyre::Result<u64> {
-        let db = self.acquire_reader();
-        let count: i64 = db.query_row(
-            "SELECT COUNT(*) FROM chunks WHERE data IS NOT NULL",
-            [],
-            |row| row.get(0),
-        )?;
-        Ok(count as u64)
-    }
-
-    /// Return the number of zstd-compressed chunks (any level).
-    pub fn total_compressed_chunks(&self) -> color_eyre::Result<u64> {
-        let db = self.acquire_reader();
-        let count: i64 = db.query_row(
-            "SELECT COUNT(*) FROM chunks WHERE zstd_level IS NOT NULL",
-            [],
-            |row| row.get(0),
-        )?;
-        Ok(count as u64)
+    /// Invalidate cached stats so the next call recomputes them.
+    pub fn invalidate_stats_cache(&self) {
+        let mut cached = self.stats_cache.lock().expect("stats cache lock");
+        // Set timestamp to epoch-equivalent so elapsed() > TTL.
+        cached.0 = Instant::now() - CACHE_STATS_TTL;
     }
 
     /// Recompress a batch of hot-path (level 1) chunks at the cold level.
@@ -576,6 +637,7 @@ impl CastoreBackend {
                 "Recompressed {total_processed} chunks, saved {} bytes",
                 total_saved
             );
+            self.invalidate_stats_cache();
         }
 
         Ok((total_processed, total_saved))
@@ -683,6 +745,7 @@ impl CastoreBackend {
         }
 
         tx.commit()?;
+        self.invalidate_stats_cache();
         Ok(bytes_freed)
     }
 
@@ -1714,6 +1777,7 @@ impl StorageBackend for CastoreBackend {
 
         tx.commit()?;
         self.path_bloom_insert(hash);
+        self.invalidate_stats_cache();
         Ok(true)
     }
 
