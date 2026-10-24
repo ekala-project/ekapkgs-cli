@@ -8,21 +8,39 @@ use super::types::{ExpressionInfo, Fetcher};
 ///
 /// Returns the SRI hash string (e.g., `sha256-...`).
 pub fn prefetch_source_hash(info: &ExpressionInfo) -> color_eyre::Result<String> {
+    let tag = if info.version_has_v_prefix {
+        format!("v{}", info.version)
+    } else {
+        info.version.clone()
+    };
+
     let url = match &info.fetcher {
-        Fetcher::GitHub { owner, repo } => {
+        Fetcher::GitHub {
+            owner,
+            repo,
+            domain,
+        } => {
+            let host = domain.as_deref().unwrap_or("github.com");
             format!(
-                "https://github.com/{owner}/{repo}/archive/refs/tags/v{version}.tar.gz",
+                "https://{host}/{owner}/{repo}/archive/refs/tags/{tag}.tar.gz",
+                host = host,
                 owner = owner,
                 repo = repo,
-                version = info.version,
+                tag = tag,
             )
         },
-        Fetcher::GitLab { owner, repo } => {
+        Fetcher::GitLab {
+            owner,
+            repo,
+            domain,
+        } => {
+            let host = domain.as_deref().unwrap_or("gitlab.com");
             format!(
-                "https://gitlab.com/{owner}/{repo}/-/archive/v{version}/{repo}-v{version}.tar.gz",
+                "https://{host}/{owner}/{repo}/-/archive/{tag}/{repo}-{tag}.tar.gz",
+                host = host,
                 owner = owner,
                 repo = repo,
-                version = info.version,
+                tag = tag,
             )
         },
         Fetcher::Local => return Err(eyre!("Cannot prefetch hash for local source")),

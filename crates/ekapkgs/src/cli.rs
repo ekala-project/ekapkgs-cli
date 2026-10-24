@@ -1624,6 +1624,11 @@ pub struct TemplateOpts {
     #[arg(long)]
     pub from_url: Option<String>,
 
+    /// Force the forge type when the domain is not github.com or gitlab.com
+    /// (e.g., for self-hosted instances).
+    #[arg(long, value_enum)]
+    pub forge: Option<ForgeType>,
+
     /// Print to stdout instead of writing a file.
     #[arg(long)]
     pub stdout: bool,
@@ -1631,6 +1636,12 @@ pub struct TemplateOpts {
     /// License (nixpkgs short name, e.g., `mit`, `gpl3Plus`).
     #[arg(long)]
     pub license: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+pub enum ForgeType {
+    Github,
+    Gitlab,
 }
 
 #[derive(Subcommand)]
