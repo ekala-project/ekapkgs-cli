@@ -26,8 +26,20 @@ impl std::fmt::Display for TemplateKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[allow(dead_code)]
 pub enum Fetcher {
-    GitHub { owner: String, repo: String },
-    GitLab { owner: String, repo: String },
+    GitHub {
+        owner: String,
+        repo: String,
+        /// Domain for self-hosted instances (e.g. `github.example.com`).
+        /// `None` means `github.com`.
+        domain: Option<String>,
+    },
+    GitLab {
+        owner: String,
+        repo: String,
+        /// Domain for self-hosted instances (e.g. `gitlab.gnome.org`).
+        /// `None` means `gitlab.com`.
+        domain: Option<String>,
+    },
     Local,
 }
 
@@ -47,6 +59,8 @@ pub struct ExpressionInfo {
     pub src_hash: String,
     pub cargo_hash: String,
     pub vendor_hash: String,
+    /// Whether the upstream tag has a "v" prefix (e.g. "v1.0.0" vs "1.0.0").
+    pub version_has_v_prefix: bool,
 }
 
 impl ExpressionInfo {
@@ -61,10 +75,12 @@ impl ExpressionInfo {
             fetcher: Fetcher::GitHub {
                 owner: "CHANGEME".into(),
                 repo: "CHANGEME".into(),
+                domain: None,
             },
             src_hash: FAKE_HASH.into(),
             cargo_hash: FAKE_HASH.into(),
             vendor_hash: FAKE_HASH.into(),
+            version_has_v_prefix: true,
         }
     }
 }

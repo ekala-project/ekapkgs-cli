@@ -50,21 +50,43 @@ pub fn execute(command: TemplateCommand) -> color_eyre::Result<()> {
 
     // Fetch metadata from URL if provided
     if let Some(ref from_url) = opts.from_url {
-        let fetcher = url::parse_url(from_url)?;
+        let fetcher = url::parse_url(from_url, opts.forge)?;
         info.fetcher = fetcher;
 
-        if let Fetcher::GitHub {
-            ref owner,
-            ref repo,
-        } = info.fetcher
-        {
-            let owner = owner.clone();
-            let repo = repo.clone();
-            if let Err(e) = url::fetch_github_metadata(&owner, &repo, &mut info) {
-                eprintln!("Warning: could not fetch GitHub metadata: {e}");
-            }
+        match &info.fetcher {
+            Fetcher::GitHub {
+                owner,
+                repo,
+                domain,
+            } => {
+                let owner = owner.clone();
+                let repo = repo.clone();
+                let domain = domain.clone();
+                if let Err(e) =
+                    url::fetch_github_metadata(&owner, &repo, domain.as_deref(), &mut info)
+                {
+                    eprintln!("Warning: could not fetch GitHub metadata: {e}");
+                }
+            },
+            Fetcher::GitLab {
+                owner,
+                repo,
+                domain,
+            } => {
+                let owner = owner.clone();
+                let repo = repo.clone();
+                let domain = domain.clone();
+                if let Err(e) =
+                    url::fetch_gitlab_metadata(&owner, &repo, domain.as_deref(), &mut info)
+                {
+                    eprintln!("Warning: could not fetch GitLab metadata: {e}");
+                }
+            },
+            Fetcher::Local => {},
+        }
 
-            // Prefetch source hash
+        // Prefetch source hash for any remote fetcher
+        if !matches!(info.fetcher, Fetcher::Local) {
             match prefetch::prefetch_source_hash(&info) {
                 Ok(hash) => info.src_hash = hash,
                 Err(e) => eprintln!("Warning: could not prefetch source hash: {e}"),

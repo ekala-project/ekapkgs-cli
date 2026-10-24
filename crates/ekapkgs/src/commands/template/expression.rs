@@ -13,27 +13,53 @@ pub fn generate(info: &ExpressionInfo) -> String {
 }
 
 fn render_fetch_block(info: &ExpressionInfo) -> (Vec<&'static str>, String) {
+    let tag_value = if info.version_has_v_prefix {
+        "v${finalAttrs.version}"
+    } else {
+        "${finalAttrs.version}"
+    };
+
     match &info.fetcher {
-        Fetcher::GitHub { owner, repo } => {
+        Fetcher::GitHub {
+            owner,
+            repo,
+            domain,
+        } => {
             let inputs = vec!["fetchFromGitHub"];
+            let domain_line = match domain {
+                Some(d) => format!("\n\x20   githubBase = \"{d}\";"),
+                None => String::new(),
+            };
             let block = format!(
                 "  src = fetchFromGitHub {{\n\x20   owner = \"{owner}\";\n\x20   repo = \
-                 \"{repo}\";\n\x20   tag = \"v${{finalAttrs.version}}\";\n\x20   hash = \
+                 \"{repo}\";{domain_line}\n\x20   tag = \"{tag}\";\n\x20   hash = \
                  \"{hash}\";\n\x20 }};",
                 owner = owner,
                 repo = repo,
+                domain_line = domain_line,
+                tag = tag_value,
                 hash = info.src_hash,
             );
             (inputs, block)
         },
-        Fetcher::GitLab { owner, repo } => {
+        Fetcher::GitLab {
+            owner,
+            repo,
+            domain,
+        } => {
             let inputs = vec!["fetchFromGitLab"];
+            let domain_line = match domain {
+                Some(d) => format!("\n\x20   domain = \"{d}\";"),
+                None => String::new(),
+            };
             let block = format!(
                 "  src = fetchFromGitLab {{\n\x20   owner = \"{owner}\";\n\x20   repo = \
-                 \"{repo}\";\n\x20   tag = \"v${{finalAttrs.version}}\";\n\x20   hash = \
+                 \"{repo}\";{domain_line}\n\x20   tag = \"{tag}\";\n\x20   hash = \
                  \"{hash}\";\n\x20 }};",
                 owner = owner,
                 repo = repo,
+                domain_line = domain_line,
+                tag = tag_value,
                 hash = info.src_hash,
             );
             (inputs, block)
@@ -200,10 +226,12 @@ mod tests {
             fetcher: Fetcher::GitHub {
                 owner: "user".into(),
                 repo: "example".into(),
+                domain: None,
             },
             src_hash: FAKE_HASH.into(),
             cargo_hash: FAKE_HASH.into(),
             vendor_hash: FAKE_HASH.into(),
+            version_has_v_prefix: true,
         }
     }
 
@@ -402,6 +430,7 @@ mod tests {
         info.fetcher = Fetcher::GitLab {
             owner: "org".into(),
             repo: "proj".into(),
+            domain: None,
         };
         let out = generate(&info);
         assert!(out.contains("fetchFromGitLab"));
