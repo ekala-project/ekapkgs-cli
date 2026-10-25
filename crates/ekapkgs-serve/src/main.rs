@@ -987,7 +987,12 @@ async fn cmd_serve(cli: Cli) -> color_eyre::Result<()> {
                 ));
             },
             config::StorageConfig::Castore { path, gc } => {
-                let backend = Arc::new(storage::castore::CastoreBackend::new(path)?);
+                let chunk_config = storage::castore::ChunkCompressionConfig {
+                    level: config.compression.chunk_level,
+                    overflow_level: config.compression.chunk_overflow_level,
+                    workers: config.compression.chunk_workers,
+                };
+                let backend = Arc::new(storage::castore::CastoreBackend::new(path, chunk_config)?);
                 let gc_t = if let Some(gc_raw) = gc {
                     let max_size = gc::parse_byte_size(&gc_raw.max_size)?;
                     let target_size = gc_raw
