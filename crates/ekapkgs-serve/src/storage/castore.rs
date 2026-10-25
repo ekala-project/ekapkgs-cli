@@ -42,12 +42,41 @@ const CHUNK_MAX: u32 = 256 * 1024; // 256 KiB
 /// Chunks smaller than this are stored inline in SQLite instead of as files.
 const INLINE_THRESHOLD: usize = 1024;
 
-/// Zstd compression level stored in the `zstd_level` column.
+/// Default zstd compression level for on-disk chunk storage.
 ///
-/// `NULL` in SQLite means either inline (when `data IS NOT NULL`) or
-/// incompressible (when `data IS NULL`) — never attempt compression again.
-const ZSTD_LEVEL_HOT: i32 = 1;
-const ZSTD_LEVEL_COLD: i32 = 9;
+/// Used by the dedicated compression worker pool. `NULL` in SQLite means
+/// either inline (when `data IS NOT NULL`) or incompressible (when `data
+/// IS NULL`) — never attempt compression again.
+const DEFAULT_CHUNK_LEVEL: i32 = 9;
+
+/// Default fallback level used when the dedicated pool is saturated.
+const DEFAULT_CHUNK_OVERFLOW_LEVEL: i32 = 1;
+
+/// Configuration for the chunk compression worker pool.
+#[derive(Debug, Clone)]
+pub struct ChunkCompressionConfig {
+    /// Primary compression level (dedicated pool). Default: 9.
+    pub level: i32,
+    /// Fallback level when the pool is busy. Default: 1.
+    pub overflow_level: i32,
+    /// Number of dedicated compression threads. 0 = no pool.
+    pub workers: usize,
+}
+
+impl Default for ChunkCompressionConfig {
+    fn default() -> Self {
+        let workers = std::thread::available_parallelism()
+            .map(std::num::NonZero::get)
+            .unwrap_or(4)
+            / 4
+            + 1;
+        Self {
+            level: DEFAULT_CHUNK_LEVEL,
+            overflow_level: DEFAULT_CHUNK_OVERFLOW_LEVEL,
+            workers,
+        }
+    }
+}
 
 /// Represents the client's set of already-cached chunk digests.
 ///
@@ -160,11 +189,20 @@ pub struct CastoreBackend {
     path_bloom: Mutex<BloomFilter>,
     /// Cached aggregate stats with TTL to avoid repeated full-table scans.
     stats_cache: Mutex<(Instant, CacheStats)>,
+    /// Chunk compression configuration (levels + worker count).
+    chunk_compression: ChunkCompressionConfig,
+    /// Dedicated thread pool for high-ratio chunk compression.
+    /// `None` when `chunk_workers == 0`.
+    chunk_pool: Option<rayon::ThreadPool>,
+    /// Number of in-flight jobs on the dedicated chunk pool.
+    /// When this reaches `chunk_compression.workers`, new chunks fall back
+    /// to the overflow level instead of queueing.
+    chunk_pool_inflight: AtomicUsize,
 }
 
 impl CastoreBackend {
     /// Create a new CAS backend rooted at the given directory.
-    pub fn new(root: PathBuf) -> color_eyre::Result<Self> {
+    pub fn new(root: PathBuf, chunk_config: ChunkCompressionConfig) -> color_eyre::Result<Self> {
         tracing::log::info!("Creating CAS store at directory {}", root.display());
         std::fs::create_dir_all(root.join("chunks"))?;
 
@@ -191,6 +229,28 @@ impl CastoreBackend {
             read_pool.push(Mutex::new(reader));
         }
 
+        // Build the dedicated chunk compression pool (if workers > 0).
+        let chunk_pool = if chunk_config.workers > 0 {
+            Some(
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(chunk_config.workers)
+                    .thread_name(|i| format!("chunk-zstd-{i}"))
+                    .build()
+                    .map_err(|e| {
+                        color_eyre::eyre::eyre!("failed to create chunk compression pool: {e}")
+                    })?,
+            )
+        } else {
+            None
+        };
+
+        tracing::info!(
+            "Chunk compression: level={} overflow={} workers={}",
+            chunk_config.level,
+            chunk_config.overflow_level,
+            chunk_config.workers,
+        );
+
         let backend = Self {
             root,
             db: Mutex::new(conn),
@@ -201,6 +261,9 @@ impl CastoreBackend {
             path_bloom: Mutex::new(BloomFilter::new(1024)),
             // Seed with epoch so the first call to cache_stats() triggers a refresh.
             stats_cache: Mutex::new((Instant::now(), CacheStats::default())),
+            chunk_compression: chunk_config,
+            chunk_pool,
+            chunk_pool_inflight: AtomicUsize::new(0),
         };
 
         // Build the bloom filter from existing chunks.
@@ -440,7 +503,10 @@ impl CastoreBackend {
                 COALESCE(SUM(CASE WHEN zstd_level = ?1 THEN size END), 0), \
                 COALESCE(SUM(CASE WHEN zstd_level = ?2 THEN size END), 0) \
              FROM chunks",
-            params![ZSTD_LEVEL_HOT, ZSTD_LEVEL_COLD],
+            params![
+                self.chunk_compression.overflow_level,
+                self.chunk_compression.level,
+            ],
             |row| {
                 Ok((
                     row.get(0)?,
@@ -512,18 +578,26 @@ impl CastoreBackend {
         cached.0 = Instant::now() - CACHE_STATS_TTL;
     }
 
-    /// Recompress a batch of hot-path (level 1) chunks at the cold level.
+    /// Recompress a batch of overflow-level chunks at the primary level.
     ///
-    /// Returns `(chunks_processed, bytes_saved)`. Chunks where level-9
-    /// compression is not smaller are marked as level 9 anyway (already
+    /// Returns `(chunks_processed, bytes_saved)`. Chunks where primary-level
+    /// compression is not smaller are marked at that level anyway (already
     /// optimal).
     pub fn recompress_batch(&self, batch_size: usize) -> color_eyre::Result<(u64, u64)> {
+        let overflow = self.chunk_compression.overflow_level;
+        let target = self.chunk_compression.level;
+
+        // Nothing to upgrade when both levels are the same.
+        if overflow == target {
+            return Ok((0, 0));
+        }
+
         // Fetch candidates from a read connection.
         let reader = self.acquire_reader();
         let mut stmt =
             reader.prepare("SELECT digest, size FROM chunks WHERE zstd_level = ?1 LIMIT ?2")?;
         let candidates: Vec<([u8; 32], i64)> = stmt
-            .query_map(params![ZSTD_LEVEL_HOT, batch_size as i64], |row| {
+            .query_map(params![overflow, batch_size as i64], |row| {
                 let digest: Vec<u8> = row.get(0)?;
                 let size: i64 = row.get(1)?;
                 Ok((digest, size))
@@ -558,27 +632,28 @@ impl CastoreBackend {
                     return None;
                 }
 
-                let Ok(compressed_l1) = std::fs::read(&path) else {
+                let Ok(compressed_old) = std::fs::read(&path) else {
                     return None;
                 };
-                let old_size = compressed_l1.len() as u64;
+                let old_size = compressed_old.len() as u64;
 
-                // Decompress the level-1 data.
-                let Ok(raw) = zstd::bulk::decompress(&compressed_l1, CHUNK_MAX as usize * 2) else {
-                    return None;
-                };
-
-                // Recompress at the cold level.
-                let Ok(compressed_l9) = zstd::bulk::compress(&raw, ZSTD_LEVEL_COLD) else {
+                // Decompress the overflow-level data.
+                let Ok(raw) = zstd::bulk::decompress(&compressed_old, CHUNK_MAX as usize * 2)
+                else {
                     return None;
                 };
 
-                let new_size = compressed_l9.len() as u64;
+                // Recompress at the target level.
+                let Ok(compressed_new) = zstd::bulk::compress(&raw, target) else {
+                    return None;
+                };
+
+                let new_size = compressed_new.len() as u64;
                 if new_size < old_size {
                     // Write to temp file for atomic rename.
                     let parent = path.parent()?;
                     let mut tmp = tempfile::NamedTempFile::new_in(parent).ok()?;
-                    std::io::Write::write_all(&mut tmp, &compressed_l9).ok()?;
+                    std::io::Write::write_all(&mut tmp, &compressed_new).ok()?;
                     let temp_path = tmp.into_temp_path().to_path_buf();
                     Some(RecompressResult {
                         digest: *digest,
@@ -588,7 +663,7 @@ impl CastoreBackend {
                         final_path: path,
                     })
                 } else {
-                    // Already optimal at level 1 — mark as level 9 with no file change.
+                    // Already optimal at overflow level — mark as target with no file change.
                     Some(RecompressResult {
                         digest: *digest,
                         new_disk_size: old_size,
@@ -612,10 +687,10 @@ impl CastoreBackend {
                 "UPDATE chunks SET zstd_level = ?1, disk_size = ?2 WHERE digest = ?3 AND \
                  zstd_level = ?4",
                 params![
-                    ZSTD_LEVEL_COLD,
+                    target,
                     r.new_disk_size as i64,
                     r.digest.as_slice(),
-                    ZSTD_LEVEL_HOT,
+                    overflow,
                 ],
             )?;
             total_processed += 1;
@@ -878,9 +953,11 @@ impl CastoreBackend {
     /// disk size (0 for inline chunks).
     ///
     /// Chunks smaller than `INLINE_THRESHOLD` are not written to disk — the
-    /// caller stores the data in SQLite. Larger chunks are compressed with
-    /// zstd level 1; if compression doesn't reduce size, they are stored raw
-    /// and marked incompressible (`zstd_level = NULL`).
+    /// caller stores the data in SQLite. Larger chunks are compressed using
+    /// the dedicated worker pool at `chunk_level`; if the pool is saturated,
+    /// falls back to `chunk_overflow_level` inline. If compression doesn't
+    /// reduce size, they are stored raw and marked incompressible
+    /// (`zstd_level = NULL`).
     fn write_chunk_file(&self, data: &[u8]) -> color_eyre::Result<([u8; 32], Option<i32>, u64)> {
         let hash = blake3::hash(data);
         let digest = *hash.as_bytes();
@@ -896,12 +973,12 @@ impl CastoreBackend {
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent)?;
 
-                // Try zstd compression at the hot-path level.
-                let compressed = zstd::bulk::compress(data, ZSTD_LEVEL_HOT)
-                    .map_err(|e| color_eyre::eyre::eyre!("zstd compress failed: {e}"))?;
+                // Choose compression level: try the dedicated pool first,
+                // fall back to overflow level if the pool is saturated.
+                let (compressed, level) = self.compress_chunk(data)?;
 
                 let (bytes_to_write, zstd_level) = if compressed.len() < data.len() {
-                    (compressed.as_slice(), Some(ZSTD_LEVEL_HOT))
+                    (compressed.as_slice(), Some(level))
                 } else {
                     // Incompressible: store raw, mark NULL permanently.
                     (data, None)
@@ -924,6 +1001,37 @@ impl CastoreBackend {
         // INSERT OR IGNORE in the caller preserves it.
         let disk_size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
         Ok((digest, None, disk_size))
+    }
+
+    /// Compress chunk data, returning `(compressed_bytes, level_used)`.
+    ///
+    /// Tries to acquire a slot on the dedicated pool for high-ratio
+    /// compression. If the pool is full, compresses inline at the overflow
+    /// level to avoid blocking the ingest path.
+    fn compress_chunk(&self, data: &[u8]) -> color_eyre::Result<(Vec<u8>, i32)> {
+        let cc = &self.chunk_compression;
+
+        if let Some(pool) = &self.chunk_pool {
+            // Try to acquire a slot (non-blocking).
+            let current = self.chunk_pool_inflight.fetch_add(1, Ordering::Relaxed);
+            if current < cc.workers {
+                // Got a slot — compress on the dedicated pool.
+                let level = cc.level;
+                let result = pool.install(|| zstd::bulk::compress(data, level));
+                self.chunk_pool_inflight.fetch_sub(1, Ordering::Relaxed);
+                let compressed =
+                    result.map_err(|e| color_eyre::eyre::eyre!("zstd compress failed: {e}"))?;
+                return Ok((compressed, level));
+            }
+            // Pool is saturated — undo the increment and fall through.
+            self.chunk_pool_inflight.fetch_sub(1, Ordering::Relaxed);
+        }
+
+        // Overflow: compress inline at the fast level.
+        let level = cc.overflow_level;
+        let compressed = zstd::bulk::compress(data, level)
+            .map_err(|e| color_eyre::eyre::eyre!("zstd compress failed: {e}"))?;
+        Ok((compressed, level))
     }
 
     /// Insert a row into the chunks table. Caller must hold a connection.
@@ -2073,7 +2181,9 @@ mod tests {
 
     fn setup_backend() -> (tempfile::TempDir, CastoreBackend) {
         let dir = tempfile::TempDir::new().unwrap();
-        let backend = CastoreBackend::new(dir.path().to_path_buf()).unwrap();
+        let backend =
+            CastoreBackend::new(dir.path().to_path_buf(), ChunkCompressionConfig::default())
+                .unwrap();
         (dir, backend)
     }
 

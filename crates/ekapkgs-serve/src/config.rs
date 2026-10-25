@@ -8,7 +8,7 @@ pub struct Config {
     pub storage: StorageConfig,
     pub signing: SigningConfig,
     pub auth: Option<AuthConfig>,
-    /// Zstd compression settings for HTTP responses.
+    /// Zstd compression settings for HTTP responses and chunk storage.
     #[serde(default)]
     pub compression: CompressionConfig,
 }
@@ -121,7 +121,7 @@ pub struct CompressionConfig {
     /// Master switch for HTTP response compression. Default: true.
     #[serde(default = "default_true")]
     pub enable: bool,
-    /// Zstd compression level. Default: 1.
+    /// Zstd compression level for HTTP responses. Default: 3.
     #[serde(default = "default_compression_level")]
     pub level: i32,
     /// Enable long distance matching for NAR responses. Default: true.
@@ -133,16 +133,31 @@ pub struct CompressionConfig {
     /// Maximum concurrent LDM encoders per worker. Default: 16.
     #[serde(default = "default_max_ldm_encoders")]
     pub max_ldm_encoders: u32,
+    /// Zstd level for on-disk chunk storage (CAS). Default: 9.
+    #[serde(default = "default_chunk_level")]
+    pub chunk_level: i32,
+    /// Zstd fallback level when all chunk workers are busy. Default: 1.
+    #[serde(default = "default_chunk_overflow_level")]
+    pub chunk_overflow_level: i32,
+    /// Dedicated compression threads for chunk storage.
+    /// Default: available_parallelism / 4 (min 1).
+    /// Set to 0 to disable the dedicated pool (all chunks compress inline
+    /// at chunk_overflow_level).
+    #[serde(default = "default_chunk_workers")]
+    pub chunk_workers: usize,
 }
 
 impl Default for CompressionConfig {
     fn default() -> Self {
         Self {
             enable: true,
-            level: 1,
+            level: 3,
             long_distance_matching: true,
             window_log: 0,
             max_ldm_encoders: 16,
+            chunk_level: 9,
+            chunk_overflow_level: 1,
+            chunk_workers: default_chunk_workers(),
         }
     }
 }
@@ -152,11 +167,27 @@ fn default_true() -> bool {
 }
 
 fn default_compression_level() -> i32 {
-    1
+    3
 }
 
 fn default_max_ldm_encoders() -> u32 {
     16
+}
+
+fn default_chunk_level() -> i32 {
+    9
+}
+
+fn default_chunk_overflow_level() -> i32 {
+    1
+}
+
+fn default_chunk_workers() -> usize {
+    std::thread::available_parallelism()
+        .map(std::num::NonZero::get)
+        .unwrap_or(4)
+        / 4
+        + 1 // ensure at least 1: (0 / 4) + 1 = 1 on single-core
 }
 
 #[derive(Debug, Deserialize)]
