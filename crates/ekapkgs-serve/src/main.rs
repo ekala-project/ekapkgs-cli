@@ -153,6 +153,11 @@ pub struct AppState {
     /// downloads, gRPC streaming, delta computation). Each permit
     /// represents a slot that may hold a full NAR in memory.
     pub nar_semaphore: Arc<tokio::sync::Semaphore>,
+    /// Semaphore limiting concurrent NAR upload ingestion.
+    /// Each upload may hold the full NAR body (up to 8 GiB) plus
+    /// in-flight compression buffers. Without a bound, concurrent
+    /// pushes can exhaust memory and trigger OOM kills.
+    pub push_semaphore: Arc<tokio::sync::Semaphore>,
 }
 
 /// Cache for computed delta NARs, keyed by (base_hash, target_hash).
@@ -1089,6 +1094,10 @@ async fn cmd_serve(cli: Cli) -> color_eyre::Result<()> {
         // Each may hold a full NAR in memory; 8 concurrent × ~200 MiB
         // average ≈ 1.6 GiB worst-case from NAR serving alone.
         nar_semaphore: Arc::new(tokio::sync::Semaphore::new(8)),
+        // Limit concurrent NAR upload ingestion. Each upload holds the
+        // full NAR body plus chunk compression buffers; 4 concurrent
+        // uploads cap push memory at ~4 × 200 MiB typical.
+        push_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
     });
 
     // Validate TLS config consistency.

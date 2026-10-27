@@ -157,6 +157,11 @@ pub async fn put_nar(
         return (StatusCode::BAD_REQUEST, "invalid nar filename").into_response();
     }
 
+    // Acquire a push semaphore permit to bound concurrent ingestion memory.
+    let Ok(_permit) = state.push_semaphore.acquire().await else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "server shutting down").into_response();
+    };
+
     let nar_path = format!("nar/{file}");
 
     match state.storage.put_nar(&nar_path, &body) {
