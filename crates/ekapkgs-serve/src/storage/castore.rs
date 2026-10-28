@@ -12,8 +12,8 @@
 use std::collections::HashSet;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use ekapkgs_nix::bloom::BloomFilter;
@@ -198,6 +198,10 @@ pub struct CastoreBackend {
     /// When this reaches `chunk_compression.workers`, new chunks fall back
     /// to the overflow level instead of queueing.
     chunk_pool_inflight: AtomicUsize,
+    /// Set to `true` once the background bloom filter warmup completes.
+    /// While `false`, bloom lookups are bypassed (return `true` = "maybe
+    /// present") so the server can accept requests immediately at startup.
+    bloom_ready: AtomicBool,
 }
 
 impl CastoreBackend {
@@ -264,20 +268,41 @@ impl CastoreBackend {
             chunk_compression: chunk_config,
             chunk_pool,
             chunk_pool_inflight: AtomicUsize::new(0),
+            bloom_ready: AtomicBool::new(false),
         };
 
-        // Build the bloom filter from existing chunks.
-        let bloom = backend.build_chunk_bloom();
-        *backend.chunk_bloom.lock().expect("chunk bloom lock") = bloom;
-
-        let path_bloom = backend.build_path_bloom();
-        *backend.path_bloom.lock().expect("path bloom lock") = path_bloom;
-
-        // Eagerly compute stats so the first request is fast.
-        let stats = backend.compute_stats()?;
-        *backend.stats_cache.lock().expect("stats cache lock") = (Instant::now(), stats);
-
         Ok(backend)
+    }
+
+    /// Spawn a background thread to build bloom filters and compute initial
+    /// stats.  Until this completes, bloom lookups are bypassed (every query
+    /// falls through to SQLite) so the server can start accepting requests
+    /// immediately.
+    pub fn spawn_warmup(self: &Arc<Self>) {
+        let backend = Arc::clone(self);
+        std::thread::Builder::new()
+            .name("cas-warmup".into())
+            .spawn(move || {
+                let t = Instant::now();
+
+                let chunk_bloom = backend.build_chunk_bloom();
+                *backend.chunk_bloom.lock().expect("chunk bloom lock") = chunk_bloom;
+
+                let path_bloom = backend.build_path_bloom();
+                *backend.path_bloom.lock().expect("path bloom lock") = path_bloom;
+
+                backend.bloom_ready.store(true, Ordering::Release);
+
+                // Best-effort stats warmup; failures are harmless since
+                // cache_stats() will recompute on demand.
+                if let Ok(stats) = backend.compute_stats() {
+                    *backend.stats_cache.lock().expect("stats cache lock") =
+                        (Instant::now(), stats);
+                }
+
+                tracing::info!("Background warmup completed in {:?}", t.elapsed());
+            })
+            .expect("failed to spawn warmup thread");
     }
 
     /// Acquire a read-only connection from the pool.
@@ -1723,7 +1748,13 @@ impl CastoreBackend {
 
     /// Check the path bloom filter. Returns false if the path is
     /// definitely not present, true if it might be.
+    ///
+    /// While bloom warmup is in progress, always returns `true` (fall
+    /// through to SQLite) to avoid false negatives.
     fn path_bloom_maybe_contains(&self, hash: &str) -> bool {
+        if !self.bloom_ready.load(Ordering::Acquire) {
+            return true;
+        }
         match self.path_bloom.lock() {
             Ok(bloom) => {
                 let digest = blake3::hash(hash.as_bytes());
@@ -1741,7 +1772,13 @@ impl CastoreBackend {
     }
 
     /// Check the bloom filter for a chunk digest.
+    ///
+    /// While bloom warmup is in progress, always returns `true` (fall
+    /// through to SQLite) to avoid false negatives.
     pub fn bloom_maybe_contains(&self, digest: &[u8; 32]) -> bool {
+        if !self.bloom_ready.load(Ordering::Acquire) {
+            return true;
+        }
         match self.chunk_bloom.lock() {
             Ok(bloom) => bloom.maybe_contains(digest),
             Err(_) => true,
