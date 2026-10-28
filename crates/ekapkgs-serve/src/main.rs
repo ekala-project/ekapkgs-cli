@@ -1000,6 +1000,7 @@ async fn cmd_serve(cli: Cli) -> color_eyre::Result<()> {
                     workers: config.compression.chunk_workers,
                 };
                 let backend = Arc::new(storage::castore::CastoreBackend::new(path, chunk_config)?);
+                backend.spawn_warmup();
                 let gc_t = if let Some(gc_raw) = gc {
                     let max_size = gc::parse_byte_size(&gc_raw.max_size)?;
                     let target_size = gc_raw
