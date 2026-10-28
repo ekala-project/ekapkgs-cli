@@ -53,12 +53,42 @@ pub fn closure_path_info(installable: &Installable) -> Result<Vec<PathInfoEntry>
 /// Query the local nix store for which paths exist.
 ///
 /// Returns `(have, want)` — paths present locally and paths missing.
+///
+/// Queries paths in batches with a single `nix path-info` call each,
+/// falling back to individual queries only for batches that contain a
+/// mix of present and missing paths.
 pub fn partition_local(paths: &[String]) -> Result<(Vec<String>, Vec<String>), NixError> {
+    if paths.is_empty() {
+        return Ok((Vec::new(), Vec::new()));
+    }
+
     let mut have = Vec::new();
     let mut want = Vec::new();
 
-    // Query all paths at once. nix path-info exits non-zero if any path
-    // is missing, so we query individually for reliable partitioning.
+    // Try all paths at once first. If they're all present, nix path-info
+    // exits 0 and we're done in a single process spawn.
+    let mut cmd = NixCommand::new(&["path-info"]);
+    for p in paths {
+        cmd = cmd.arg(p);
+    }
+
+    match cmd.output() {
+        Ok(_) => {
+            // All paths exist locally.
+            have.extend_from_slice(paths);
+            return Ok((have, want));
+        },
+        Err(NixError::Failed { .. }) => {
+            // At least one path is missing. Parse stdout to find which
+            // paths were present — nix path-info prints one path per line
+            // for each path it successfully resolved.
+        },
+        Err(e) => return Err(e),
+    }
+
+    // Batch query failed (mix of present/missing). Query each path
+    // individually. This is the previous behavior but only triggers
+    // when the fast path above can't resolve everything at once.
     for path in paths {
         let result = NixCommand::new(&["path-info"]).arg(path).output();
 

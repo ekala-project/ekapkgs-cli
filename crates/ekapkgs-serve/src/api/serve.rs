@@ -13,6 +13,8 @@ use crate::api::compat::is_valid_store_hash;
 /// Supports MIME detection, automatic index.html, and directory listings.
 /// Path traversal is prevented by canonicalizing and checking the result
 /// stays strictly inside the store path.
+///
+/// All filesystem I/O uses `tokio::fs` to avoid blocking the async runtime.
 pub async fn get_serve(
     State(state): State<Arc<AppState>>,
     Path((hash, tail)): Path<(String, String)>,
@@ -32,17 +34,13 @@ pub async fn get_serve(
     };
 
     let base = PathBuf::from(&store_path);
-    if !base.exists() {
-        return not_found();
-    }
-
     let target = base.join(&tail);
 
     // Canonicalize to resolve symlinks and `..` components.
-    let Ok(real_nix_store) = PathBuf::from("/nix/store").canonicalize() else {
+    let Ok(real_nix_store) = tokio::fs::canonicalize("/nix/store").await else {
         return not_found();
     };
-    let Ok(canonical) = target.canonicalize() else {
+    let Ok(canonical) = tokio::fs::canonicalize(&target).await else {
         return not_found();
     };
 
@@ -51,19 +49,19 @@ pub async fn get_serve(
         return not_found();
     }
 
-    let Ok(meta) = std::fs::metadata(&canonical) else {
+    let Ok(meta) = tokio::fs::metadata(&canonical).await else {
         return not_found();
     };
 
     if meta.is_file() {
-        serve_file(&canonical)
+        serve_file(&canonical).await
     } else if meta.is_dir() {
         // Try index.html first.
         let index = canonical.join("index.html");
-        if index.is_file() {
-            return serve_file(&index);
+        if tokio::fs::metadata(&index).await.is_ok_and(|m| m.is_file()) {
+            return serve_file(&index).await;
         }
-        serve_directory_listing(&canonical, &hash, &tail)
+        serve_directory_listing(&canonical, &hash, &tail).await
     } else {
         not_found()
     }
@@ -74,8 +72,8 @@ pub async fn get_serve(
 const MAX_SERVE_FILE_SIZE: u64 = 256 * 1024 * 1024;
 
 /// Serve a single file with MIME type detection.
-fn serve_file(path: &std::path::Path) -> Response {
-    let Ok(meta) = std::fs::metadata(path) else {
+async fn serve_file(path: &std::path::Path) -> Response {
+    let Ok(meta) = tokio::fs::metadata(path).await else {
         return not_found();
     };
     if meta.len() > MAX_SERVE_FILE_SIZE {
@@ -85,7 +83,7 @@ fn serve_file(path: &std::path::Path) -> Response {
         )
             .into_response();
     }
-    let Ok(data) = std::fs::read(path) else {
+    let Ok(data) = tokio::fs::read(path).await else {
         return not_found();
     };
 
@@ -107,16 +105,16 @@ fn serve_file(path: &std::path::Path) -> Response {
 }
 
 /// Render a directory listing as HTML.
-fn serve_directory_listing(dir: &std::path::Path, hash: &str, tail: &str) -> Response {
-    let Ok(read_dir) = std::fs::read_dir(dir) else {
+async fn serve_directory_listing(dir: &std::path::Path, hash: &str, tail: &str) -> Response {
+    let Ok(mut read_dir) = tokio::fs::read_dir(dir).await else {
         return not_found();
     };
 
     let mut entries: Vec<(String, bool, u64)> = Vec::new();
 
-    for entry in read_dir.flatten() {
+    while let Ok(Some(entry)) = read_dir.next_entry().await {
         let name = entry.file_name().to_string_lossy().into_owned();
-        let Ok(meta) = entry.metadata() else {
+        let Ok(meta) = entry.metadata().await else {
             continue;
         };
         entries.push((name, meta.is_dir(), meta.len()));

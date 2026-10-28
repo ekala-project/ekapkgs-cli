@@ -42,7 +42,8 @@ pub struct TrustedRoot {
 ///
 /// Format: `name || public_key(32) || not_before(8 LE) || not_after(8 LE) || issuer`
 pub fn certificate_sign_payload(cert: &SigningCertificate) -> Vec<u8> {
-    let mut payload = Vec::new();
+    let capacity = cert.name.len() + cert.public_key.len() + 8 + 8 + cert.issuer.len();
+    let mut payload = Vec::with_capacity(capacity);
     payload.extend_from_slice(cert.name.as_bytes());
     payload.extend_from_slice(&cert.public_key);
     payload.extend_from_slice(&cert.not_before.to_le_bytes());

@@ -74,10 +74,16 @@ fn decompose_node(
             let mut chunk_metas = Vec::new();
             let mut total_size = 0u64;
 
+            // Compute the file-level blake3 hash incrementally while
+            // chunking, avoiding a second full pass over the data.
+            let mut file_hasher = blake3::Hasher::new();
+
             for chunk in cdc_chunks {
                 let chunk_data = &data[chunk.offset..chunk.offset + chunk.length];
                 let hash = blake3::hash(chunk_data);
                 let digest = *hash.as_bytes();
+
+                file_hasher.update(chunk_data);
 
                 if chunk_seen.insert(digest) {
                     chunks.push(Chunk {
@@ -90,8 +96,7 @@ fn decompose_node(
                 total_size += chunk.length as u64;
             }
 
-            let file_hash = blake3::hash(data);
-            let file_digest = *file_hash.as_bytes();
+            let file_digest = *file_hasher.finalize().as_bytes();
 
             if !chunk_metas.is_empty() {
                 file_chunk_mappings.push(FileChunkMapping {
