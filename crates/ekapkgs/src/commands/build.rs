@@ -14,80 +14,96 @@ pub fn execute(installable: &str, extra: &[String]) -> color_eyre::Result<()> {
 
     // If we have a configured cache, try negotiated substitution.
     if let Some(cache) = config.primary_cache() {
-        tracing::info!("Building {installable}");
+        // Verify the cache server is reachable before doing expensive work.
+        let rt = tokio::runtime::Runtime::new()?;
+        let server_url = cache.url.clone();
 
-        let spinner = ekapkgs_ui::progress::spinner("Evaluating closure...");
+        let server_ok = rt.block_on(async {
+            let spinner = ekapkgs_ui::progress::spinner("Connecting to cache...");
+            let result = crate::negotiate::check_server(&server_url).await;
+            spinner.finish_and_clear();
+            result
+        });
 
-        // Get the full closure of output paths.
-        let closure_paths = eval::derivation_closure_paths(&inst)?;
-
-        spinner.set_message("Checking local store...");
-
-        // Partition into what we have and what we need.
-        let (have, want) = store::partition_local(&closure_paths)?;
-
-        spinner.finish_and_clear();
-
-        if want.is_empty() {
-            tracing::info!("All {} paths already in local store", have.len());
+        if let Err(e) = server_ok {
+            tracing::warn!("Cache unreachable, falling back to nix: {e}");
         } else {
-            tracing::info!(
-                "Closure: {} paths ({} in local store, {} to fetch)",
-                closure_paths.len(),
-                have.len(),
-                want.len()
-            );
+            tracing::info!("Building {installable}");
 
-            // Convert store paths to hashes for the negotiate request.
-            let want_hashes: Vec<String> = want
-                .iter()
-                .filter_map(|p| store::store_path_hash(p).map(String::from))
-                .collect();
-            let have_hashes: Vec<String> = have
-                .iter()
-                .filter_map(|p| store::store_path_hash(p).map(String::from))
-                .collect();
+            let spinner = ekapkgs_ui::progress::spinner("Evaluating closure...");
 
-            let server_url = cache.url.clone();
+            // Get the full closure of output paths.
+            let closure_paths = eval::derivation_closure_paths(&inst)?;
 
-            // Run the async negotiation + download.
-            let rt = tokio::runtime::Runtime::new()?;
-            rt.block_on(async {
-                let spinner = ekapkgs_ui::progress::spinner("Negotiating with cache...");
+            spinner.set_message("Checking local store...");
 
-                let response =
-                    crate::negotiate::negotiate(&server_url, want_hashes, have_hashes).await?;
+            // Partition into what we have and what we need.
+            let (have, want) = store::partition_local(&closure_paths)?;
 
-                spinner.finish_and_clear();
+            spinner.finish_and_clear();
 
-                let avail = response.available.len();
-                let unavail = response.unavailable.len();
-                let dl_size = response.total_download_size;
-                let nar_size = response.total_nar_size;
+            if want.is_empty() {
+                tracing::info!("All {} paths already in local store", have.len());
+            } else {
+                tracing::info!(
+                    "Closure: {} paths ({} in local store, {} to fetch)",
+                    closure_paths.len(),
+                    have.len(),
+                    want.len()
+                );
 
-                if avail > 0 {
-                    tracing::info!(
-                        "{avail} paths to download ({} download, {} unpacked)",
-                        ekapkgs_ui::format::format_bytes(dl_size),
-                        ekapkgs_ui::format::format_bytes(nar_size),
-                    );
+                // Convert store paths to hashes for the negotiate request.
+                let want_hashes: Vec<String> = want
+                    .iter()
+                    .filter_map(|p| store::store_path_hash(p).map(String::from))
+                    .collect();
+                let have_hashes: Vec<String> = have
+                    .iter()
+                    .filter_map(|p| store::store_path_hash(p).map(String::from))
+                    .collect();
 
-                    crate::download::download_and_import(
-                        &server_url,
-                        &response,
-                        config.defaults.max_parallel_downloads,
-                    )
-                    .await?;
+                // Run the async negotiation + download.
+                let result = rt.block_on(async {
+                    let spinner = ekapkgs_ui::progress::spinner("Negotiating with cache...");
 
-                    tracing::info!("Imported {avail} paths from cache");
+                    let response =
+                        crate::negotiate::negotiate(&server_url, want_hashes, have_hashes).await?;
+
+                    spinner.finish_and_clear();
+
+                    let avail = response.available.len();
+                    let unavail = response.unavailable.len();
+                    let dl_size = response.total_download_size;
+                    let nar_size = response.total_nar_size;
+
+                    if avail > 0 {
+                        tracing::info!(
+                            "{avail} paths to download ({} download, {} unpacked)",
+                            ekapkgs_ui::format::format_bytes(dl_size),
+                            ekapkgs_ui::format::format_bytes(nar_size),
+                        );
+
+                        crate::download::download_and_import(
+                            &server_url,
+                            &response,
+                            config.defaults.max_parallel_downloads,
+                        )
+                        .await?;
+
+                        tracing::info!("Imported {avail} paths from cache");
+                    }
+
+                    if unavail > 0 {
+                        tracing::info!("{unavail} paths not on cache, falling back to nix");
+                    }
+
+                    Ok::<(), color_eyre::Report>(())
+                });
+
+                if let Err(e) = result {
+                    tracing::warn!("Cache negotiation/download failed, falling back to nix: {e}");
                 }
-
-                if unavail > 0 {
-                    tracing::info!("{unavail} paths not on cache, falling back to nix");
-                }
-
-                Ok::<(), color_eyre::Report>(())
-            })?;
+            }
         }
     } else {
         tracing::info!("Building {installable} (no ekapkgs cache configured)");
