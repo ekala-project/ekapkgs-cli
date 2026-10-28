@@ -387,13 +387,17 @@ impl ChunkStore {
                     }
                 }
 
-                // Check if this file_digest is still referenced by another path.
-                let still_used: bool = tx.query_row(
+                // Only delete file_chunks when no other cas_path could
+                // reference this file. Checking properly would require
+                // walking every remaining path's CaNode tree, so we use
+                // a conservative heuristic: delete only when this was the
+                // last cas_path overall.
+                let other_paths_exist: bool = tx.query_row(
                     "SELECT EXISTS(SELECT 1 FROM cas_paths WHERE hash != ?1)",
                     params![hash],
                     |row| row.get(0),
                 )?;
-                if !still_used {
+                if !other_paths_exist {
                     tx.execute(
                         "DELETE FROM file_chunks WHERE file_digest = ?1",
                         params![file_digest.as_slice()],

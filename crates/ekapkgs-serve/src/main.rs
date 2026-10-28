@@ -223,6 +223,8 @@ impl DeltaCache {
         if let Some(old) = inner.map.remove(&key) {
             inner.total_bytes -= old.len();
             inner.by_target.remove(&key.1);
+            // O(n) scan of deque — only runs when replacing an existing key,
+            // which is rare compared to fresh inserts.
             inner.order.retain(|k| k != &key);
         }
 
