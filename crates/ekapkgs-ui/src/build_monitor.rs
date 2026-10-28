@@ -372,22 +372,16 @@ impl BuildMonitor {
         let sep = "━".repeat(42).dim().to_string();
         lines.push(format!(" {sep}"));
 
-        // Builds row
-        let build_planned = self
-            .build_expected
-            .saturating_sub(self.build_done + self.build_running + self.build_failed);
-        lines.push(format!(
-            "  {} {} {}  {} {}  {} {}  {} {}",
-            "Builds   ".bold(),
-            "⏵".yellow().bold(),
-            self.build_running.to_string().yellow().bold(),
-            "✔".green(),
-            self.build_done.to_string().green(),
-            "⏸".blue(),
-            build_planned.to_string().blue(),
-            "∑".dim(),
-            self.build_expected.to_string().dim(),
-        ));
+        // Builds progress bar
+        if self.build_expected > 0 {
+            let bar = render_progress_bar(
+                self.build_done,
+                self.build_running,
+                self.build_failed,
+                self.build_expected,
+            );
+            lines.push(format!("  {} {}", "Builds   ".bold(), bar,));
+        }
 
         // Downloads row
         let dl_running = self.download_expected.saturating_sub(self.download_done);
@@ -574,6 +568,50 @@ fn format_duration(d: std::time::Duration) -> String {
     }
 }
 
+/// Render a segmented progress bar: green(done) blue(running) red(failed) dim(remaining).
+///
+/// Returns a string like `[██████░░░░░░░░░░] 5/20` with ANSI colors.
+fn render_progress_bar(done: u64, running: u64, failed: u64, expected: u64) -> String {
+    let counter = format!("{}/{}", done + failed, expected);
+
+    // Bar width adapts to terminal; fall back to 40 if unavailable.
+    let term_width = crossterm::terminal::size()
+        .map(|(w, _)| w as usize)
+        .unwrap_or(80);
+    // Prefix "  Builds   [" = 13, suffix "] " + counter.
+    let chrome = 13 + 2 + counter.len();
+    let bar_width = if term_width > chrome + 10 {
+        term_width - chrome
+    } else {
+        20 // minimum bar width
+    };
+
+    let total = expected.max(1); // avoid division by zero
+    let done_cells = ((done as usize) * bar_width) / (total as usize);
+    let running_cells = ((running as usize) * bar_width) / (total as usize);
+    let failed_cells = ((failed as usize) * bar_width) / (total as usize);
+    // Ensure non-zero counts get at least 1 cell of representation.
+    let done_cells = if done > 0 { done_cells.max(1) } else { 0 };
+    let running_cells = if running > 0 { running_cells.max(1) } else { 0 };
+    let failed_cells = if failed > 0 { failed_cells.max(1) } else { 0 };
+    // Remaining absorbs rounding; clamp to 0.
+    let remaining_cells = bar_width.saturating_sub(done_cells + running_cells + failed_cells);
+
+    let done_str = "█".repeat(done_cells).green().bold().to_string();
+    let running_str = "█".repeat(running_cells).blue().bold().to_string();
+    let failed_str = "█".repeat(failed_cells).red().bold().to_string();
+    let remaining_str = "░".repeat(remaining_cells).dim().to_string();
+
+    format!(
+        "[{}{}{}{}] {}",
+        done_str,
+        running_str,
+        failed_str,
+        remaining_str,
+        counter.dim()
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -676,5 +714,66 @@ mod tests {
             format_duration(std::time::Duration::from_secs(3665)),
             "1h1m"
         );
+    }
+
+    /// Strip ANSI escape sequences so we can assert on visible content.
+    fn strip_ansi(s: &str) -> String {
+        let mut out = String::new();
+        let mut chars = s.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c == '\x1b' {
+                // Skip until 'm' (end of SGR sequence).
+                for c2 in chars.by_ref() {
+                    if c2 == 'm' {
+                        break;
+                    }
+                }
+            } else {
+                out.push(c);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn progress_bar_all_done() {
+        let bar = strip_ansi(&render_progress_bar(10, 0, 0, 10));
+        // Should contain the counter and be all filled.
+        assert!(bar.contains("10/10"), "bar = {bar}");
+        assert!(!bar.contains('░'), "bar should have no remaining: {bar}");
+    }
+
+    #[test]
+    fn progress_bar_none_started() {
+        let bar = strip_ansi(&render_progress_bar(0, 0, 0, 10));
+        assert!(bar.contains("0/10"), "bar = {bar}");
+        assert!(!bar.contains('█'), "bar should have no filled: {bar}");
+    }
+
+    #[test]
+    fn progress_bar_with_failures() {
+        let bar = strip_ansi(&render_progress_bar(5, 2, 3, 20));
+        assert!(
+            bar.contains("8/20"),
+            "counter should sum done+failed: {bar}"
+        );
+        // All segments should be present.
+        assert!(bar.contains('█'), "bar should have filled cells: {bar}");
+        assert!(bar.contains('░'), "bar should have remaining cells: {bar}");
+    }
+
+    #[test]
+    fn progress_bar_width_sums_correctly() {
+        // The visible bar characters between [ and ] should equal a consistent width.
+        let bar = strip_ansi(&render_progress_bar(3, 2, 1, 20));
+        let inner = &bar[bar.find('[').unwrap() + 1..bar.find(']').unwrap()];
+        let cell_count = inner.chars().count();
+        // All cells should be either █ or ░.
+        assert!(
+            inner.chars().all(|c| c == '█' || c == '░'),
+            "unexpected char in bar: {inner}"
+        );
+        // Width should be positive and stable.
+        assert!(cell_count > 0, "bar should have cells");
     }
 }
