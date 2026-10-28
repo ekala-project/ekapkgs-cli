@@ -128,8 +128,8 @@ impl BuildMonitor {
         if self.has_rendered {
             return true;
         }
-        // If nix reported expected counts and there are actual builds, render.
-        if self.saw_expected && self.build_expected > 0 {
+        // If nix reported expected counts and there is actual work, render.
+        if self.saw_expected && (self.build_expected > 0 || self.download_expected > 0) {
             return true;
         }
         // If we see any active build derivation, render.
@@ -232,6 +232,7 @@ impl BuildMonitor {
                         ACT_COPY_PATHS => {
                             self.download_done = event.fields[0].as_u64().unwrap_or(0);
                             self.download_expected = event.fields[1].as_u64().unwrap_or(0);
+                            self.saw_expected = true;
                         },
                         _ => {},
                     }
@@ -372,29 +373,17 @@ impl BuildMonitor {
         let sep = "━".repeat(42).dim().to_string();
         lines.push(format!(" {sep}"));
 
-        // Builds progress bar
-        if self.build_expected > 0 {
-            let bar = render_progress_bar(
-                self.build_done,
-                self.build_running,
-                self.build_failed,
-                self.build_expected,
-            );
-            lines.push(format!("  {} {}", "Builds   ".bold(), bar,));
-        }
-
-        // Downloads row
+        // Unified progress bar (builds + downloads as one end-to-end view).
+        let total_expected = self.build_expected + self.download_expected;
+        let total_done = self.build_done + self.download_done;
         let dl_running = self.download_expected.saturating_sub(self.download_done);
-        lines.push(format!(
-            "  {} {} {}  {} {}  {} {}",
-            "Downloads".bold(),
-            "↓".cyan().bold(),
-            dl_running.to_string().cyan().bold(),
-            "✔".green(),
-            self.download_done.to_string().green(),
-            "∑".dim(),
-            self.download_expected.to_string().dim(),
-        ));
+        let total_running = self.build_running + dl_running;
+
+        if total_expected > 0 {
+            let bar =
+                render_progress_bar(total_done, total_running, self.build_failed, total_expected);
+            lines.push(format!("  {} {}", "Progress ".bold(), bar,));
+        }
 
         // Failures row (only if any)
         if self.build_failed > 0 {
@@ -504,24 +493,24 @@ impl BuildMonitor {
         let sep = format!(" {}", "━".repeat(42).dim());
         let _ = writeln!(stderr, "{sep}");
 
-        if self.build_done > 0 || self.build_failed > 0 {
-            let _ = writeln!(
-                stderr,
-                "  {} {} {}  {} {}",
-                "Builds   ".bold(),
-                "✔".green(),
-                self.build_done.to_string().green(),
-                "✘".red(),
-                self.build_failed.to_string().red(),
-            );
-        }
-        if self.download_done > 0 {
+        let total_done = self.build_done + self.download_done;
+        if total_done > 0 || self.build_failed > 0 {
+            let mut parts = Vec::new();
+            if self.build_done > 0 {
+                parts.push(format!("{} built", self.build_done));
+            }
+            if self.download_done > 0 {
+                parts.push(format!("{} downloaded", self.download_done));
+            }
+            if self.build_failed > 0 {
+                parts.push(format!("{}", format!("{} failed", self.build_failed).red()));
+            }
             let _ = writeln!(
                 stderr,
                 "  {} {} {}",
-                "Downloads".bold(),
+                "Done     ".bold(),
                 "✔".green(),
-                self.download_done.to_string().green(),
+                parts.join(", "),
             );
         }
         let _ = writeln!(stderr, "  {} {} {}", "Time     ".bold(), "⏱".dim(), elapsed,);
