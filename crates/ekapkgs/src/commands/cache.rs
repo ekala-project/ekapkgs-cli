@@ -239,38 +239,34 @@ fn cmd_push(paths: &[String], cache_name: Option<&str>) -> color_eyre::Result<()
     let store_paths: Vec<String> = store_paths.into_iter().collect();
     let total_closure_size = closure_nar_size(&store_paths);
 
-    // Pre-push summary: "Pushing <first> (size) and N others (total) to <cache>"
-    // Use the top-level (user-provided) paths for display, not an arbitrary
-    // closure dependency.
-    let display_path = top_level_paths
-        .iter()
-        .next()
-        .unwrap_or_else(|| &store_paths[0]);
-    let (name, ver) = store::parse_store_path_name(display_path);
-    let first_name = if ver.is_empty() {
-        name.to_owned()
-    } else {
-        format!("{name}-{ver}")
-    };
+    // Pre-push summary: list every top-level output with its individual size,
+    // then a closure total.
+    let mut sorted_top: Vec<_> = top_level_paths.iter().cloned().collect();
+    sorted_top.sort();
 
-    let first_size = single_nar_size(display_path);
+    let mut top_level_total = 0u64;
 
-    if store_paths.len() == 1 {
-        tracing::info!(
-            "Pushing {} ({}) to {base_url}",
-            first_name,
-            ekapkgs_ui::format::format_bytes(first_size),
-        );
-    } else {
-        let others = store_paths.len() - 1;
-        tracing::info!(
-            "Pushing {} ({}) and {} others ({} closure) to {base_url}",
-            first_name,
-            ekapkgs_ui::format::format_bytes(first_size),
-            others,
-            ekapkgs_ui::format::format_bytes(total_closure_size),
-        );
+    tracing::info!("Pushing to {base_url}:");
+    for tl in &sorted_top {
+        let (name, ver) = store::parse_store_path_name(tl);
+        let pkg_name = if ver.is_empty() {
+            name.to_owned()
+        } else {
+            format!("{name}-{ver}")
+        };
+        let size = single_nar_size(tl);
+        top_level_total += size;
+        tracing::info!("  {pkg_name} ({})", ekapkgs_ui::format::format_bytes(size),);
     }
+
+    let n_outputs = sorted_top.len();
+    let n_paths = store_paths.len();
+    let suffix = if n_outputs == 1 { "" } else { "s" };
+    tracing::info!(
+        "{} in {n_outputs} output{suffix}, {} closure ({n_paths} paths)",
+        ekapkgs_ui::format::format_bytes(top_level_total),
+        ekapkgs_ui::format::format_bytes(total_closure_size),
+    );
 
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {
