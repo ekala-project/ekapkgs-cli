@@ -9,6 +9,39 @@ use ekapkgs_protocol::ekapkgs::v1::{
 /// At 1000 chunks × 34 bytes ≈ 34 KB (flat list) vs ~1.2 KB (bloom filter).
 const BLOOM_THRESHOLD: usize = 1_000;
 
+/// Timeout for the initial gRPC handshake to verify the server is reachable.
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Check whether the cache server is reachable via a gRPC connect with a
+/// short timeout.  Returns `Ok(())` on success or an error describing why
+/// the server could not be reached.
+pub async fn check_server(server_url: &str) -> color_eyre::Result<()> {
+    let channel = tonic::transport::Channel::from_shared(server_url.to_owned())?
+        .connect_timeout(CONNECT_TIMEOUT)
+        .timeout(CONNECT_TIMEOUT)
+        .connect()
+        .await?;
+
+    // Issue a trivial negotiate with empty want/have to confirm the service
+    // is responding, not just that TCP connected.
+    let mut client = CacheServiceClient::new(channel)
+        .max_decoding_message_size(64 * 1024 * 1024)
+        .max_encoding_message_size(64 * 1024 * 1024);
+
+    let request = tonic::Request::new(NegotiateRequest {
+        want: Vec::new(),
+        have: Vec::new(),
+        accept_compression: Vec::new(),
+        trust_roots: Vec::new(),
+        supports_cas: false,
+        target_hash: String::new(),
+        expand_closure: false,
+    });
+
+    client.negotiate(request).await?;
+    Ok(())
+}
+
 /// Send a negotiate request to the ekapkgs cache server.
 ///
 /// If `target` is provided, the server prioritizes the target and its
