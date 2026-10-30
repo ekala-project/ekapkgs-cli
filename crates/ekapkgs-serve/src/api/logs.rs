@@ -51,7 +51,7 @@ pub async fn get_log(
     if bz2_path.exists() {
         if accepts_bzip2 {
             // Serve raw bzip2 without decompression.
-            let Ok(data) = std::fs::read(&bz2_path) else {
+            let Ok(data) = tokio::fs::read(&bz2_path).await else {
                 return not_found();
             };
             return (
@@ -68,14 +68,19 @@ pub async fn get_log(
         }
 
         // Transparently decompress bzip2.
-        let Ok(compressed) = std::fs::read(&bz2_path) else {
+        let Ok(compressed) = tokio::fs::read(&bz2_path).await else {
             return not_found();
         };
-        let mut decoder = bzip2::read::BzDecoder::new(compressed.as_slice());
-        let mut decompressed = Vec::new();
-        if decoder.read_to_end(&mut decompressed).is_err() {
+        let decompress_result = tokio::task::spawn_blocking(move || {
+            let mut decoder = bzip2::read::BzDecoder::new(compressed.as_slice());
+            let mut decompressed = Vec::new();
+            decoder.read_to_end(&mut decompressed).map(|_| decompressed)
+        })
+        .await;
+
+        let Ok(Ok(decompressed)) = decompress_result else {
             return (StatusCode::INTERNAL_SERVER_ERROR, "decompression error").into_response();
-        }
+        };
 
         return (
             StatusCode::OK,
@@ -90,7 +95,7 @@ pub async fn get_log(
     }
 
     if plain_path.exists() {
-        let Ok(data) = std::fs::read(&plain_path) else {
+        let Ok(data) = tokio::fs::read(&plain_path).await else {
             return not_found();
         };
         return (

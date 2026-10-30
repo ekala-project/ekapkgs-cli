@@ -141,12 +141,13 @@ pub async fn cas_pull(
     // 6. Reassemble NARs and stage for import.
     let staging_dir = tempfile::tempdir()?;
     let nar_dir = staging_dir.path().join("nar");
-    std::fs::create_dir_all(&nar_dir)?;
+    tokio::fs::create_dir_all(&nar_dir).await?;
 
-    std::fs::write(
+    tokio::fs::write(
         staging_dir.path().join("nix-cache-info"),
         "StoreDir: /nix/store\n",
-    )?;
+    )
+    .await?;
 
     let entry_by_hash: HashMap<&str, &PathManifestEntry> = available
         .iter()
@@ -176,7 +177,7 @@ pub async fn cas_pull(
         // in memory at a time.
         let nar_path = staging_dir.path().join(&entry.url);
         if let Some(parent) = nar_path.parent() {
-            std::fs::create_dir_all(parent)?;
+            tokio::fs::create_dir_all(parent).await?;
         }
 
         let nar_bytes = {
@@ -202,12 +203,12 @@ pub async fn cas_pull(
             continue;
         }
 
-        std::fs::write(&nar_path, &nar_bytes)?;
+        tokio::fs::write(&nar_path, &nar_bytes).await?;
 
         // Write narinfo.
         let narinfo_text = crate::download::build_narinfo_text(entry);
         let narinfo_path = staging_dir.path().join(format!("{hash}.narinfo"));
-        std::fs::write(&narinfo_path, narinfo_text)?;
+        tokio::fs::write(&narinfo_path, narinfo_text).await?;
 
         reassembled += 1;
         reassembly_bar.inc(1);

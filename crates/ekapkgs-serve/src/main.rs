@@ -1157,13 +1157,13 @@ async fn cmd_serve(cli: Cli) -> color_eyre::Result<()> {
     } else if is_unix {
         let socket_path = bind_addr.strip_prefix("unix:").unwrap();
         // Remove stale socket file.
-        let _ = std::fs::remove_file(socket_path);
+        let _ = tokio::fs::remove_file(socket_path).await;
         let listener = tokio::net::UnixListener::bind(socket_path)?;
         // Restrict socket to owner and group.
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o660))?;
+            tokio::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o660)).await?;
         }
         tracing::info!("Listening on unix:{socket_path} (gRPC + HTTP)");
         notify_ready();
@@ -1190,7 +1190,7 @@ async fn cmd_serve(cli: Cli) -> color_eyre::Result<()> {
         tracing::info!("Listening on {local_addr} (gRPC + HTTP)");
         // Write port to file for test harness discovery (avoids TOCTOU race).
         if let Ok(path) = std::env::var("EKAPKGS_PORT_FILE") {
-            let _ = std::fs::write(&path, local_addr.port().to_string());
+            let _ = tokio::fs::write(&path, local_addr.port().to_string()).await;
         }
         notify_ready();
         spawn_watchdog();

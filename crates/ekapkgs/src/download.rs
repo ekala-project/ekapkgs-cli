@@ -18,13 +18,14 @@ pub async fn download_and_import(
 
     let staging_dir = tempfile::tempdir()?;
     let nar_dir = staging_dir.path().join("nar");
-    std::fs::create_dir_all(&nar_dir)?;
+    tokio::fs::create_dir_all(&nar_dir).await?;
 
     // Write nix-cache-info so nix recognizes this as a binary cache.
-    std::fs::write(
+    tokio::fs::write(
         staging_dir.path().join("nix-cache-info"),
         "StoreDir: /nix/store\n",
-    )?;
+    )
+    .await?;
 
     let total_paths = response.available.len() as u64;
     let bar = ekapkgs_ui::progress::item_bar(total_paths, "paths");
@@ -142,7 +143,7 @@ async fn download_single(
 
         if resp.status().is_success() {
             let delta_bytes = resp.bytes().await?;
-            match apply_delta(&delta_bytes, &entry.delta_base_hash) {
+            match apply_delta(&delta_bytes, &entry.delta_base_hash).await {
                 Ok(nar) => nar,
                 Err(e) => {
                     tracing::warn!("Delta apply failed for {hash}, downloading full NAR: {e}");
@@ -159,14 +160,14 @@ async fn download_single(
     // Write NAR file.
     let nar_path = staging_dir.join(&entry.url);
     if let Some(parent) = nar_path.parent() {
-        std::fs::create_dir_all(parent)?;
+        tokio::fs::create_dir_all(parent).await?;
     }
-    std::fs::write(&nar_path, &nar_data)?;
+    tokio::fs::write(&nar_path, &nar_data).await?;
 
     // Write narinfo file.
     let narinfo_text = build_narinfo_text(entry);
     let narinfo_path = staging_dir.join(format!("{hash}.narinfo"));
-    std::fs::write(&narinfo_path, narinfo_text)?;
+    tokio::fs::write(&narinfo_path, narinfo_text).await?;
 
     Ok(())
 }
@@ -206,13 +207,14 @@ pub async fn stream_and_import(
 
     let staging_dir = tempfile::tempdir()?;
     let nar_dir = staging_dir.path().join("nar");
-    std::fs::create_dir_all(&nar_dir)?;
+    tokio::fs::create_dir_all(&nar_dir).await?;
 
     // Write nix-cache-info so nix recognizes this as a binary cache.
-    std::fs::write(
+    tokio::fs::write(
         staging_dir.path().join("nix-cache-info"),
         "StoreDir: /nix/store\n",
-    )?;
+    )
+    .await?;
 
     // Build a lookup from hash to manifest entry.
     let entry_by_hash: std::collections::HashMap<&str, &PathManifestEntry> = response
@@ -279,7 +281,7 @@ pub async fn stream_and_import(
             if let Some(entry) = entry_by_hash.get(current_hash.as_str()) {
                 // If this is a delta, decompress using the base NAR as dictionary.
                 let nar_data = if current_is_delta && !entry.delta_base_hash.is_empty() {
-                    match apply_delta(&current_buf, &entry.delta_base_hash) {
+                    match apply_delta(&current_buf, &entry.delta_base_hash).await {
                         Ok(data) => data,
                         Err(e) => {
                             tracing::warn!("Delta decompression failed for {current_hash}: {e}");
@@ -293,13 +295,13 @@ pub async fn stream_and_import(
 
                 let nar_path = staging_dir.path().join(&entry.url);
                 if let Some(parent) = nar_path.parent() {
-                    std::fs::create_dir_all(parent)?;
+                    tokio::fs::create_dir_all(parent).await?;
                 }
-                std::fs::write(&nar_path, &nar_data)?;
+                tokio::fs::write(&nar_path, &nar_data).await?;
 
                 let narinfo_text = build_narinfo_text(entry);
                 let narinfo_path = staging_dir.path().join(format!("{current_hash}.narinfo"));
-                std::fs::write(&narinfo_path, narinfo_text)?;
+                tokio::fs::write(&narinfo_path, narinfo_text).await?;
 
                 paths_received += 1;
             } else {
@@ -364,12 +366,13 @@ pub(crate) fn build_narinfo_text(entry: &PathManifestEntry) -> String {
 ///
 /// Reads the base NAR from the local nix store via `nix-store --dump`,
 /// then decompresses the delta using the base NAR as a zstd dictionary.
-fn apply_delta(delta: &[u8], base_hash: &str) -> color_eyre::Result<Vec<u8>> {
+async fn apply_delta(delta: &[u8], base_hash: &str) -> color_eyre::Result<Vec<u8>> {
     // Read the base NAR from the local store.
-    let output = std::process::Command::new("nix-store")
+    let output = tokio::process::Command::new("nix-store")
         .arg("--dump")
         .arg(format!("/nix/store/{base_hash}"))
-        .output()?;
+        .output()
+        .await?;
 
     if !output.status.success() {
         return Err(color_eyre::eyre::eyre!(
@@ -379,11 +382,14 @@ fn apply_delta(delta: &[u8], base_hash: &str) -> color_eyre::Result<Vec<u8>> {
 
     let base_nar = output.stdout;
 
-    // Decompress the delta using the base NAR as dictionary.
-    use std::io::Read;
-    let mut decoder = zstd::Decoder::with_dictionary(delta, &base_nar)?;
-    let mut result = Vec::new();
-    decoder.read_to_end(&mut result)?;
-
-    Ok(result)
+    // Decompress the delta using the base NAR as dictionary (CPU-bound).
+    let delta = delta.to_vec();
+    tokio::task::spawn_blocking(move || {
+        use std::io::Read;
+        let mut decoder = zstd::Decoder::with_dictionary(&delta[..], &base_nar)?;
+        let mut result = Vec::new();
+        decoder.read_to_end(&mut result)?;
+        Ok(result)
+    })
+    .await?
 }
