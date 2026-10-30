@@ -31,7 +31,7 @@ pub async fn get_listing_inner(state: &AppState, hash: &str) -> Response {
         return not_found();
     }
 
-    let Some(root) = build_file_tree(&path) else {
+    let Ok(Some(root)) = tokio::task::spawn_blocking(move || build_file_tree(&path)).await else {
         return not_found();
     };
 
