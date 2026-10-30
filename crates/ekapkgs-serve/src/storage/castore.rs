@@ -202,6 +202,9 @@ pub struct CastoreBackend {
     /// While `false`, bloom lookups are bypassed (return `true` = "maybe
     /// present") so the server can accept requests immediately at startup.
     bloom_ready: AtomicBool,
+    /// Path to a corrupt database that was moved aside at startup.
+    /// When `Some`, background recovery will attempt to salvage rows from it.
+    corrupt_path: Option<PathBuf>,
 }
 
 impl CastoreBackend {
@@ -211,7 +214,7 @@ impl CastoreBackend {
         std::fs::create_dir_all(root.join("chunks"))?;
 
         let db_path = root.join("castore.db");
-        let conn = open_db(&db_path)?;
+        let OpenDbResult { conn, corrupt_path } = open_db(&db_path)?;
         create_tables(&conn)?;
 
         // Migrate: move any existing on-disk directories into SQLite.
@@ -269,6 +272,7 @@ impl CastoreBackend {
             chunk_pool,
             chunk_pool_inflight: AtomicUsize::new(0),
             bloom_ready: AtomicBool::new(false),
+            corrupt_path,
         };
 
         Ok(backend)
@@ -303,6 +307,52 @@ impl CastoreBackend {
                 tracing::info!("Background warmup completed in {:?}", t.elapsed());
             })
             .expect("failed to spawn warmup thread");
+    }
+
+    /// Spawn a background thread to recover salvageable rows from a corrupt
+    /// database. The server is already running with an empty DB; this fills
+    /// it back in so clients don't have to re-push everything.
+    ///
+    /// Must be called after `spawn_warmup` — the bloom filters will be
+    /// rebuilt once recovery finishes.
+    pub fn spawn_recovery(self: &Arc<Self>) {
+        let corrupt_path = match &self.corrupt_path {
+            Some(p) => p.clone(),
+            None => return,
+        };
+        let backend = Arc::clone(self);
+        std::thread::Builder::new()
+            .name("cas-recovery".into())
+            .spawn(move || {
+                tracing::info!(
+                    "starting background recovery from {}",
+                    corrupt_path.display()
+                );
+                match recover_from_corrupt(&backend, &corrupt_path) {
+                    Ok(stats) => {
+                        tracing::info!(
+                            "recovery complete: {} paths, {} chunks, {} file_chunks, {} \
+                             directories salvaged ({} row errors skipped)",
+                            stats.paths,
+                            stats.chunks,
+                            stats.file_chunks,
+                            stats.directories,
+                            stats.errors,
+                        );
+                        // Rebuild bloom filters to include recovered data.
+                        let chunk_bloom = backend.build_chunk_bloom();
+                        *backend.chunk_bloom.lock().expect("chunk bloom lock") = chunk_bloom;
+                        let path_bloom = backend.build_path_bloom();
+                        *backend.path_bloom.lock().expect("path bloom lock") = path_bloom;
+                        // Invalidate stats so next request recomputes.
+                        backend.invalidate_stats_cache();
+                    },
+                    Err(e) => {
+                        tracing::warn!("background recovery failed: {e:#}");
+                    },
+                }
+            })
+            .expect("failed to spawn recovery thread");
     }
 
     /// Acquire a read-only connection from the pool.
@@ -2049,7 +2099,16 @@ fn open_db_reader(path: &Path) -> color_eyre::Result<Connection> {
     Ok(conn)
 }
 
-fn open_db(path: &Path) -> color_eyre::Result<Connection> {
+/// Result of opening a database: the live connection plus an optional path to
+/// a corrupt database that was moved aside and should be recovered from.
+struct OpenDbResult {
+    conn: Connection,
+    /// When set, the corrupt DB was renamed here and background recovery should
+    /// be attempted.
+    corrupt_path: Option<PathBuf>,
+}
+
+fn open_db(path: &Path) -> color_eyre::Result<OpenDbResult> {
     tracing::log::info!("Opening database at {}", path.display());
     let conn = Connection::open(path)?;
     conn.execute_batch(
@@ -2060,12 +2119,457 @@ fn open_db(path: &Path) -> color_eyre::Result<Connection> {
     // Detect corruption early rather than discovering it mid-operation.
     let integrity: String = conn.query_row("PRAGMA quick_check", [], |row| row.get(0))?;
     if integrity != "ok" {
-        return Err(color_eyre::eyre::eyre!(
-            "database integrity check failed: {integrity}"
-        ));
+        tracing::log::warn!(
+            "database corruption detected in {}: {integrity}",
+            path.display()
+        );
+
+        // Close the corrupt connection before renaming.
+        drop(conn);
+
+        // Move the corrupt database (and WAL/SHM sidecars) aside so we can
+        // start fresh, then attempt background recovery of salvageable rows.
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let path_str = path.as_os_str().to_string_lossy();
+        let mut corrupt_main = None;
+        for suffix in &["", "-wal", "-shm"] {
+            let src = PathBuf::from(format!("{path_str}{suffix}"));
+            if src.exists() {
+                let dst = PathBuf::from(format!("{path_str}{suffix}.corrupt-{ts}"));
+                tracing::log::warn!("renaming {} -> {}", src.display(), dst.display());
+                std::fs::rename(&src, &dst)?;
+                if suffix.is_empty() {
+                    corrupt_main = Some(dst);
+                }
+            }
+        }
+
+        tracing::log::info!(
+            "re-creating database at {} after corruption recovery",
+            path.display()
+        );
+        let conn = Connection::open(path)?;
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL;PRAGMA synchronous=FULL;PRAGMA foreign_keys=ON;PRAGMA \
+             busy_timeout=5000;",
+        )?;
+        return Ok(OpenDbResult {
+            conn,
+            corrupt_path: corrupt_main,
+        });
     }
 
-    Ok(conn)
+    Ok(OpenDbResult {
+        conn,
+        corrupt_path: None,
+    })
+}
+
+struct RecoveryStats {
+    paths: u64,
+    chunks: u64,
+    file_chunks: u64,
+    directories: u64,
+    errors: u64,
+}
+
+/// Best-effort recovery: open the corrupt DB read-only, iterate each table,
+/// and copy salvageable rows into the live (empty) database. Rows on corrupt
+/// pages will fail to read and are silently skipped.
+fn recover_from_corrupt(
+    backend: &CastoreBackend,
+    corrupt_path: &Path,
+) -> color_eyre::Result<RecoveryStats> {
+    let src = Connection::open_with_flags(
+        corrupt_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    // Don't run integrity check — we already know it's corrupt.
+    // Use a large busy timeout in case WAL recovery is in progress.
+    src.execute_batch("PRAGMA busy_timeout=10000;")?;
+
+    let mut stats = RecoveryStats {
+        paths: 0,
+        chunks: 0,
+        file_chunks: 0,
+        directories: 0,
+        errors: 0,
+    };
+
+    // Rows are read from the corrupt DB without holding the write lock,
+    // buffered into batches, then flushed to the live DB in short
+    // transactions. This keeps the write lock free for incoming requests.
+    const BATCH_SIZE: usize = 5_000;
+    // If we hit this many consecutive read errors the B-tree is probably
+    // destroyed and continued iteration is pointless.
+    const MAX_CONSECUTIVE_ERRORS: u32 = 100;
+
+    // --- Recover chunks table ---
+    // This must come first since cas_paths and file_chunks reference chunks.
+    type ChunkRow = (Vec<u8>, i64, i64, Option<i32>, i64, Option<Vec<u8>>);
+
+    if let Ok(mut stmt) =
+        src.prepare("SELECT digest, size, ref_count, zstd_level, disk_size, data FROM chunks")
+    {
+        if let Ok(mut rows) = stmt.query([]) {
+            let mut buf: Vec<ChunkRow> = Vec::with_capacity(BATCH_SIZE);
+            let mut consecutive_errs = 0u32;
+            let mut done = false;
+            while !done {
+                // Read phase: no write lock held.
+                buf.clear();
+                while buf.len() < BATCH_SIZE {
+                    match rows.next() {
+                        Ok(Some(row)) => {
+                            consecutive_errs = 0;
+                            let digest: Vec<u8> = match row.get(0) {
+                                Ok(v) => v,
+                                Err(e) => {
+                                    stats.errors += 1;
+                                    tracing::debug!("skip chunk row: {e}");
+                                    continue;
+                                },
+                            };
+                            let size: i64 = row.get(1).unwrap_or(0);
+                            let ref_count: i64 = row.get(2).unwrap_or(1);
+                            let zstd_level: Option<i32> = row.get(3).unwrap_or(None);
+                            let disk_size: i64 = row.get(4).unwrap_or(0);
+                            let data: Option<Vec<u8>> = row.get(5).unwrap_or(None);
+                            buf.push((digest, size, ref_count, zstd_level, disk_size, data));
+                        },
+                        Ok(None) => {
+                            done = true;
+                            break;
+                        },
+                        Err(e) => {
+                            stats.errors += 1;
+                            consecutive_errs += 1;
+                            tracing::debug!("skipping corrupt chunks row: {e}");
+                            if consecutive_errs >= MAX_CONSECUTIVE_ERRORS {
+                                tracing::warn!(
+                                    "too many consecutive errors in chunks table, stopping"
+                                );
+                                done = true;
+                                break;
+                            }
+                        },
+                    }
+                }
+                // Write phase: short lock hold.
+                if !buf.is_empty() {
+                    let db = backend.db.lock().expect("db lock");
+                    db.execute_batch("BEGIN")?;
+                    for (digest, size, ref_count, zstd_level, disk_size, data) in &buf {
+                        if db
+                            .execute(
+                                "INSERT OR IGNORE INTO chunks (digest, size, ref_count, \
+                                 zstd_level, disk_size, data) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                                params![digest, size, ref_count, zstd_level, disk_size, data],
+                            )
+                            .is_ok()
+                        {
+                            stats.chunks += 1;
+                        } else {
+                            stats.errors += 1;
+                        }
+                    }
+                    db.execute_batch("COMMIT")?;
+                    tracing::debug!("recovery: {} chunks so far", stats.chunks);
+                }
+            }
+        }
+    }
+
+    // --- Recover file_chunks table ---
+    type FileChunkRow = (Vec<u8>, i64, Vec<u8>, i64);
+
+    if let Ok(mut stmt) =
+        src.prepare("SELECT file_digest, chunk_index, chunk_digest, chunk_size FROM file_chunks")
+    {
+        if let Ok(mut rows) = stmt.query([]) {
+            let mut buf: Vec<FileChunkRow> = Vec::with_capacity(BATCH_SIZE);
+            let mut consecutive_errs = 0u32;
+            let mut done = false;
+            while !done {
+                buf.clear();
+                while buf.len() < BATCH_SIZE {
+                    match rows.next() {
+                        Ok(Some(row)) => {
+                            consecutive_errs = 0;
+                            let file_digest: Vec<u8> = match row.get(0) {
+                                Ok(v) => v,
+                                Err(e) => {
+                                    stats.errors += 1;
+                                    tracing::debug!("skip file_chunks row: {e}");
+                                    continue;
+                                },
+                            };
+                            let chunk_index: i64 = row.get(1).unwrap_or(0);
+                            let chunk_digest: Vec<u8> = match row.get(2) {
+                                Ok(v) => v,
+                                Err(e) => {
+                                    stats.errors += 1;
+                                    tracing::debug!("skip file_chunks row: {e}");
+                                    continue;
+                                },
+                            };
+                            let chunk_size: i64 = row.get(3).unwrap_or(0);
+                            buf.push((file_digest, chunk_index, chunk_digest, chunk_size));
+                        },
+                        Ok(None) => {
+                            done = true;
+                            break;
+                        },
+                        Err(e) => {
+                            stats.errors += 1;
+                            consecutive_errs += 1;
+                            tracing::debug!("skipping corrupt file_chunks row: {e}");
+                            if consecutive_errs >= MAX_CONSECUTIVE_ERRORS {
+                                tracing::warn!(
+                                    "too many consecutive errors in file_chunks table, stopping"
+                                );
+                                done = true;
+                                break;
+                            }
+                        },
+                    }
+                }
+                if !buf.is_empty() {
+                    let db = backend.db.lock().expect("db lock");
+                    db.execute_batch("BEGIN")?;
+                    for (file_digest, chunk_index, chunk_digest, chunk_size) in &buf {
+                        if db
+                            .execute(
+                                "INSERT OR IGNORE INTO file_chunks (file_digest, chunk_index, \
+                                 chunk_digest, chunk_size) VALUES (?1, ?2, ?3, ?4)",
+                                params![file_digest, chunk_index, chunk_digest, chunk_size],
+                            )
+                            .is_ok()
+                        {
+                            stats.file_chunks += 1;
+                        } else {
+                            stats.errors += 1;
+                        }
+                    }
+                    db.execute_batch("COMMIT")?;
+                }
+            }
+        }
+    }
+
+    // --- Recover directories table ---
+    type DirRow = (Vec<u8>, Vec<u8>);
+
+    if let Ok(mut stmt) = src.prepare("SELECT digest, data FROM directories") {
+        if let Ok(mut rows) = stmt.query([]) {
+            let mut buf: Vec<DirRow> = Vec::with_capacity(BATCH_SIZE);
+            let mut consecutive_errs = 0u32;
+            let mut done = false;
+            while !done {
+                buf.clear();
+                while buf.len() < BATCH_SIZE {
+                    match rows.next() {
+                        Ok(Some(row)) => {
+                            consecutive_errs = 0;
+                            let digest: Vec<u8> = match row.get(0) {
+                                Ok(v) => v,
+                                Err(e) => {
+                                    stats.errors += 1;
+                                    tracing::debug!("skip directories row: {e}");
+                                    continue;
+                                },
+                            };
+                            let data: Vec<u8> = match row.get(1) {
+                                Ok(v) => v,
+                                Err(e) => {
+                                    stats.errors += 1;
+                                    tracing::debug!("skip directories row: {e}");
+                                    continue;
+                                },
+                            };
+                            buf.push((digest, data));
+                        },
+                        Ok(None) => {
+                            done = true;
+                            break;
+                        },
+                        Err(e) => {
+                            stats.errors += 1;
+                            consecutive_errs += 1;
+                            tracing::debug!("skipping corrupt directories row: {e}");
+                            if consecutive_errs >= MAX_CONSECUTIVE_ERRORS {
+                                tracing::warn!(
+                                    "too many consecutive errors in directories table, stopping"
+                                );
+                                done = true;
+                                break;
+                            }
+                        },
+                    }
+                }
+                if !buf.is_empty() {
+                    let db = backend.db.lock().expect("db lock");
+                    db.execute_batch("BEGIN")?;
+                    for (digest, data) in &buf {
+                        if db
+                            .execute(
+                                "INSERT OR IGNORE INTO directories (digest, data) VALUES (?1, ?2)",
+                                params![digest, data],
+                            )
+                            .is_ok()
+                        {
+                            stats.directories += 1;
+                        } else {
+                            stats.errors += 1;
+                        }
+                    }
+                    db.execute_batch("COMMIT")?;
+                }
+            }
+        }
+    }
+
+    // --- Recover cas_paths table ---
+    #[allow(clippy::type_complexity)]
+    type CasPathRow = (
+        String,
+        String,
+        String,
+        i64,
+        Vec<u8>,
+        String,
+        String,
+        String,
+        String,
+        i64,
+        i64,
+    );
+
+    if let Ok(mut stmt) = src.prepare(
+        "SELECT hash, store_path, nar_hash, nar_size, root_node, references_, signatures, ca, \
+         deriver, added_at, last_access FROM cas_paths",
+    ) {
+        if let Ok(mut rows) = stmt.query([]) {
+            let mut buf: Vec<CasPathRow> = Vec::with_capacity(BATCH_SIZE);
+            let mut consecutive_errs = 0u32;
+            let mut done = false;
+            while !done {
+                buf.clear();
+                while buf.len() < BATCH_SIZE {
+                    match rows.next() {
+                        Ok(Some(row)) => {
+                            consecutive_errs = 0;
+                            let hash: String = match row.get(0) {
+                                Ok(v) => v,
+                                Err(e) => {
+                                    stats.errors += 1;
+                                    tracing::debug!("skip cas_paths row: {e}");
+                                    continue;
+                                },
+                            };
+                            let store_path: String = row.get(1).unwrap_or_default();
+                            let nar_hash: String = row.get(2).unwrap_or_default();
+                            let nar_size: i64 = row.get(3).unwrap_or(0);
+                            let root_node: Vec<u8> = match row.get(4) {
+                                Ok(v) => v,
+                                Err(e) => {
+                                    stats.errors += 1;
+                                    tracing::debug!("skip cas_paths row (no root_node): {e}");
+                                    continue;
+                                },
+                            };
+                            let references: String = row.get(5).unwrap_or_default();
+                            let signatures: String = row.get(6).unwrap_or_default();
+                            let ca: String = row.get(7).unwrap_or_default();
+                            let deriver: String = row.get(8).unwrap_or_default();
+                            let added_at: i64 = row.get(9).unwrap_or(0);
+                            let last_access: i64 = row.get(10).unwrap_or(0);
+                            buf.push((
+                                hash,
+                                store_path,
+                                nar_hash,
+                                nar_size,
+                                root_node,
+                                references,
+                                signatures,
+                                ca,
+                                deriver,
+                                added_at,
+                                last_access,
+                            ));
+                        },
+                        Ok(None) => {
+                            done = true;
+                            break;
+                        },
+                        Err(e) => {
+                            stats.errors += 1;
+                            consecutive_errs += 1;
+                            tracing::debug!("skipping corrupt cas_paths row: {e}");
+                            if consecutive_errs >= MAX_CONSECUTIVE_ERRORS {
+                                tracing::warn!(
+                                    "too many consecutive errors in cas_paths table, stopping"
+                                );
+                                done = true;
+                                break;
+                            }
+                        },
+                    }
+                }
+                if !buf.is_empty() {
+                    let db = backend.db.lock().expect("db lock");
+                    db.execute_batch("BEGIN")?;
+                    for (
+                        hash,
+                        store_path,
+                        nar_hash,
+                        nar_size,
+                        root_node,
+                        references,
+                        signatures,
+                        ca,
+                        deriver,
+                        added_at,
+                        last_access,
+                    ) in &buf
+                    {
+                        if db
+                            .execute(
+                                "INSERT OR IGNORE INTO cas_paths (hash, store_path, nar_hash, \
+                                 nar_size, root_node, references_, signatures, ca, deriver, \
+                                 added_at, last_access) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, \
+                                 ?9, ?10, ?11)",
+                                params![
+                                    hash,
+                                    store_path,
+                                    nar_hash,
+                                    nar_size,
+                                    root_node,
+                                    references,
+                                    signatures,
+                                    ca,
+                                    deriver,
+                                    added_at,
+                                    last_access
+                                ],
+                            )
+                            .is_ok()
+                        {
+                            stats.paths += 1;
+                        } else {
+                            stats.errors += 1;
+                        }
+                    }
+                    db.execute_batch("COMMIT")?;
+                }
+            }
+        }
+    }
+
+    Ok(stats)
 }
 
 fn create_tables(conn: &Connection) -> color_eyre::Result<()> {
