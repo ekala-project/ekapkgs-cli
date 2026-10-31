@@ -161,34 +161,6 @@ pub async fn ekapkgs_cache_info(State(state): State<Arc<AppState>>) -> impl Into
                     format_bytes(saved)
                 ));
             }
-
-            // Per-level compression breakdown (zstd 1 vs 9).
-            if s.logical_bytes_zstd1 > 0 {
-                let ratio =
-                    (1.0 - s.disk_bytes_zstd1 as f64 / s.logical_bytes_zstd1 as f64) * 100.0;
-                lines.push(format!(
-                    "Zstd1: {} -> {} ({ratio:.1}% saved)",
-                    format_bytes(s.logical_bytes_zstd1),
-                    format_bytes(s.disk_bytes_zstd1)
-                ));
-            }
-            if s.logical_bytes_zstd9 > 0 {
-                let ratio =
-                    (1.0 - s.disk_bytes_zstd9 as f64 / s.logical_bytes_zstd9 as f64) * 100.0;
-                lines.push(format!(
-                    "Zstd9: {} -> {} ({ratio:.1}% saved)",
-                    format_bytes(s.logical_bytes_zstd9),
-                    format_bytes(s.disk_bytes_zstd9)
-                ));
-            }
-            if s.disk_bytes_zstd1 > 0 && s.disk_bytes_zstd9 > 0 && s.logical_bytes_zstd1 > 0 {
-                let z1_ratio = s.disk_bytes_zstd1 as f64 / s.logical_bytes_zstd1 as f64;
-                let estimated_at_z1 = (s.logical_bytes_zstd9 as f64 * z1_ratio) as u64;
-                if estimated_at_z1 > s.disk_bytes_zstd9 {
-                    let extra_saved = estimated_at_z1 - s.disk_bytes_zstd9;
-                    lines.push(format!("Zstd1ToZstd9Saved: {}", format_bytes(extra_saved)));
-                }
-            }
         }
     } else if storage
         .as_any()

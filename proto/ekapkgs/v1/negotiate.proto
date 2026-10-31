@@ -127,15 +127,12 @@ message CacheStatusResponse {
   // Number of zstd-compressed chunks on disk.
   uint64 compressed_chunks = 13;
 
-  // Per-level compression breakdown.
-  // Disk bytes for chunks still at zstd level 1 (hot-path).
-  uint64 disk_bytes_zstd1 = 14;
-  // Disk bytes for chunks recompressed to zstd level 9 (cold-path).
-  uint64 disk_bytes_zstd9 = 15;
-  // Logical (uncompressed) size of chunks at zstd level 1.
-  uint64 logical_bytes_zstd1 = 16;
-  // Logical (uncompressed) size of chunks at zstd level 9.
-  uint64 logical_bytes_zstd9 = 17;
+  // Deprecated: per-level compression breakdown (was used for two-tier zstd 1/9
+  // scheme). Now always 0; use disk_bytes and chunk_bytes for overall ratio.
+  uint64 disk_bytes_zstd1 = 14 [deprecated = true];
+  uint64 disk_bytes_zstd9 = 15 [deprecated = true];
+  uint64 logical_bytes_zstd1 = 16 [deprecated = true];
+  uint64 logical_bytes_zstd9 = 17 [deprecated = true];
 
   // GC information.
   uint64 gc_runs = 8;
