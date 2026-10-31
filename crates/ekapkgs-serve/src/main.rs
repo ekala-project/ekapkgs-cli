@@ -74,7 +74,10 @@ enum Command {
         command: TokenCommand,
     },
 
-    /// Compress existing uncompressed chunks in a castore backend.
+    /// Recompress chunks to the current target level (zstd 3).
+    ///
+    /// Migrates chunks stored at other compression levels (e.g. 1 or 9
+    /// from the old two-tier scheme) to the current default level.
     CompressChunks {
         /// Path to the castore root directory.
         path: PathBuf,
@@ -655,10 +658,12 @@ fn cmd_compress_chunks(
     // Ensure new columns exist (idempotent migration).
     storage::castore::ensure_compression_columns(&conn)?;
 
-    // Count total work: hot-path (level 1) chunks eligible for recompression.
+    const TARGET_LEVEL: i32 = 3;
+
+    // Count total work: chunks at any level other than the target.
     let total: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM chunks WHERE zstd_level = 1",
-        [],
+        "SELECT COUNT(*) FROM chunks WHERE zstd_level IS NOT NULL AND zstd_level != ?1",
+        params![TARGET_LEVEL],
         |row| row.get(0),
     )?;
 
@@ -672,10 +677,12 @@ fn cmd_compress_chunks(
         if dry_run { " (dry run)" } else { "" }
     );
 
-    let mut stmt =
-        conn.prepare("SELECT digest, size FROM chunks WHERE zstd_level = 1 ORDER BY size DESC")?;
+    let mut stmt = conn.prepare(
+        "SELECT digest, size FROM chunks WHERE zstd_level IS NOT NULL AND zstd_level != ?1 ORDER \
+         BY size DESC",
+    )?;
     let chunks: Vec<([u8; 32], i64)> = stmt
-        .query_map([], |row| {
+        .query_map(params![TARGET_LEVEL], |row| {
             let digest: Vec<u8> = row.get(0)?;
             let size: i64 = row.get(1)?;
             Ok((digest, size))
@@ -690,7 +697,7 @@ fn cmd_compress_chunks(
 
     // Result of processing a single chunk (sent from workers to main thread).
     enum ChunkResult {
-        /// Chunk recompressed at level 9 and written to temp file.
+        /// Chunk recompressed at the target level and written to temp file.
         Recompressed {
             digest: [u8; 32],
             temp_path: std::path::PathBuf,
@@ -698,7 +705,7 @@ fn cmd_compress_chunks(
             new_size: u64,
             old_size: u64,
         },
-        /// Level 9 was not smaller — mark as level 9 anyway (already optimal).
+        /// Target level was not smaller — mark at target level anyway.
         AlreadyOptimal { digest: [u8; 32], size: u64 },
         /// Chunk file was missing or errored — skip.
         Skipped,
@@ -728,7 +735,7 @@ fn cmd_compress_chunks(
         .map_err(|e| color_eyre::eyre::eyre!("failed to create thread pool: {e}"))?;
 
     for batch in chunks.chunks(BATCH_SIZE) {
-        // Workers: decompress level-1, recompress at level 9.
+        // Workers: decompress and recompress at the target level.
         let results: Vec<ChunkResult> = pool.install(|| {
             use rayon::prelude::*;
             batch
@@ -740,22 +747,20 @@ fn cmd_compress_chunks(
                         return ChunkResult::Skipped;
                     }
 
-                    let Ok(compressed_l1) = std::fs::read(&file_path) else {
+                    let Ok(compressed_old) = std::fs::read(&file_path) else {
                         return ChunkResult::Skipped;
                     };
-                    let old_size = compressed_l1.len() as u64;
+                    let old_size = compressed_old.len() as u64;
 
-                    // Decompress the level-1 data.
-                    let Ok(raw) = zstd::bulk::decompress(&compressed_l1, 256 * 1024 * 2) else {
-                        return ChunkResult::Skipped;
-                    };
-
-                    // Recompress at level 9.
-                    let Ok(compressed_l9) = zstd::bulk::compress(&raw, 9) else {
+                    let Ok(raw) = zstd::bulk::decompress(&compressed_old, 256 * 1024 * 2) else {
                         return ChunkResult::Skipped;
                     };
 
-                    let new_size = compressed_l9.len() as u64;
+                    let Ok(compressed_new) = zstd::bulk::compress(&raw, TARGET_LEVEL) else {
+                        return ChunkResult::Skipped;
+                    };
+
+                    let new_size = compressed_new.len() as u64;
                     if new_size < old_size {
                         if dry_run {
                             return ChunkResult::Recompressed {
@@ -771,7 +776,7 @@ fn cmd_compress_chunks(
                         };
                         let tmp = match tempfile::NamedTempFile::new_in(parent) {
                             Ok(mut t) => {
-                                if t.write_all(&compressed_l9).is_err() {
+                                if t.write_all(&compressed_new).is_err() {
                                     return ChunkResult::Skipped;
                                 }
                                 t
@@ -805,14 +810,14 @@ fn cmd_compress_chunks(
                         digest, new_size, ..
                     } => {
                         tx.execute(
-                            "UPDATE chunks SET zstd_level = 9, disk_size = ?1 WHERE digest = ?2",
-                            params![*new_size as i64, digest.as_slice()],
+                            "UPDATE chunks SET zstd_level = ?3, disk_size = ?1 WHERE digest = ?2",
+                            params![*new_size as i64, digest.as_slice(), TARGET_LEVEL],
                         )?;
                     },
                     ChunkResult::AlreadyOptimal { digest, size } => {
                         tx.execute(
-                            "UPDATE chunks SET zstd_level = 9, disk_size = ?1 WHERE digest = ?2",
-                            params![*size as i64, digest.as_slice()],
+                            "UPDATE chunks SET zstd_level = ?3, disk_size = ?1 WHERE digest = ?2",
+                            params![*size as i64, digest.as_slice(), TARGET_LEVEL],
                         )?;
                     },
                     ChunkResult::Skipped => {},
@@ -996,8 +1001,6 @@ async fn cmd_serve(cli: Cli) -> color_eyre::Result<()> {
             config::StorageConfig::Castore { path, gc } => {
                 let chunk_config = storage::castore::ChunkCompressionConfig {
                     level: config.compression.chunk_level,
-                    overflow_level: config.compression.chunk_overflow_level,
-                    workers: config.compression.chunk_workers,
                 };
                 let backend = Arc::new(storage::castore::CastoreBackend::new(path, chunk_config)?);
                 backend.spawn_warmup();

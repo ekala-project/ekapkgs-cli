@@ -606,10 +606,7 @@ impl CacheService for NegotiateService {
                 resp.disk_bytes = s.disk_bytes;
                 resp.inline_chunks = s.inline_chunks;
                 resp.compressed_chunks = s.compressed_chunks;
-                resp.disk_bytes_zstd1 = s.disk_bytes_zstd1;
-                resp.disk_bytes_zstd9 = s.disk_bytes_zstd9;
-                resp.logical_bytes_zstd1 = s.logical_bytes_zstd1;
-                resp.logical_bytes_zstd9 = s.logical_bytes_zstd9;
+                // Per-level fields (14-17) are deprecated; left at 0.
             }
         } else if storage
             .as_any()
