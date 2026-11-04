@@ -296,6 +296,20 @@ pub trait ChunkReader {
     /// Returns the concatenated chunk data for all chunks of this file.
     fn read_file_data(&self, file_digest: &[u8; 32]) -> color_eyre::Result<Vec<u8>>;
 
+    /// Stream file data directly to a writer, one chunk at a time.
+    ///
+    /// Avoids materializing the full file in memory. The default
+    /// implementation falls back to `read_file_data` + `write_all`.
+    fn write_file_data_to(
+        &self,
+        file_digest: &[u8; 32],
+        w: &mut dyn std::io::Write,
+    ) -> color_eyre::Result<()> {
+        let data = self.read_file_data(file_digest)?;
+        w.write_all(&data)?;
+        Ok(())
+    }
+
     /// Load a CAS directory by its blake3 digest.
     fn load_directory(
         &self,
@@ -349,9 +363,16 @@ fn write_cas_node_streaming<W: std::io::Write>(
                 write_str_to(w, "");
             }
             write_str_to(w, "contents");
-            // Read file data and write it. The data is freed after this scope.
-            let data = reader.read_file_data(&file_digest)?;
-            write_bytes_to(w, &data);
+            // Stream file data chunk-by-chunk. Write the NAR length prefix
+            // using the known file size, then stream chunks directly to the
+            // writer without materializing the full file in memory.
+            let len = file.size;
+            let _ = w.write_all(&len.to_le_bytes());
+            reader.write_file_data_to(&file_digest, w)?;
+            let pad = (8 - (len as usize % 8)) % 8;
+            if pad > 0 {
+                let _ = w.write_all(&[0u8; 8][..pad]);
+            }
         },
 
         Node::Directory(dir) => {
