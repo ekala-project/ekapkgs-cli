@@ -579,9 +579,10 @@ impl CastoreBackend {
 
     /// Evict a store path and its exclusively-referenced data.
     ///
-    /// Deletes the `cas_paths` row, then removes any chunks that are no
-    /// longer referenced by any remaining file_chunks row. Returns bytes
-    /// freed from chunk file deletions.
+    /// Uses the `path_files` table for O(1) reference checking instead of
+    /// walking all remaining paths' trees. Deletes the `cas_paths` and
+    /// `path_files` rows, then removes any file_chunks and chunks that are
+    /// no longer referenced. Returns bytes freed from chunk file deletions.
     ///
     /// Directories are left in SQLite (they are small and will be
     /// overwritten naturally on future ingests).
@@ -589,53 +590,61 @@ impl CastoreBackend {
         let db = self.db.lock().expect("db lock");
         let tx = db.unchecked_transaction()?;
 
-        // 1. Load root node and walk the tree to collect all file digests.
-        let root_bytes: Option<Vec<u8>> = tx
-            .query_row(
-                "SELECT root_node FROM cas_paths WHERE hash = ?1",
-                params![hash],
-                |row| row.get(0),
-            )
-            .ok();
-
-        let Some(root_bytes) = root_bytes else {
-            return Ok(0);
-        };
-
-        let mut file_digests = HashSet::new();
-        if let Ok(root_node) = CaNode::decode(root_bytes.as_slice()) {
-            Self::collect_file_digests_from_tree(&tx, &root_node, &mut file_digests);
-        }
-
-        // 2. Delete the cas_paths row.
-        tx.execute("DELETE FROM cas_paths WHERE hash = ?1", params![hash])?;
-
-        // 3. For each file digest, collect its chunk digests. We don't delete file_chunks rows here
-        //    because the same file_digest may be shared across multiple paths (file-level dedup).
-        //    The file_chunks rows are small and will be cleaned up when no remaining path uses
-        //    them.
-        let mut chunk_digests_to_check = HashSet::new();
-        for file_digest in &file_digests {
-            let mut stmt =
-                tx.prepare("SELECT chunk_digest FROM file_chunks WHERE file_digest = ?1")?;
-            let chunks: Vec<Vec<u8>> = stmt
-                .query_map(params![file_digest.as_slice()], |row| row.get(0))?
-                .filter_map(std::result::Result::ok)
+        // 1. Collect file digests owned by this path from the path_files table.
+        let file_digests: Vec<[u8; 32]> = {
+            let mut stmt = tx.prepare("SELECT file_digest FROM path_files WHERE path_hash = ?1")?;
+            let digests: Vec<[u8; 32]> = stmt
+                .query_map(params![hash], |row| {
+                    let v: Vec<u8> = row.get(0)?;
+                    Ok(v)
+                })?
+                .filter_map(|r| {
+                    let v = r.ok()?;
+                    <[u8; 32]>::try_from(v.as_slice()).ok()
+                })
                 .collect();
             drop(stmt);
+            digests
+        };
 
-            for chunk_vec in chunks {
-                if let Ok(d) = <[u8; 32]>::try_from(chunk_vec.as_slice()) {
-                    chunk_digests_to_check.insert(d);
-                }
-            }
+        if file_digests.is_empty() {
+            // No path_files rows — path may not exist or may predate the table.
+            // Delete the cas_paths row anyway.
+            tx.execute("DELETE FROM cas_paths WHERE hash = ?1", params![hash])?;
+            tx.execute("DELETE FROM path_files WHERE path_hash = ?1", params![hash])?;
+            tx.commit()?;
+            return Ok(0);
         }
 
-        // Check if these file_digests are still referenced by any remaining
-        // cas_paths. If not, delete the file_chunks rows.
+        // 2. Delete the cas_paths and path_files rows for this path.
+        tx.execute("DELETE FROM cas_paths WHERE hash = ?1", params![hash])?;
+        tx.execute("DELETE FROM path_files WHERE path_hash = ?1", params![hash])?;
+
+        // 3. For each file digest, check if other paths still reference it. If not, collect its
+        //    chunk digests and delete the file_chunks rows.
+        let mut chunk_digests_to_check = HashSet::new();
         for file_digest in &file_digests {
-            let still_needed = self.is_file_digest_referenced(&tx, file_digest, hash)?;
-            if !still_needed {
+            let still_referenced: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM path_files WHERE file_digest = ?1)",
+                params![file_digest.as_slice()],
+                |row| row.get(0),
+            )?;
+
+            if !still_referenced {
+                let mut stmt =
+                    tx.prepare("SELECT chunk_digest FROM file_chunks WHERE file_digest = ?1")?;
+                let chunks: Vec<Vec<u8>> = stmt
+                    .query_map(params![file_digest.as_slice()], |row| row.get(0))?
+                    .filter_map(std::result::Result::ok)
+                    .collect();
+                drop(stmt);
+
+                for chunk_vec in chunks {
+                    if let Ok(d) = <[u8; 32]>::try_from(chunk_vec.as_slice()) {
+                        chunk_digests_to_check.insert(d);
+                    }
+                }
+
                 tx.execute(
                     "DELETE FROM file_chunks WHERE file_digest = ?1",
                     params![file_digest.as_slice()],
@@ -681,35 +690,6 @@ impl CastoreBackend {
         tx.commit()?;
         self.invalidate_stats_cache();
         Ok(bytes_freed)
-    }
-
-    /// Check if a file digest is referenced by any remaining cas_paths
-    /// (excluding `exclude_hash`).
-    fn is_file_digest_referenced(
-        &self,
-        conn: &Connection,
-        file_digest: &[u8; 32],
-        exclude_hash: &str,
-    ) -> color_eyre::Result<bool> {
-        // Walk all remaining paths' trees and check if any reference this file.
-        let mut stmt = conn.prepare("SELECT root_node FROM cas_paths WHERE hash != ?1")?;
-        let roots: Vec<Vec<u8>> = stmt
-            .query_map(params![exclude_hash], |row| row.get(0))?
-            .filter_map(std::result::Result::ok)
-            .collect();
-        drop(stmt);
-
-        for root_bytes in &roots {
-            if let Ok(root_node) = CaNode::decode(root_bytes.as_slice()) {
-                let mut digests = HashSet::new();
-                Self::collect_file_digests_from_tree(conn, &root_node, &mut digests);
-                if digests.contains(file_digest) {
-                    return Ok(true);
-                }
-            }
-        }
-
-        Ok(false)
     }
 
     /// Walk a CaNode tree recursively, collecting all file digests.
@@ -1699,12 +1679,22 @@ impl StorageBackend for CastoreBackend {
 
         // Ingest into CAS within a single transaction.
         // Chunk files are written to disk outside the transaction (idempotent).
-        // All DB rows (chunks, file_chunks, directories, cas_paths) are written
-        // atomically — a crash mid-ingest leaves only orphan chunk files on disk,
-        // not inconsistent DB state.
+        // All DB rows (chunks, file_chunks, directories, cas_paths, path_files)
+        // are written atomically — a crash mid-ingest leaves only orphan chunk
+        // files on disk, not inconsistent DB state.
         let db = self.db.lock().expect("db lock");
         let tx = db.unchecked_transaction()?;
         let root_node = self.ingest_node(&tx, &nar_node)?;
+
+        // Record which file digests this path references for O(1) GC eviction.
+        let mut file_digests = HashSet::new();
+        Self::collect_file_digests_from_tree(&tx, &root_node, &mut file_digests);
+        for fd in &file_digests {
+            tx.execute(
+                "INSERT OR IGNORE INTO path_files (path_hash, file_digest) VALUES (?1, ?2)",
+                params![hash, fd.as_slice()],
+            )?;
+        }
 
         // If metadata already exists (put_narinfo was called first), update it
         // with the actual root node. Otherwise, store minimal metadata.
@@ -1761,6 +1751,43 @@ impl StorageBackend for CastoreBackend {
 impl ChunkReader for CastoreBackend {
     fn read_file_data(&self, file_digest: &[u8; 32]) -> color_eyre::Result<Vec<u8>> {
         self.read_file_data(file_digest)
+    }
+
+    /// Stream file data chunk-by-chunk directly to the writer.
+    ///
+    /// Each chunk is read, decompressed, written, and immediately freed —
+    /// only one chunk (up to 256 KiB) is in memory at a time instead of
+    /// the entire file.
+    fn write_file_data_to(
+        &self,
+        file_digest: &[u8; 32],
+        w: &mut dyn std::io::Write,
+    ) -> color_eyre::Result<()> {
+        let db = self.acquire_reader();
+        let mut stmt = db.prepare(
+            "SELECT chunk_digest FROM file_chunks WHERE file_digest = ?1 ORDER BY chunk_index",
+        )?;
+        let chunk_digests: Vec<[u8; 32]> = stmt
+            .query_map(params![file_digest.as_slice()], |row| {
+                let v: Vec<u8> = row.get(0)?;
+                Ok(v)
+            })?
+            .filter_map(|r| {
+                let v = r.ok()?;
+                <[u8; 32]>::try_from(v.as_slice()).ok()
+            })
+            .collect();
+        drop(stmt);
+        drop(db);
+
+        for chunk_digest in &chunk_digests {
+            let chunk_data = self.get_chunk_by_digest(chunk_digest)?.ok_or_else(|| {
+                color_eyre::eyre::eyre!("missing chunk {}", hex_encode(chunk_digest))
+            })?;
+            w.write_all(&chunk_data)?;
+        }
+
+        Ok(())
     }
 
     fn load_directory(
@@ -1872,7 +1899,7 @@ fn open_db(path: &Path) -> color_eyre::Result<OpenDbResult> {
     let conn = Connection::open(path)?;
     conn.execute_batch(
         "PRAGMA journal_mode=WAL;PRAGMA synchronous=FULL;PRAGMA foreign_keys=ON;PRAGMA \
-         busy_timeout=5000;",
+         busy_timeout=5000;PRAGMA cache_size=-65536;PRAGMA mmap_size=1073741824",
     )?;
 
     // Detect corruption early rather than discovering it mid-operation.
@@ -1913,7 +1940,7 @@ fn open_db(path: &Path) -> color_eyre::Result<OpenDbResult> {
         let conn = Connection::open(path)?;
         conn.execute_batch(
             "PRAGMA journal_mode=WAL;PRAGMA synchronous=FULL;PRAGMA foreign_keys=ON;PRAGMA \
-             busy_timeout=5000;",
+             busy_timeout=5000;PRAGMA cache_size=-65536;PRAGMA mmap_size=1073741824",
         )?;
         return Ok(OpenDbResult {
             conn,
@@ -2318,6 +2345,20 @@ fn recover_from_corrupt(
                             .is_ok()
                         {
                             stats.paths += 1;
+                            // Populate path_files for GC reference tracking.
+                            if let Ok(root_ca) = CaNode::decode(root_node.as_slice()) {
+                                let mut fds = HashSet::new();
+                                CastoreBackend::collect_file_digests_from_tree(
+                                    &db, &root_ca, &mut fds,
+                                );
+                                for fd in &fds {
+                                    let _ = db.execute(
+                                        "INSERT OR IGNORE INTO path_files (path_hash, \
+                                         file_digest) VALUES (?1, ?2)",
+                                        params![hash, fd.as_slice()],
+                                    );
+                                }
+                            }
                         } else {
                             stats.errors += 1;
                         }
@@ -2365,6 +2406,12 @@ fn create_tables(conn: &Connection) -> color_eyre::Result<()> {
             digest       BLOB PRIMARY KEY,
             data         BLOB NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS path_files (
+            path_hash    TEXT NOT NULL,
+            file_digest  BLOB NOT NULL,
+            PRIMARY KEY (path_hash, file_digest)
+        );
+        CREATE INDEX IF NOT EXISTS idx_path_files_file_digest ON path_files(file_digest);
         CREATE INDEX IF NOT EXISTS idx_file_chunks_digest ON file_chunks(chunk_digest);
         CREATE INDEX IF NOT EXISTS idx_cas_paths_last_access ON cas_paths(last_access);",
     )?;
@@ -2381,6 +2428,76 @@ fn create_tables(conn: &Connection) -> color_eyre::Result<()> {
     }
 
     ensure_compression_columns(conn)?;
+    ensure_path_files_table(conn)?;
+
+    Ok(())
+}
+
+/// Ensure the `path_files` table exists and is populated.
+///
+/// On fresh databases the table is created by `create_tables`. On existing
+/// databases that were created before this table existed, we create it here
+/// and backfill from existing `cas_paths` root nodes.
+fn ensure_path_files_table(conn: &Connection) -> color_eyre::Result<()> {
+    let table_exists: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='path_files')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(false);
+
+    if table_exists {
+        // Check if already populated — skip the expensive backfill if so.
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM path_files", [], |row| row.get(0))
+            .unwrap_or(0);
+        if count > 0 {
+            return Ok(());
+        }
+    } else {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS path_files (
+                path_hash    TEXT NOT NULL,
+                file_digest  BLOB NOT NULL,
+                PRIMARY KEY (path_hash, file_digest)
+            );
+            CREATE INDEX IF NOT EXISTS idx_path_files_file_digest ON path_files(file_digest);",
+        )?;
+    }
+
+    // Backfill: walk all existing cas_paths root_nodes to populate path_files.
+    let mut stmt = conn.prepare("SELECT hash, root_node FROM cas_paths")?;
+    let rows: Vec<(String, Vec<u8>)> = stmt
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .filter_map(std::result::Result::ok)
+        .collect();
+    drop(stmt);
+
+    if rows.is_empty() {
+        return Ok(());
+    }
+
+    tracing::info!(
+        "Backfilling path_files table from {} existing paths",
+        rows.len()
+    );
+
+    let tx = conn.unchecked_transaction()?;
+    for (hash, root_bytes) in &rows {
+        if let Ok(root_node) = CaNode::decode(root_bytes.as_slice()) {
+            let mut file_digests = HashSet::new();
+            CastoreBackend::collect_file_digests_from_tree(&tx, &root_node, &mut file_digests);
+            for fd in &file_digests {
+                let _ = tx.execute(
+                    "INSERT OR IGNORE INTO path_files (path_hash, file_digest) VALUES (?1, ?2)",
+                    params![hash, fd.as_slice()],
+                );
+            }
+        }
+    }
+    tx.commit()?;
+    tracing::info!("path_files backfill complete");
 
     Ok(())
 }

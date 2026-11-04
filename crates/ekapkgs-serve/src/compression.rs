@@ -11,8 +11,6 @@ use std::sync::Arc;
 
 use axum::body::Body;
 use axum::http::{HeaderMap, HeaderValue, Request, Response, StatusCode, header};
-use axum::response::IntoResponse;
-use http_body_util::BodyExt;
 use tower::{Layer, Service};
 
 use crate::config::CompressionConfig;
@@ -28,9 +26,6 @@ const LDM_WINDOW_LOG_CAP: u32 = 25;
 
 /// Window log cap for non-NAR HTTP responses per RFC 9659.
 const HTTP_WINDOW_LOG_MAX: u32 = 23;
-
-/// Threshold below which compression runs inline (not on blocking pool).
-const INLINE_COMPRESS_THRESHOLD: usize = 1024; // 1 KiB
 
 /// Axum layer that applies zstd compression to responses.
 #[derive(Clone)]
@@ -139,16 +134,9 @@ where
                 config.window_log.min(cap)
             };
 
-            // For streaming responses (no Content-Length), compress each
-            // chunk as it arrives via a streaming zstd encoder. For
-            // buffered responses (known size), use the original
-            // collect-then-compress path for better ratio.
-            let is_streaming = content_length.is_none();
-
             // Determine if we need an LDM permit.
             let actual_use_ldm = if use_ldm {
-                let needs_permit =
-                    is_streaming || content_length.is_none_or(|len| len >= LARGE_BODY_THRESHOLD);
+                let needs_permit = content_length.is_none_or(|len| len >= LARGE_BODY_THRESHOLD);
                 if needs_permit {
                     ldm_semaphore.clone().try_acquire_owned().is_ok()
                 } else {
@@ -160,101 +148,62 @@ where
 
             let level = config.level;
 
-            if is_streaming {
-                // Streaming compression: pipe body chunks through a zstd
-                // encoder on a blocking task, sending compressed frames
-                // through a channel. This avoids materializing the full
-                // response in memory.
-                let (comp_tx, comp_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4);
+            // Always use streaming compression: pipe body chunks through a
+            // zstd encoder on a blocking task, sending compressed frames
+            // through a buffered channel. This avoids materializing the full
+            // response body in memory regardless of whether Content-Length
+            // is set (compression removes it anyway).
+            let (comp_tx, comp_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4);
 
-                tokio::task::spawn_blocking(move || {
-                    let writer = BlockingSender(comp_tx);
-                    let Ok(mut encoder) = zstd::Encoder::new(writer, level) else {
-                        return;
-                    };
-                    if effective_window_log > 0 {
-                        let _ = encoder.set_parameter(zstd::zstd_safe::CParameter::WindowLog(
-                            effective_window_log,
-                        ));
-                    }
-                    if actual_use_ldm {
-                        let _ = encoder.set_parameter(
-                            zstd::zstd_safe::CParameter::EnableLongDistanceMatching(true),
-                        );
-                    }
+            tokio::task::spawn_blocking(move || {
+                let writer = BufferedSender::new(comp_tx);
+                let Ok(mut encoder) = zstd::Encoder::new(writer, level) else {
+                    return;
+                };
+                if effective_window_log > 0 {
+                    let _ = encoder.set_parameter(zstd::zstd_safe::CParameter::WindowLog(
+                        effective_window_log,
+                    ));
+                }
+                if actual_use_ldm {
+                    let _ = encoder.set_parameter(
+                        zstd::zstd_safe::CParameter::EnableLongDistanceMatching(true),
+                    );
+                }
 
-                    // Collect body frames and feed them to the encoder.
-                    let rt = tokio::runtime::Handle::current();
-                    let mut body = body;
-                    loop {
-                        let frame = rt.block_on(async {
-                            use http_body_util::BodyExt as _;
-                            body.frame().await
-                        });
-                        match frame {
-                            Some(Ok(frame)) => {
-                                if let Ok(data) = frame.into_data() {
-                                    if encoder.write_all(&data).is_err() {
-                                        return;
-                                    }
+                // Collect body frames and feed them to the encoder.
+                let rt = tokio::runtime::Handle::current();
+                let mut body = body;
+                loop {
+                    let frame = rt.block_on(async {
+                        use http_body_util::BodyExt as _;
+                        body.frame().await
+                    });
+                    match frame {
+                        Some(Ok(frame)) => {
+                            if let Ok(data) = frame.into_data() {
+                                if encoder.write_all(&data).is_err() {
+                                    return;
                                 }
-                            },
-                            _ => break,
-                        }
+                            }
+                        },
+                        _ => break,
                     }
-                    let _ = encoder.finish();
-                });
+                }
+                let _ = encoder.finish();
+            });
 
-                let stream = futures::stream::unfold(comp_rx, |mut rx| async move {
-                    let chunk = rx.recv().await?;
-                    Some((Ok::<_, std::io::Error>(chunk), rx))
-                });
+            let stream = futures::stream::unfold(comp_rx, |mut rx| async move {
+                let chunk = rx.recv().await?;
+                Some((Ok::<_, std::io::Error>(chunk), rx))
+            });
 
-                let mut headers = parts.headers;
-                headers.insert(header::CONTENT_ENCODING, HeaderValue::from_static("zstd"));
-                headers.remove(header::CONTENT_LENGTH);
-                headers.append(header::VARY, HeaderValue::from_static("accept-encoding"));
-
-                let mut response = Response::new(Body::from_stream(stream));
-                *response.status_mut() = parts.status;
-                *response.headers_mut() = headers;
-                *response.version_mut() = parts.version;
-                return Ok(response);
-            }
-
-            // Buffered path: collect body, then compress in one shot.
-            let Ok(body_bytes) = collect_body(body).await else {
-                return Ok((StatusCode::INTERNAL_SERVER_ERROR, "compression error").into_response());
-            };
-
-            if body_bytes.is_empty() {
-                return Ok(Response::from_parts(parts, Body::from(body_bytes)));
-            }
-
-            // Compress: inline for small chunks, blocking pool for large.
-            let compressed = if body_bytes.len() < INLINE_COMPRESS_THRESHOLD {
-                compress_bytes(&body_bytes, level, effective_window_log, actual_use_ldm)
-            } else {
-                let bytes = body_bytes.clone();
-                tokio::task::spawn_blocking(move || {
-                    compress_bytes(&bytes, level, effective_window_log, actual_use_ldm)
-                })
-                .await
-                .unwrap_or_default()
-            };
-
-            let Some(compressed) = compressed else {
-                // Compression failed — return original body.
-                return Ok(Response::from_parts(parts, Body::from(body_bytes)));
-            };
-
-            // Build compressed response with updated headers.
             let mut headers = parts.headers;
             headers.insert(header::CONTENT_ENCODING, HeaderValue::from_static("zstd"));
             headers.remove(header::CONTENT_LENGTH);
             headers.append(header::VARY, HeaderValue::from_static("accept-encoding"));
 
-            let mut response = Response::new(Body::from(compressed));
+            let mut response = Response::new(Body::from_stream(stream));
             *response.status_mut() = parts.status;
             *response.headers_mut() = headers;
             *response.version_mut() = parts.version;
@@ -264,20 +213,53 @@ where
     }
 }
 
-/// `std::io::Write` adapter that sends bytes through a tokio mpsc channel
-/// using `blocking_send`. Used by the streaming compression path to pipe
-/// compressed output from a blocking zstd encoder to an async response body.
-struct BlockingSender(tokio::sync::mpsc::Sender<Vec<u8>>);
+/// Buffered write size for compressed output (64 KiB).
+const SENDER_BUF_SIZE: usize = 65_536;
 
-impl std::io::Write for BlockingSender {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0
-            .blocking_send(buf.to_vec())
-            .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "receiver dropped"))?;
-        Ok(buf.len())
+/// `std::io::Write` adapter that buffers compressed output into 64 KiB chunks
+/// before sending through a tokio mpsc channel. This avoids a separate
+/// allocation and channel send for every small `write()` call from the zstd
+/// encoder.
+struct BufferedSender {
+    buf: Vec<u8>,
+    tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+}
+
+impl BufferedSender {
+    fn new(tx: tokio::sync::mpsc::Sender<Vec<u8>>) -> Self {
+        Self {
+            buf: Vec::with_capacity(SENDER_BUF_SIZE),
+            tx,
+        }
+    }
+}
+
+impl std::io::Write for BufferedSender {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        let mut written = 0;
+        while written < data.len() {
+            let space = SENDER_BUF_SIZE - self.buf.len();
+            let n = space.min(data.len() - written);
+            self.buf.extend_from_slice(&data[written..written + n]);
+            written += n;
+
+            if self.buf.len() >= SENDER_BUF_SIZE {
+                let chunk = std::mem::replace(&mut self.buf, Vec::with_capacity(SENDER_BUF_SIZE));
+                self.tx.blocking_send(chunk).map_err(|_| {
+                    std::io::Error::new(std::io::ErrorKind::BrokenPipe, "receiver dropped")
+                })?;
+            }
+        }
+        Ok(written)
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
+        if !self.buf.is_empty() {
+            let chunk = std::mem::take(&mut self.buf);
+            self.tx.blocking_send(chunk).map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::BrokenPipe, "receiver dropped")
+            })?;
+        }
         Ok(())
     }
 }
@@ -350,36 +332,28 @@ fn should_compress(
     true
 }
 
-/// Compress bytes with zstd using the specified parameters.
-fn compress_bytes(data: &[u8], level: i32, window_log: u32, use_ldm: bool) -> Option<Vec<u8>> {
-    let mut encoder = zstd::Encoder::new(Vec::new(), level).ok()?;
-
-    if window_log > 0 {
-        encoder
-            .set_parameter(zstd::zstd_safe::CParameter::WindowLog(window_log))
-            .ok()?;
-    }
-    if use_ldm {
-        encoder
-            .set_parameter(zstd::zstd_safe::CParameter::EnableLongDistanceMatching(
-                true,
-            ))
-            .ok()?;
-    }
-
-    encoder.write_all(data).ok()?;
-    encoder.finish().ok()
-}
-
-/// Collect a body stream into bytes.
-async fn collect_body(body: Body) -> Result<Vec<u8>, axum::Error> {
-    let collected = body.collect().await.map_err(axum::Error::new)?;
-    Ok(collected.to_bytes().to_vec())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Compress bytes with zstd using the specified parameters.
+    fn compress_bytes(data: &[u8], level: i32, window_log: u32, use_ldm: bool) -> Option<Vec<u8>> {
+        let mut encoder = zstd::Encoder::new(Vec::new(), level).ok()?;
+        if window_log > 0 {
+            encoder
+                .set_parameter(zstd::zstd_safe::CParameter::WindowLog(window_log))
+                .ok()?;
+        }
+        if use_ldm {
+            encoder
+                .set_parameter(zstd::zstd_safe::CParameter::EnableLongDistanceMatching(
+                    true,
+                ))
+                .ok()?;
+        }
+        encoder.write_all(data).ok()?;
+        encoder.finish().ok()
+    }
 
     #[test]
     fn accept_zstd_simple() {
