@@ -17,6 +17,8 @@ service CacheService {
   rpc PushNegotiate(PushNegotiateRequest) returns (PushNegotiateResponse);
   // Query cache status: storage statistics and GC info.
   rpc CacheStatus(CacheStatusRequest) returns (CacheStatusResponse);
+  // Query historical cache status snapshots (hourly ring buffer).
+  rpc CacheHistory(CacheHistoryRequest) returns (CacheHistoryResponse);
 }
 
 message NegotiateRequest {
@@ -138,4 +140,28 @@ message CacheStatusResponse {
   uint64 gc_runs = 8;
   uint64 gc_paths_evicted = 9;
   uint64 gc_bytes_freed = 10;
+}
+
+message CacheHistoryRequest {}
+
+message CacheHistoryResponse {
+  repeated CacheHistorySnapshot snapshots = 1;
+}
+
+message CacheHistorySnapshot {
+  // Unix timestamp (seconds) when this snapshot was recorded.
+  uint64 timestamp = 1;
+  string backend = 2;
+  uint64 store_paths = 3;
+  uint64 total_nar_size = 4;
+  uint64 chunks = 5;
+  uint64 chunk_bytes = 6;
+  uint64 unique_files = 7;
+  uint64 total_file_chunk_refs = 8;
+  uint64 disk_bytes = 9;
+  uint64 inline_chunks = 10;
+  uint64 compressed_chunks = 11;
+  uint64 gc_runs = 12;
+  uint64 gc_paths_evicted = 13;
+  uint64 gc_bytes_freed = 14;
 }

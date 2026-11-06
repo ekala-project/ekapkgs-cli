@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use clap::{Parser, Subcommand};
 #[allow(unused_imports)]
 use clap_complete::engine::ArgValueCompleter;
@@ -304,6 +306,17 @@ pub enum CacheCommand {
 
     /// Show cache server status (storage stats, deduplication, GC).
     Status {
+        /// Cache name or URL. If omitted, uses the primary cache or EKAPKGS_CACHE_URL.
+        #[arg(long)]
+        cache: Option<String>,
+    },
+
+    /// Download historical cache status snapshots as CSV.
+    History {
+        /// Output file path for the CSV data.
+        #[arg(short, long)]
+        output: PathBuf,
+
         /// Cache name or URL. If omitted, uses the primary cache or EKAPKGS_CACHE_URL.
         #[arg(long)]
         cache: Option<String>,

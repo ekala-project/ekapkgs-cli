@@ -107,6 +107,7 @@ pub fn execute(command: CacheCommand) -> color_eyre::Result<()> {
             cache.as_deref(),
         ),
         CacheCommand::Status { cache } => cmd_status(cache.as_deref()),
+        CacheCommand::History { output, cache } => cmd_history(&output, cache.as_deref()),
         CacheCommand::Auth { command } => cmd_auth(command),
     }
 }
@@ -182,6 +183,75 @@ fn cmd_status(cache_name: Option<&str>) -> color_eyre::Result<()> {
             ekapkgs_ui::format::format_bytes(response.gc_bytes_freed)
         );
     }
+
+    Ok(())
+}
+
+// --- history ---
+
+fn cmd_history(output: &std::path::Path, cache_name: Option<&str>) -> color_eyre::Result<()> {
+    use std::io::Write;
+
+    use ekapkgs_protocol::ekapkgs::v1::CacheHistoryRequest;
+    use ekapkgs_protocol::ekapkgs::v1::cache_service_client::CacheServiceClient;
+
+    let config = ClientConfig::load()?;
+    let (server_url, _token) = resolve_cache_for_action(&config, cache_name)?;
+
+    let rt = tokio::runtime::Runtime::new()?;
+    let response = rt.block_on(async {
+        let mut client = CacheServiceClient::connect(server_url.clone())
+            .await?
+            .max_decoding_message_size(64 * 1024 * 1024);
+
+        let resp = client
+            .cache_history(tonic::Request::new(CacheHistoryRequest {}))
+            .await?;
+        Ok::<_, color_eyre::Report>(resp.into_inner())
+    })?;
+
+    let snapshots = response.snapshots;
+    if snapshots.is_empty() {
+        println!("No history snapshots available yet (snapshots are recorded hourly).");
+        return Ok(());
+    }
+
+    let mut file = std::fs::File::create(output)?;
+
+    // CSV header
+    writeln!(
+        file,
+        "timestamp,backend,store_paths,total_nar_size,chunks,chunk_bytes,unique_files,\
+         total_file_chunk_refs,disk_bytes,inline_chunks,compressed_chunks,gc_runs,\
+         gc_paths_evicted,gc_bytes_freed"
+    )?;
+
+    for s in &snapshots {
+        writeln!(
+            file,
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+            s.timestamp,
+            s.backend,
+            s.store_paths,
+            s.total_nar_size,
+            s.chunks,
+            s.chunk_bytes,
+            s.unique_files,
+            s.total_file_chunk_refs,
+            s.disk_bytes,
+            s.inline_chunks,
+            s.compressed_chunks,
+            s.gc_runs,
+            s.gc_paths_evicted,
+            s.gc_bytes_freed,
+        )?;
+    }
+
+    println!(
+        "Wrote {} snapshots to {}",
+        snapshots.len(),
+        output.display()
+    );
 
     Ok(())
 }

@@ -2,6 +2,7 @@ mod api;
 mod compression;
 mod config;
 mod gc;
+mod history;
 mod http_metrics;
 pub mod metrics;
 mod signing;
@@ -161,6 +162,8 @@ pub struct AppState {
     /// in-flight compression buffers. Without a bound, concurrent
     /// pushes can exhaust memory and trigger OOM kills.
     pub push_semaphore: Arc<tokio::sync::Semaphore>,
+    /// Path to the history snapshot database (None when no writable storage).
+    pub history_db_path: Option<PathBuf>,
 }
 
 /// Cache for computed delta NARs, keyed by (base_hash, target_hash).
@@ -909,6 +912,7 @@ async fn cmd_serve(cli: Cli) -> color_eyre::Result<()> {
     let mut priority: u32 = 30;
     let mut store_dir: String = "/nix/store".to_owned();
     let token_store_path: PathBuf;
+    let mut storage_root: Option<PathBuf> = None;
     let server_metrics = metrics::Metrics::new();
 
     let gc_metrics = gc::GcMetrics {
@@ -966,6 +970,7 @@ async fn cmd_serve(cli: Cli) -> color_eyre::Result<()> {
                     None
                 };
                 gc_tracker = gc_t;
+                storage_root = Some(path.clone());
                 Box::new(storage::filesystem::FilesystemBackend::new(path))
             },
             config::StorageConfig::NixStore => {
@@ -1002,7 +1007,11 @@ async fn cmd_serve(cli: Cli) -> color_eyre::Result<()> {
                 let chunk_config = storage::castore::ChunkCompressionConfig {
                     level: config.compression.chunk_level,
                 };
-                let backend = Arc::new(storage::castore::CastoreBackend::new(path, chunk_config)?);
+                let backend = Arc::new(storage::castore::CastoreBackend::new(
+                    path.clone(),
+                    chunk_config,
+                )?);
+                storage_root = Some(path);
                 backend.spawn_warmup();
                 backend.spawn_recovery();
                 let gc_t = if let Some(gc_raw) = gc {
@@ -1068,9 +1077,9 @@ async fn cmd_serve(cli: Cli) -> color_eyre::Result<()> {
         storage_backend = if storage_str == "nix-store" {
             Box::new(storage::nix_store::NixStoreBackend::new())
         } else {
-            Box::new(storage::filesystem::FilesystemBackend::new(PathBuf::from(
-                storage_str,
-            )))
+            let p = PathBuf::from(&storage_str);
+            storage_root = Some(p.clone());
+            Box::new(storage::filesystem::FilesystemBackend::new(p))
         };
     }
 
@@ -1082,6 +1091,12 @@ async fn cmd_serve(cli: Cli) -> color_eyre::Result<()> {
     let admin_token = std::env::var("EKAPKGS_ADMIN_TOKEN")
         .ok()
         .filter(|s| !s.is_empty());
+
+    // Spawn the hourly cache-history snapshot loop if we have writable storage.
+    let history_db_path = storage_root
+        .as_ref()
+        .map(|root| root.join("cache_history.db"));
+
     let state = Arc::new(AppState {
         storage: storage_backend,
         signer,
@@ -1105,7 +1120,12 @@ async fn cmd_serve(cli: Cli) -> color_eyre::Result<()> {
         // full NAR body plus chunk compression buffers; 4 concurrent
         // uploads cap push memory at ~4 × 200 MiB typical.
         push_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
+        history_db_path: history_db_path.clone(),
     });
+
+    if let Some(root) = &storage_root {
+        history::spawn_history_loop(Arc::clone(&state), root);
+    }
 
     // Validate TLS config consistency.
     let use_tls = match (&tls_cert_path, &tls_key_path) {
