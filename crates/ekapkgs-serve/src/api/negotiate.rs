@@ -3,10 +3,11 @@ use std::sync::Arc;
 
 use ekapkgs_protocol::ekapkgs::v1::cache_service_server::CacheService;
 use ekapkgs_protocol::ekapkgs::v1::{
-    B3Digest, CaDirectoryData, CaPathMapping, CacheStatusRequest, CacheStatusResponse,
-    ChunkDownload, ChunkMeta, ChunkNegotiateRequest, ChunkNegotiateResponse, Compression,
-    DownloadBatch, DownloadPlan, FileChunkMapping, NarChunk, NegotiateRequest, NegotiateResponse,
-    PathManifestEntry, PushNegotiateRequest, PushNegotiateResponse, StreamNarsRequest,
+    B3Digest, CaDirectoryData, CaPathMapping, CacheHistoryRequest, CacheHistoryResponse,
+    CacheHistorySnapshot, CacheStatusRequest, CacheStatusResponse, ChunkDownload, ChunkMeta,
+    ChunkNegotiateRequest, ChunkNegotiateResponse, Compression, DownloadBatch, DownloadPlan,
+    FileChunkMapping, NarChunk, NegotiateRequest, NegotiateResponse, PathManifestEntry,
+    PushNegotiateRequest, PushNegotiateResponse, StreamNarsRequest,
 };
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
@@ -625,6 +626,48 @@ impl CacheService for NegotiateService {
         resp.gc_bytes_freed = metrics.gc_bytes_freed_total.get();
 
         Ok(Response::new(resp))
+    }
+
+    async fn cache_history(
+        &self,
+        _request: Request<CacheHistoryRequest>,
+    ) -> Result<Response<CacheHistoryResponse>, Status> {
+        let db_path = self
+            .state
+            .history_db_path
+            .as_ref()
+            .ok_or_else(|| Status::unavailable("no history available for this backend"))?;
+
+        let db_path = db_path.clone();
+        let snapshots =
+            tokio::task::spawn_blocking(move || crate::history::read_snapshots(&db_path))
+                .await
+                .map_err(|e| Status::internal(format!("join error: {e}")))?
+                .map_err(|e| Status::internal(format!("history read failed: {e}")))?;
+
+        let proto_snapshots: Vec<CacheHistorySnapshot> = snapshots
+            .into_iter()
+            .map(|s| CacheHistorySnapshot {
+                timestamp: s.timestamp,
+                backend: s.backend,
+                store_paths: s.store_paths,
+                total_nar_size: s.total_nar_size,
+                chunks: s.chunks,
+                chunk_bytes: s.chunk_bytes,
+                unique_files: s.unique_files,
+                total_file_chunk_refs: s.total_file_chunk_refs,
+                disk_bytes: s.disk_bytes,
+                inline_chunks: s.inline_chunks,
+                compressed_chunks: s.compressed_chunks,
+                gc_runs: s.gc_runs,
+                gc_paths_evicted: s.gc_paths_evicted,
+                gc_bytes_freed: s.gc_bytes_freed,
+            })
+            .collect();
+
+        Ok(Response::new(CacheHistoryResponse {
+            snapshots: proto_snapshots,
+        }))
     }
 }
 
