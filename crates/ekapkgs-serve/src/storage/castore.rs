@@ -131,6 +131,64 @@ impl DirCache {
     }
 }
 
+/// A lazily-initialized read-only SQLite connection slot.
+///
+/// The connection is opened on first lock, avoiding the cost of opening all
+/// pool connections at startup. Once open, the connection is reused.
+struct LazyReader {
+    inner: Mutex<Option<Connection>>,
+    db_path: PathBuf,
+}
+
+impl LazyReader {
+    fn new(db_path: PathBuf) -> Self {
+        Self {
+            inner: Mutex::new(None),
+            db_path,
+        }
+    }
+
+    /// Lock this slot, opening the connection on first use.
+    fn lock(&self) -> std::sync::MutexGuard<'_, Option<Connection>> {
+        let mut guard = self.inner.lock().expect("lazy reader lock");
+        if guard.is_none() {
+            match open_db_reader(&self.db_path) {
+                Ok(conn) => *guard = Some(conn),
+                Err(e) => {
+                    tracing::error!("failed to open reader connection: {e}");
+                },
+            }
+        }
+        guard
+    }
+
+    /// Try to lock without blocking.
+    fn try_lock(&self) -> Option<std::sync::MutexGuard<'_, Option<Connection>>> {
+        let mut guard = self.inner.try_lock().ok()?;
+        if guard.is_none() {
+            match open_db_reader(&self.db_path) {
+                Ok(conn) => *guard = Some(conn),
+                Err(e) => {
+                    tracing::error!("failed to open reader connection: {e}");
+                },
+            }
+        }
+        Some(guard)
+    }
+}
+
+/// Guard wrapping a lazily-opened reader connection. Implements
+/// `Deref<Target = Connection>` so callsites are unchanged.
+struct ReaderGuard<'a>(std::sync::MutexGuard<'a, Option<Connection>>);
+
+impl std::ops::Deref for ReaderGuard<'_> {
+    type Target = Connection;
+
+    fn deref(&self) -> &Connection {
+        self.0.as_ref().expect("reader connection not initialized")
+    }
+}
+
 /// How long cached storage stats remain valid before recomputation.
 const CACHE_STATS_TTL: std::time::Duration = std::time::Duration::from_secs(5 * 60);
 
@@ -154,7 +212,8 @@ pub struct CastoreBackend {
     db: Mutex<Connection>,
     /// Pool of read-only connections for concurrent query serving.
     /// SQLite WAL mode supports unlimited concurrent readers.
-    read_pool: Vec<Mutex<Connection>>,
+    /// Connections are opened lazily on first use to avoid startup overhead.
+    read_pool: Vec<LazyReader>,
     /// Atomic counter for lock-free round-robin reader selection.
     next_reader: AtomicUsize,
     /// LRU cache for directory blobs to avoid repeated SQLite reads
@@ -176,6 +235,10 @@ pub struct CastoreBackend {
     /// While `false`, bloom lookups are bypassed (return `true` = "maybe
     /// present") so the server can accept requests immediately at startup.
     bloom_ready: AtomicBool,
+    /// Set to `true` once the background `path_files` backfill completes.
+    /// While `false`, GC eviction is skipped since the reference table is
+    /// incomplete.
+    path_files_ready: AtomicBool,
     /// Path to a corrupt database that was moved aside at startup.
     /// When `Some`, background recovery will attempt to salvage rows from it.
     corrupt_path: Option<PathBuf>,
@@ -188,8 +251,11 @@ impl CastoreBackend {
         std::fs::create_dir_all(root.join("chunks"))?;
 
         let db_path = root.join("castore.db");
-        let OpenDbResult { conn, corrupt_path } = open_db(&db_path)?;
-        create_tables(&conn)?;
+        let OpenDbResult {
+            conn,
+            corrupt_path,
+            needs_backfill,
+        } = open_db(&db_path)?;
 
         // Migrate: move any existing on-disk directories into SQLite.
         let dirs_path = root.join("dirs");
@@ -197,17 +263,15 @@ impl CastoreBackend {
             migrate_dirs_to_db(&conn, &dirs_path)?;
         }
 
-        // Create a pool of read-only connections for concurrent queries.
-        // SQLite WAL mode supports unlimited concurrent readers. Cap the pool
-        // size to avoid excessive connection overhead on high-core-count machines.
+        // Create a pool of lazy read-only connection slots.
+        // Connections are opened on first use to avoid startup overhead.
         let num_readers = std::thread::available_parallelism()
             .map(std::num::NonZero::get)
             .unwrap_or(4)
             .clamp(4, 16);
         let mut read_pool = Vec::with_capacity(num_readers);
         for _ in 0..num_readers {
-            let reader = open_db_reader(&db_path)?;
-            read_pool.push(Mutex::new(reader));
+            read_pool.push(LazyReader::new(db_path.clone()));
         }
 
         tracing::info!("Chunk compression: level={}", chunk_config.level);
@@ -224,10 +288,17 @@ impl CastoreBackend {
             stats_cache: Mutex::new((Instant::now(), CacheStats::default())),
             chunk_compression: chunk_config,
             bloom_ready: AtomicBool::new(false),
+            path_files_ready: AtomicBool::new(!needs_backfill),
             corrupt_path,
         };
 
         Ok(backend)
+    }
+
+    /// Returns `true` when the `path_files` table is fully populated and
+    /// GC eviction can safely rely on it for reference checking.
+    pub fn path_files_ready(&self) -> bool {
+        self.path_files_ready.load(Ordering::Acquire)
     }
 
     /// Spawn a background thread to build bloom filters and compute initial
@@ -307,22 +378,109 @@ impl CastoreBackend {
             .expect("failed to spawn recovery thread");
     }
 
+    /// Spawn a background thread to backfill the `path_files` table from
+    /// existing `cas_paths` root nodes.  Until this completes, GC eviction
+    /// is skipped since the reference table is incomplete.
+    pub fn spawn_backfill(self: &Arc<Self>) {
+        if self.path_files_ready.load(Ordering::Acquire) {
+            return;
+        }
+        let backend = Arc::clone(self);
+        std::thread::Builder::new()
+            .name("cas-backfill".into())
+            .spawn(move || {
+                let t = Instant::now();
+                tracing::info!("starting background path_files backfill");
+
+                const BATCH_SIZE: usize = 1_000;
+                let mut offset: usize = 0;
+                let mut total: usize = 0;
+
+                loop {
+                    // Read a batch of paths from a reader connection.
+                    let batch: Vec<(String, Vec<u8>)> = {
+                        let db = backend.acquire_reader();
+                        let mut stmt = db
+                            .prepare("SELECT hash, root_node FROM cas_paths LIMIT ?1 OFFSET ?2")
+                            .unwrap_or_else(|e| panic!("backfill prepare: {e}"));
+                        let rows = stmt
+                            .query_map(params![BATCH_SIZE as i64, offset as i64], |row| {
+                                Ok((row.get(0)?, row.get(1)?))
+                            })
+                            .unwrap_or_else(|e| panic!("backfill query: {e}"));
+                        rows.filter_map(std::result::Result::ok).collect()
+                    };
+
+                    if batch.is_empty() {
+                        break;
+                    }
+
+                    // Process and write through the write connection in a
+                    // short transaction.
+                    {
+                        let db = backend.db.lock().expect("backfill write lock");
+                        let tx = db.unchecked_transaction().expect("backfill tx");
+                        for (hash, root_bytes) in &batch {
+                            if let Ok(root_node) = CaNode::decode(root_bytes.as_slice()) {
+                                let mut file_digests = HashSet::new();
+                                CastoreBackend::collect_file_digests_from_tree(
+                                    &tx,
+                                    &root_node,
+                                    &mut file_digests,
+                                );
+                                for fd in &file_digests {
+                                    let _ = tx.execute(
+                                        "INSERT OR IGNORE INTO path_files (path_hash, \
+                                         file_digest) VALUES (?1, ?2)",
+                                        params![hash, fd.as_slice()],
+                                    );
+                                }
+                            }
+                        }
+                        tx.commit().expect("backfill commit");
+                    }
+
+                    total += batch.len();
+                    offset += batch.len();
+
+                    if batch.len() < BATCH_SIZE {
+                        break;
+                    }
+                }
+
+                backend.path_files_ready.store(true, Ordering::Release);
+                tracing::info!(
+                    "path_files backfill complete: {total} paths in {:?}",
+                    t.elapsed()
+                );
+            })
+            .expect("failed to spawn backfill thread");
+    }
+
+    /// Write the clean-shutdown sentinel so the next startup can skip the
+    /// expensive integrity check.
+    pub fn mark_clean_shutdown(&self) {
+        let db = self.db.lock().expect("mark_clean_shutdown lock");
+        mark_clean(&db);
+    }
+
     /// Acquire a read-only connection from the pool.
     ///
     /// Uses an atomic counter for lock-free round-robin selection,
     /// avoiding the overhead of hashing thread IDs. Falls back to
-    /// blocking if all connections are busy.
-    fn acquire_reader(&self) -> std::sync::MutexGuard<'_, Connection> {
+    /// blocking if all connections are busy. Connections are opened
+    /// lazily on first use.
+    fn acquire_reader(&self) -> ReaderGuard<'_> {
         let start = self.next_reader.fetch_add(1, Ordering::Relaxed) % self.read_pool.len();
         // Try each connection starting from the round-robin index.
         for i in 0..self.read_pool.len() {
             let idx = (start + i) % self.read_pool.len();
-            if let Ok(guard) = self.read_pool[idx].try_lock() {
-                return guard;
+            if let Some(guard) = self.read_pool[idx].try_lock() {
+                return ReaderGuard(guard);
             }
         }
         // All readers busy — block on the starting one.
-        self.read_pool[start].lock().expect("read pool lock")
+        ReaderGuard(self.read_pool[start].lock())
     }
 
     /// Get a chunk by its blake3 digest (as 32 raw bytes).
@@ -1746,6 +1904,10 @@ impl StorageBackend for CastoreBackend {
     fn get_cas_root(&self, hash: &str) -> color_eyre::Result<Option<Vec<u8>>> {
         Ok(self.get_root_node(hash)?.map(|n| n.encode_to_vec()))
     }
+
+    fn on_shutdown(&self) {
+        self.mark_clean_shutdown();
+    }
 }
 
 impl ChunkReader for CastoreBackend {
@@ -1865,6 +2027,10 @@ impl StorageBackend for std::sync::Arc<CastoreBackend> {
     fn get_cas_root(&self, hash: &str) -> color_eyre::Result<Option<Vec<u8>>> {
         (**self).get_cas_root(hash)
     }
+
+    fn on_shutdown(&self) {
+        (**self).on_shutdown();
+    }
 }
 
 // --- Database helpers ---
@@ -1892,66 +2058,115 @@ struct OpenDbResult {
     /// When set, the corrupt DB was renamed here and background recovery should
     /// be attempted.
     corrupt_path: Option<PathBuf>,
+    /// When `true`, the `path_files` table needs to be backfilled in the
+    /// background.
+    needs_backfill: bool,
 }
+
+/// Standard PRAGMAs applied to every writable connection.
+const WRITER_PRAGMAS: &str = "PRAGMA journal_mode=WAL;PRAGMA synchronous=FULL;PRAGMA \
+                              foreign_keys=ON;PRAGMA busy_timeout=5000;PRAGMA \
+                              cache_size=-65536;PRAGMA mmap_size=1073741824";
 
 fn open_db(path: &Path) -> color_eyre::Result<OpenDbResult> {
     tracing::log::info!("Opening database at {}", path.display());
     let conn = Connection::open(path)?;
-    conn.execute_batch(
-        "PRAGMA journal_mode=WAL;PRAGMA synchronous=FULL;PRAGMA foreign_keys=ON;PRAGMA \
-         busy_timeout=5000;PRAGMA cache_size=-65536;PRAGMA mmap_size=1073741824",
-    )?;
+    conn.execute_batch(WRITER_PRAGMAS)?;
 
-    // Detect corruption early rather than discovering it mid-operation.
-    let integrity: String = conn.query_row("PRAGMA quick_check", [], |row| row.get(0))?;
-    if integrity != "ok" {
-        tracing::log::warn!(
-            "database corruption detected in {}: {integrity}",
-            path.display()
-        );
+    create_tables(&conn)?;
 
-        // Close the corrupt connection before renaming.
-        drop(conn);
+    // Use a lightweight clean-shutdown sentinel instead of a full
+    // `PRAGMA quick_check` (which scans every page). The `_meta` table
+    // stores `clean_shutdown = 1` when the previous instance exited
+    // normally. If the flag is missing or 0, the previous instance
+    // crashed and we run the expensive integrity check only then.
+    let clean: bool = conn
+        .query_row(
+            "SELECT value FROM _meta WHERE key = 'clean_shutdown'",
+            [],
+            |row| row.get::<_, i64>(0).map(|v| v == 1),
+        )
+        .unwrap_or(false);
 
-        // Move the corrupt database (and WAL/SHM sidecars) aside so we can
-        // start fresh, then attempt background recovery of salvageable rows.
-        let ts = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        let path_str = path.as_os_str().to_string_lossy();
-        let mut corrupt_main = None;
-        for suffix in &["", "-wal", "-shm"] {
-            let src = PathBuf::from(format!("{path_str}{suffix}"));
-            if src.exists() {
-                let dst = PathBuf::from(format!("{path_str}{suffix}.corrupt-{ts}"));
-                tracing::log::warn!("renaming {} -> {}", src.display(), dst.display());
-                std::fs::rename(&src, &dst)?;
-                if suffix.is_empty() {
-                    corrupt_main = Some(dst);
+    if clean {
+        tracing::info!("clean shutdown detected — skipping integrity check");
+    } else {
+        tracing::info!("no clean-shutdown sentinel — running integrity check");
+        let integrity: String = conn.query_row("PRAGMA quick_check", [], |row| row.get(0))?;
+        if integrity != "ok" {
+            tracing::log::warn!(
+                "database corruption detected in {}: {integrity}",
+                path.display()
+            );
+
+            // Close the corrupt connection before renaming.
+            drop(conn);
+
+            // Move the corrupt database (and WAL/SHM sidecars) aside so we
+            // can start fresh, then attempt background recovery.
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let path_str = path.as_os_str().to_string_lossy();
+            let mut corrupt_main = None;
+            for suffix in &["", "-wal", "-shm"] {
+                let src = PathBuf::from(format!("{path_str}{suffix}"));
+                if src.exists() {
+                    let dst = PathBuf::from(format!("{path_str}{suffix}.corrupt-{ts}"));
+                    tracing::log::warn!("renaming {} -> {}", src.display(), dst.display());
+                    std::fs::rename(&src, &dst)?;
+                    if suffix.is_empty() {
+                        corrupt_main = Some(dst);
+                    }
                 }
             }
-        }
 
-        tracing::log::info!(
-            "re-creating database at {} after corruption recovery",
-            path.display()
-        );
-        let conn = Connection::open(path)?;
-        conn.execute_batch(
-            "PRAGMA journal_mode=WAL;PRAGMA synchronous=FULL;PRAGMA foreign_keys=ON;PRAGMA \
-             busy_timeout=5000;PRAGMA cache_size=-65536;PRAGMA mmap_size=1073741824",
-        )?;
-        return Ok(OpenDbResult {
-            conn,
-            corrupt_path: corrupt_main,
-        });
+            tracing::log::info!(
+                "re-creating database at {} after corruption recovery",
+                path.display()
+            );
+            let conn = Connection::open(path)?;
+            conn.execute_batch(WRITER_PRAGMAS)?;
+            create_tables(&conn)?;
+            mark_dirty(&conn);
+            return Ok(OpenDbResult {
+                conn,
+                corrupt_path: corrupt_main,
+                needs_backfill: false,
+            });
+        }
     }
+
+    // Clear the sentinel so a crash before the next clean shutdown is
+    // detected on the following startup.
+    mark_dirty(&conn);
+
+    let needs_backfill = path_files_needs_backfill(&conn);
 
     Ok(OpenDbResult {
         conn,
         corrupt_path: None,
+        needs_backfill,
     })
+}
+
+/// Set the clean-shutdown sentinel so the next startup skips the integrity
+/// check. Called from `CastoreBackend::mark_clean_shutdown`.
+fn mark_clean(conn: &Connection) {
+    let _ = conn.execute(
+        "INSERT OR REPLACE INTO _meta (key, value) VALUES ('clean_shutdown', 1)",
+        [],
+    );
+}
+
+/// Clear the clean-shutdown sentinel. Called at startup so a crash before the
+/// next `mark_clean` is detected.
+fn mark_dirty(conn: &Connection) {
+    let _ = conn.execute(
+        "INSERT OR REPLACE INTO _meta (key, value) VALUES ('clean_shutdown', 0)",
+        [],
+    );
 }
 
 struct RecoveryStats {
@@ -2374,7 +2589,11 @@ fn recover_from_corrupt(
 
 fn create_tables(conn: &Connection) -> color_eyre::Result<()> {
     conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS cas_paths (
+        "CREATE TABLE IF NOT EXISTS _meta (
+            key   TEXT PRIMARY KEY,
+            value INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS cas_paths (
             hash         TEXT PRIMARY KEY,
             store_path   TEXT NOT NULL,
             nar_hash     TEXT NOT NULL,
@@ -2428,78 +2647,23 @@ fn create_tables(conn: &Connection) -> color_eyre::Result<()> {
     }
 
     ensure_compression_columns(conn)?;
-    ensure_path_files_table(conn)?;
 
     Ok(())
 }
 
-/// Ensure the `path_files` table exists and is populated.
-///
-/// On fresh databases the table is created by `create_tables`. On existing
-/// databases that were created before this table existed, we create it here
-/// and backfill from existing `cas_paths` root nodes.
-fn ensure_path_files_table(conn: &Connection) -> color_eyre::Result<()> {
-    let table_exists: bool = conn
-        .query_row(
-            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='path_files')",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap_or(false);
-
-    if table_exists {
-        // Check if already populated — skip the expensive backfill if so.
-        let count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM path_files", [], |row| row.get(0))
-            .unwrap_or(0);
-        if count > 0 {
-            return Ok(());
-        }
-    } else {
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS path_files (
-                path_hash    TEXT NOT NULL,
-                file_digest  BLOB NOT NULL,
-                PRIMARY KEY (path_hash, file_digest)
-            );
-            CREATE INDEX IF NOT EXISTS idx_path_files_file_digest ON path_files(file_digest);",
-        )?;
+/// Returns `true` when the `path_files` table exists but is empty while
+/// `cas_paths` has rows — i.e. a backfill is needed.
+fn path_files_needs_backfill(conn: &Connection) -> bool {
+    let pf_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM path_files", [], |row| row.get(0))
+        .unwrap_or(0);
+    if pf_count > 0 {
+        return false;
     }
-
-    // Backfill: walk all existing cas_paths root_nodes to populate path_files.
-    let mut stmt = conn.prepare("SELECT hash, root_node FROM cas_paths")?;
-    let rows: Vec<(String, Vec<u8>)> = stmt
-        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
-        .filter_map(std::result::Result::ok)
-        .collect();
-    drop(stmt);
-
-    if rows.is_empty() {
-        return Ok(());
-    }
-
-    tracing::info!(
-        "Backfilling path_files table from {} existing paths",
-        rows.len()
-    );
-
-    let tx = conn.unchecked_transaction()?;
-    for (hash, root_bytes) in &rows {
-        if let Ok(root_node) = CaNode::decode(root_bytes.as_slice()) {
-            let mut file_digests = HashSet::new();
-            CastoreBackend::collect_file_digests_from_tree(&tx, &root_node, &mut file_digests);
-            for fd in &file_digests {
-                let _ = tx.execute(
-                    "INSERT OR IGNORE INTO path_files (path_hash, file_digest) VALUES (?1, ?2)",
-                    params![hash, fd.as_slice()],
-                );
-            }
-        }
-    }
-    tx.commit()?;
-    tracing::info!("path_files backfill complete");
-
-    Ok(())
+    let cp_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM cas_paths", [], |row| row.get(0))
+        .unwrap_or(0);
+    cp_count > 0
 }
 
 /// Migrate chunk compression columns to the `zstd_level` scheme.

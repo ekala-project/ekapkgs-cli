@@ -1014,6 +1014,7 @@ async fn cmd_serve(cli: Cli) -> color_eyre::Result<()> {
                 storage_root = Some(path);
                 backend.spawn_warmup();
                 backend.spawn_recovery();
+                backend.spawn_backfill();
                 let gc_t = if let Some(gc_raw) = gc {
                     let max_size = gc::parse_byte_size(&gc_raw.max_size)?;
                     let target_size = gc_raw
@@ -1157,18 +1158,23 @@ async fn cmd_serve(cli: Cli) -> color_eyre::Result<()> {
     .max_encoding_message_size(64 * 1024 * 1024);
 
     let request_timeout = std::time::Duration::from_secs(request_timeout_secs);
-    let app = build_http_router(state, compression_config, enable_metrics, request_timeout)
-        .route_service("/ekapkgs.v1.CacheService/Negotiate", grpc_service.clone())
-        .route_service(
-            "/ekapkgs.v1.CacheService/NegotiateChunks",
-            grpc_service.clone(),
-        )
-        .route_service("/ekapkgs.v1.CacheService/StreamNars", grpc_service.clone())
-        .route_service(
-            "/ekapkgs.v1.CacheService/PushNegotiate",
-            grpc_service.clone(),
-        )
-        .route_service("/ekapkgs.v1.CacheService/CacheStatus", grpc_service);
+    let app = build_http_router(
+        Arc::clone(&state),
+        compression_config,
+        enable_metrics,
+        request_timeout,
+    )
+    .route_service("/ekapkgs.v1.CacheService/Negotiate", grpc_service.clone())
+    .route_service(
+        "/ekapkgs.v1.CacheService/NegotiateChunks",
+        grpc_service.clone(),
+    )
+    .route_service("/ekapkgs.v1.CacheService/StreamNars", grpc_service.clone())
+    .route_service(
+        "/ekapkgs.v1.CacheService/PushNegotiate",
+        grpc_service.clone(),
+    )
+    .route_service("/ekapkgs.v1.CacheService/CacheStatus", grpc_service);
 
     // Check for systemd socket activation.
     let inherited_listener = try_socket_activation()?;
@@ -1220,6 +1226,10 @@ async fn cmd_serve(cli: Cli) -> color_eyre::Result<()> {
         spawn_watchdog();
         axum::serve(listener, app).await?;
     };
+
+    // Mark the storage backend for clean shutdown so the next startup can
+    // skip expensive integrity checks.
+    state.storage.on_shutdown();
 
     Ok(())
 }
