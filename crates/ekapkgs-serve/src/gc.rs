@@ -204,6 +204,17 @@ fn cas_maybe_run_gc(
         return Ok(());
     }
 
+    // Don't evict while the path_files backfill is still running —
+    // reference tracking is incomplete and we could delete chunks that
+    // are still referenced.
+    if !backend.path_files_ready() {
+        tracing::info!(
+            "CAS GC deferred: path_files backfill in progress (store is {})",
+            format_bytes(total),
+        );
+        return Ok(());
+    }
+
     tracing::info!(
         "CAS GC triggered: store is {} ({} over limit)",
         format_bytes(total),

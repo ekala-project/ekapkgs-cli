@@ -239,6 +239,10 @@ pub trait StorageBackend: Send + Sync {
     fn get_cas_root(&self, _hash: &str) -> color_eyre::Result<Option<Vec<u8>>> {
         Ok(None)
     }
+
+    /// Called during graceful shutdown. Backends can use this to write
+    /// clean-shutdown markers or flush pending state.
+    fn on_shutdown(&self) {}
 }
 
 /// `Write` adapter that buffers into `chunk_size` blocks and sends each
