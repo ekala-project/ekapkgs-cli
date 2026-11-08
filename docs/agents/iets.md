@@ -81,7 +81,9 @@ Run with `RUST_LOG=ekapkgs_nix=debug` to see which program each command used.
 
 `template` prefetches source hashes with `iets prefetch --unpack URL`, which
 prints the SRI hash and adds nothing to the store. It falls back to
-`nix-prefetch-url` plus `nix hash to-sri`.
+`nix-prefetch-url` plus `nix hash to-sri`. When the project type must be
+auto-detected, `template` needs the unpacked tree, so it skips iets and runs
+`nix-prefetch-url --print-path` directly.
 
 ekapkgs does not use `nix-eval-jobs`. If it ever needs jobset evaluation,
 `iets eval-jobs` is a drop-in replacement.

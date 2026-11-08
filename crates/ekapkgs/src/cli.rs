@@ -1618,7 +1618,8 @@ pub enum TemplateCommand {
 
 #[derive(clap::Args)]
 pub struct TemplateOpts {
-    /// Output path for the generated expression.
+    /// Output path for the generated expression. If a directory is given,
+    /// writes `default.nix` inside it (and `auto` detects from that directory).
     #[arg(default_value = "default.nix")]
     pub path: String,
 
@@ -1634,7 +1635,8 @@ pub struct TemplateOpts {
     #[arg(long)]
     pub description: Option<String>,
 
-    /// Fetch source from a URL (GitHub/GitLab).
+    /// Fetch source from a URL (GitHub/GitLab). With `auto`, the downloaded
+    /// source is used to detect the project type.
     #[arg(long)]
     pub from_url: Option<String>,
 
