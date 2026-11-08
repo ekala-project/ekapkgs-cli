@@ -134,8 +134,18 @@ pub struct CompressionConfig {
     #[serde(default = "default_max_ldm_encoders")]
     pub max_ldm_encoders: u32,
     /// Zstd level for on-disk chunk storage (CAS). Default: 3.
+    /// Ignored when `compress_chunks` is false.
     #[serde(default = "default_chunk_level")]
     pub chunk_level: i32,
+    /// Compress individual CAS chunks on disk with zstd. Default: true.
+    /// Disabling reduces CPU/memory at the cost of higher disk usage.
+    #[serde(default = "default_true")]
+    pub compress_chunks: bool,
+    /// Compress reconstructed NARs before serving (Compression: zstd in
+    /// narinfo). Default: false. When enabled, narinfo URLs use `.nar.zst`
+    /// and FileHash/FileSize reflect the compressed output.
+    #[serde(default)]
+    pub compress_nars: bool,
 }
 
 impl Default for CompressionConfig {
@@ -147,6 +157,8 @@ impl Default for CompressionConfig {
             window_log: 0,
             max_ldm_encoders: 16,
             chunk_level: 3,
+            compress_chunks: true,
+            compress_nars: false,
         }
     }
 }

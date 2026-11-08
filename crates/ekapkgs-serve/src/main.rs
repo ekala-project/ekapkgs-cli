@@ -1006,10 +1006,12 @@ async fn cmd_serve(cli: Cli) -> color_eyre::Result<()> {
             config::StorageConfig::Castore { path, gc } => {
                 let chunk_config = storage::castore::ChunkCompressionConfig {
                     level: config.compression.chunk_level,
+                    enabled: config.compression.compress_chunks,
                 };
                 let backend = Arc::new(storage::castore::CastoreBackend::new(
                     path.clone(),
                     chunk_config,
+                    config.compression.compress_nars,
                 )?);
                 storage_root = Some(path);
                 backend.spawn_warmup();
