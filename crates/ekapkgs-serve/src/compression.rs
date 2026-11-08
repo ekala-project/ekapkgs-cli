@@ -314,6 +314,15 @@ fn should_compress(
     if response.headers().contains_key(header::CONTENT_ENCODING) {
         return false;
     }
+    // Skip content types that are already compressed file formats.
+    let is_precompressed = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|ct| ct == "application/zstd" || ct == "application/x-xz");
+    if is_precompressed {
+        return false;
+    }
 
     let status = response.status();
     // Skip 206 Partial Content.

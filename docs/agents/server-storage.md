@@ -42,6 +42,17 @@ The `castore` storage backend decomposes NARs into a content-addressed Merkle tr
 3. Directories verified against expected blake3 digest on load
 4. Serialize back to NAR bytes via `write_nar()`
 
+### Compression options
+
+Two independent compression knobs under `[compression]` in the server config:
+
+- **`compress_chunks`** (default: `true`) — zstd-compresses individual CAS chunks on disk. Existing compressed chunks continue to decompress correctly when this is disabled; only newly written chunks are affected.
+  - **When to disable**: high-throughput ingest where CPU is the bottleneck, or when disk space is cheap and you want to minimize write amplification and memory pressure from per-chunk zstd encoder contexts.
+
+- **`compress_nars`** (default: `false`) — zstd-compresses reconstructed NAR files before serving. When enabled, narinfo advertises `Compression: zstd` and URLs use `.nar.zst`.
+  - **When to disable** (keep default): clients and server are on the same LAN or localhost, where bandwidth is plentiful and compression just adds CPU overhead. Also unnecessary when the HTTP compression middleware (`[compression] enable = true`) already handles transport-level zstd, since clients that accept `Accept-Encoding: zstd` get compressed responses either way.
+  - **When to enable**: serving clients over WAN or metered connections where narinfo-level compression lets Nix's own `builtins.fetchurl` decompress the NAR directly, without relying on HTTP middleware. Also useful when clients do not send `Accept-Encoding: zstd` (e.g. stock Nix without the ekapkgs client).
+
 ### Chunk-level negotiation (`NegotiateChunks` RPC)
 
 Server-side (`api/negotiate.rs`): walks requested paths' Merkle trees and returns root nodes, directory data, file-chunk mappings, and only the chunks the client is missing. Request size capped (10K want, 10K have, 500K have_chunks).

@@ -53,12 +53,16 @@ const DEFAULT_CHUNK_LEVEL: i32 = 3;
 pub struct ChunkCompressionConfig {
     /// Zstd compression level for on-disk chunks. Default: 3.
     pub level: i32,
+    /// Whether to compress chunks at all. When false, all chunks are stored
+    /// raw regardless of `level`.
+    pub enabled: bool,
 }
 
 impl Default for ChunkCompressionConfig {
     fn default() -> Self {
         Self {
             level: DEFAULT_CHUNK_LEVEL,
+            enabled: true,
         }
     }
 }
@@ -231,6 +235,8 @@ pub struct CastoreBackend {
     stats_cache: Mutex<(Instant, CacheStats)>,
     /// Chunk compression configuration.
     chunk_compression: ChunkCompressionConfig,
+    /// Whether to compress reconstructed NARs (Compression: zstd in narinfo).
+    compress_nars: bool,
     /// Set to `true` once the background bloom filter warmup completes.
     /// While `false`, bloom lookups are bypassed (return `true` = "maybe
     /// present") so the server can accept requests immediately at startup.
@@ -246,7 +252,11 @@ pub struct CastoreBackend {
 
 impl CastoreBackend {
     /// Create a new CAS backend rooted at the given directory.
-    pub fn new(root: PathBuf, chunk_config: ChunkCompressionConfig) -> color_eyre::Result<Self> {
+    pub fn new(
+        root: PathBuf,
+        chunk_config: ChunkCompressionConfig,
+        compress_nars: bool,
+    ) -> color_eyre::Result<Self> {
         tracing::log::info!("Creating CAS store at directory {}", root.display());
         std::fs::create_dir_all(root.join("chunks"))?;
 
@@ -274,7 +284,12 @@ impl CastoreBackend {
             read_pool.push(LazyReader::new(db_path.clone()));
         }
 
-        tracing::info!("Chunk compression: level={}", chunk_config.level);
+        tracing::info!(
+            "Chunk compression: enabled={}, level={}; NAR compression: {}",
+            chunk_config.enabled,
+            chunk_config.level,
+            compress_nars,
+        );
 
         let backend = Self {
             root,
@@ -287,6 +302,7 @@ impl CastoreBackend {
             // Seed with epoch so the first call to cache_stats() triggers a refresh.
             stats_cache: Mutex::new((Instant::now(), CacheStats::default())),
             chunk_compression: chunk_config,
+            compress_nars,
             bloom_ready: AtomicBool::new(false),
             path_files_ready: AtomicBool::new(!needs_backfill),
             corrupt_path,
@@ -968,19 +984,20 @@ impl CastoreBackend {
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent)?;
 
-                // Choose compression level: try the dedicated pool first,
-                // fall back to overflow level if the pool is saturated.
-                let (compressed, level) = self.compress_chunk(data)?;
-
-                let (bytes_to_write, zstd_level) = if compressed.len() < data.len() {
-                    (compressed.as_slice(), Some(level))
+                let (bytes_to_write, zstd_level) = if self.chunk_compression.enabled {
+                    let (compressed, level) = self.compress_chunk(data)?;
+                    if compressed.len() < data.len() {
+                        (compressed, Some(level))
+                    } else {
+                        // Incompressible: store raw, mark NULL permanently.
+                        (data.to_vec(), None)
+                    }
                 } else {
-                    // Incompressible: store raw, mark NULL permanently.
-                    (data, None)
+                    (data.to_vec(), None)
                 };
 
                 let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
-                tmp.write_all(bytes_to_write)?;
+                tmp.write_all(&bytes_to_write)?;
                 match tmp.persist(&path) {
                     Ok(_) => {},
                     Err(e) if e.error.kind() == std::io::ErrorKind::AlreadyExists => {},
@@ -1462,10 +1479,23 @@ impl CastoreBackend {
         Ok(())
     }
 
+    /// Adjust narinfo fields when NAR compression is enabled: set the URL
+    /// to `.nar.zst` and `Compression` to `zstd`.
+    fn apply_nar_compression(&self, ni: &mut NarInfo, hash: &str) {
+        if self.compress_nars {
+            ni.url = format!("nar/{hash}.nar.zst");
+            ni.compression = "zstd".to_owned();
+        }
+    }
+
     /// Load narinfo metadata from SQLite.
     fn load_metadata(&self, hash: &str) -> color_eyre::Result<Option<NarInfo>> {
         let db = self.acquire_reader();
-        Self::load_metadata_with_conn(&db, hash)
+        let mut ni = Self::load_metadata_with_conn(&db, hash)?;
+        if let Some(ref mut narinfo) = ni {
+            self.apply_nar_compression(narinfo, hash);
+        }
+        Ok(ni)
     }
 
     /// Load narinfo metadata using an existing connection (for use inside
@@ -1590,7 +1620,7 @@ impl CastoreBackend {
                     sigs_str.split('\n').map(String::from).collect()
                 };
 
-                let ni = NarInfo {
+                let mut ni = NarInfo {
                     store_path,
                     url: format!("nar/{hash}.nar"),
                     compression: "none".to_owned(),
@@ -1607,6 +1637,7 @@ impl CastoreBackend {
                     signatures,
                     ca: if ca.is_empty() { None } else { Some(ca) },
                 };
+                self.apply_nar_compression(&mut ni, &hash);
 
                 found_set.insert(hash.clone());
                 available.push((hash, ni));
@@ -1782,7 +1813,8 @@ impl StorageBackend for CastoreBackend {
         file_path: &str,
         w: &mut dyn std::io::Write,
     ) -> color_eyre::Result<bool> {
-        // Extract hash from NAR file path (e.g., "nar/abc123.nar").
+        // Extract hash from NAR file path (e.g., "nar/abc123.nar" or
+        // "nar/abc123.nar.zst").
         let filename = file_path.rsplit('/').next().unwrap_or(file_path);
         let hash = filename.split('.').next().unwrap_or(filename);
 
@@ -1790,12 +1822,19 @@ impl StorageBackend for CastoreBackend {
             return Ok(false);
         };
 
-        // Stream the NAR directly from CAS chunks — only one file's data is
-        // in memory at a time. Use a BufWriter to coalesce the many small
-        // NAR framing writes into larger OS write calls.
-        let mut bw = std::io::BufWriter::with_capacity(256 * 1024, w);
-        write_nar_streaming(&mut bw, &root_node, self)?;
-        bw.flush()?;
+        if self.compress_nars {
+            let encoder = zstd::Encoder::new(w, self.chunk_compression.level)?;
+            let mut bw = std::io::BufWriter::with_capacity(256 * 1024, encoder);
+            write_nar_streaming(&mut bw, &root_node, self)?;
+            let encoder = bw
+                .into_inner()
+                .map_err(|e| color_eyre::eyre::eyre!("flush error: {}", e.error()))?;
+            encoder.finish()?;
+        } else {
+            let mut bw = std::io::BufWriter::with_capacity(256 * 1024, w);
+            write_nar_streaming(&mut bw, &root_node, self)?;
+            bw.flush()?;
+        }
         Ok(true)
     }
 
@@ -2762,9 +2801,12 @@ mod tests {
 
     fn setup_backend() -> (tempfile::TempDir, CastoreBackend) {
         let dir = tempfile::TempDir::new().unwrap();
-        let backend =
-            CastoreBackend::new(dir.path().to_path_buf(), ChunkCompressionConfig::default())
-                .unwrap();
+        let backend = CastoreBackend::new(
+            dir.path().to_path_buf(),
+            ChunkCompressionConfig::default(),
+            false,
+        )
+        .unwrap();
         (dir, backend)
     }
 
