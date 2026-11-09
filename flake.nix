@@ -47,7 +47,10 @@
     // {
       overlays.default = localOverlay;
 
-      nixosModules.default = import ./nix/module.nix;
-      nixosModules.ekapkgs-serve = import ./nix/module.nix;
+      nixosModules.default = self.nixosModules.ekapkgs-serve;
+      nixosModules.ekapkgs-serve = {
+        imports = [ ./nix/module.nix ];
+        nixpkgs.overlays = [ localOverlay ];
+      };
     };
 }

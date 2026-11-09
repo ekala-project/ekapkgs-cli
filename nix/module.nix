@@ -12,6 +12,12 @@ let
   configFile = settingsFormat.generate "ekapkgs-serve.toml" cfg.settings;
 
   storagePath = cfg.settings.storage.path or null;
+
+  credentialPath = "/run/credentials/ekapkgs-serve.service/signing-key";
+
+  generatedKeyDir = "/var/lib/${cfg.stateDirectory}-keys";
+  generatedKeyFile = "${generatedKeyDir}/secret.key";
+  signingKeyFile = if cfg.signingKeyFile != null then cfg.signingKeyFile else generatedKeyFile;
 in
 {
   options.services.ekapkgs-serve = {
@@ -43,8 +49,13 @@ in
     };
 
     signingKeyFile = lib.mkOption {
-      type = lib.types.path;
-      description = "Path to the nix signing secret key file.";
+      type = lib.types.nullOr lib.types.path;
+      default = null;
+      description = ''
+        Path to the nix signing secret key file. When null, a key named
+        `''${config.networking.hostName}-ekapkgs-1` is generated on first start
+        under /var/lib/''${stateDirectory}-keys.
+      '';
     };
 
     environmentFile = lib.mkOption {
@@ -80,6 +91,10 @@ in
   };
 
   config = lib.mkIf cfg.enable {
+    # Required by the config schema; the --signing-key flag (populated via
+    # LoadCredential) is what the server actually reads.
+    services.ekapkgs-serve.settings.signing.secret_key_file = lib.mkDefault credentialPath;
+
     environment.systemPackages = [
       cfg.package
       pkgs.ekapkgs
@@ -113,6 +128,28 @@ in
       };
     };
 
+    # ReadWritePaths entries must exist before the mount namespace is set up,
+    # which happens before systemd would let the service create them.
+    systemd.tmpfiles.rules = lib.optional (
+      storagePath != null
+    ) "d ${storagePath} 0750 ${cfg.user} ${cfg.group} -";
+
+    systemd.services.ekapkgs-serve-keygen = lib.mkIf (cfg.signingKeyFile == null) {
+      description = "Generate ekapkgs-serve signing key";
+      wantedBy = [ "ekapkgs-serve.service" ];
+      before = [ "ekapkgs-serve.service" ];
+      unitConfig.ConditionPathExists = "!${generatedKeyFile}";
+      serviceConfig.Type = "oneshot";
+      script = ''
+        install -d -m 0700 ${generatedKeyDir}
+        umask 0077
+        ${lib.getExe config.nix.package} --extra-experimental-features nix-command \
+          key generate-secret --key-name ${config.networking.hostName}-ekapkgs-1 \
+          > ${generatedKeyFile}.tmp
+        mv ${generatedKeyFile}.tmp ${generatedKeyFile}
+      '';
+    };
+
     systemd.services.ekapkgs-serve = {
       description = "ekapkgs binary cache server";
       wantedBy = lib.mkIf (!cfg.socketActivation) [ "multi-user.target" ];
@@ -122,13 +159,13 @@ in
       serviceConfig = {
         Type = "notify";
         WatchdogSec = 15;
-        LoadCredential = [ "signing-key:${cfg.signingKeyFile}" ];
+        LoadCredential = [ "signing-key:${signingKeyFile}" ];
         ExecStart = lib.escapeShellArgs [
           "${cfg.package}/bin/ekapkgs-serve"
           "--config"
           configFile
           "--signing-key"
-          "%d/signing-key"
+          credentialPath
         ];
         Restart = "on-failure";
         RestartSec = "10s";
