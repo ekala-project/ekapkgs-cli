@@ -3,6 +3,7 @@ use std::path::PathBuf;
 
 use ekapkgs_nix::installable::Installable;
 use ekapkgs_nix::{NixCommand, eval, store};
+use ekapkgs_protocol::ekapkgs::v1::PathManifestEntry;
 use futures::StreamExt;
 
 use crate::cli::{AuthCommand, CacheCommand};
@@ -853,40 +854,51 @@ fn cmd_pull(paths: &[String], cache_name: Option<&str>) -> color_eyre::Result<()
 
     let (server_url, _token) = resolve_cache_for_action(&config, cache_name)?;
 
-    // Resolve all inputs to closure paths and partition.
-    let mut all_closure_paths = Vec::new();
+    // Resolve inputs to their own output paths. Their runtime closure comes
+    // from the server's narinfo references, so build-time dependencies in the
+    // derivation graph are never considered.
+    let mut outputs = Vec::new();
     for input in paths {
         let inst = Installable::new(input);
-        let closure = eval::derivation_closure_paths(&inst)?;
-        all_closure_paths.extend(closure);
+        outputs.extend(eval::output_paths(&inst)?);
     }
-    all_closure_paths.sort();
-    all_closure_paths.dedup();
+    outputs.sort();
+    outputs.dedup();
 
-    let (have, want) = store::partition_local(&all_closure_paths)?;
+    // A valid path's closure is always valid, so only missing outputs need
+    // their closure resolved.
+    let (local_outputs, missing_outputs) = store::partition_local(&outputs)?;
 
-    if want.is_empty() {
-        tracing::info!("All {} paths already in local store", have.len());
+    if missing_outputs.is_empty() {
+        tracing::info!("All {} paths already in local store", local_outputs.len());
         return Ok(());
     }
 
-    tracing::info!(
-        "{} paths to fetch ({} already local)",
-        want.len(),
-        have.len()
-    );
-
-    let want_hashes: Vec<String> = want
-        .iter()
-        .filter_map(|p| store::store_path_hash(p).map(String::from))
-        .collect();
-    let have_hashes: Vec<String> = have
-        .iter()
-        .filter_map(|p| store::store_path_hash(p).map(String::from))
-        .collect();
-
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {
+        let spinner = ekapkgs_ui::progress::spinner("Resolving runtime closure...");
+
+        let closure = crate::negotiate::negotiate_closure(
+            &server_url,
+            store_path_hashes(&missing_outputs),
+            Vec::new(),
+        )
+        .await?;
+        let closure_paths = runtime_closure_paths(&missing_outputs, &closure.available);
+
+        let (have, want) = store::partition_local(&closure_paths)?;
+
+        spinner.finish_and_clear();
+
+        tracing::info!(
+            "{} paths to fetch ({} already local)",
+            want.len(),
+            have.len()
+        );
+
+        let want_hashes = store_path_hashes(&want);
+        let have_hashes = store_path_hashes(&have);
+
         let spinner = ekapkgs_ui::progress::spinner("Negotiating with cache...");
 
         let response =
@@ -970,6 +982,37 @@ fn cmd_pull(paths: &[String], cache_name: Option<&str>) -> color_eyre::Result<()
     })?;
 
     Ok(())
+}
+
+/// Extract the hash portion of each store path, skipping malformed ones.
+fn store_path_hashes(paths: &[String]) -> Vec<String> {
+    paths
+        .iter()
+        .filter_map(|p| store::store_path_hash(p).map(String::from))
+        .collect()
+}
+
+/// Collect the full runtime closure from a closure-expanded negotiate
+/// response.
+///
+/// Includes each available entry and everything it references, plus the
+/// requested `roots`. References of paths the server lacks are not known, so
+/// those paths are included but not expanded.
+fn runtime_closure_paths(roots: &[String], available: &[PathManifestEntry]) -> Vec<String> {
+    let mut paths: Vec<String> = roots.to_vec();
+    for entry in available {
+        paths.push(entry.store_path.clone());
+        for reference in &entry.references {
+            if reference.starts_with("/nix/store/") {
+                paths.push(reference.clone());
+            } else {
+                paths.push(format!("/nix/store/{reference}"));
+            }
+        }
+    }
+    paths.sort();
+    paths.dedup();
+    paths
 }
 
 // --- warm ---
@@ -1454,4 +1497,58 @@ fn save_config(config: &ClientConfig) -> color_eyre::Result<()> {
         file.write_all(content.as_bytes())?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(store_path: &str, references: &[&str]) -> PathManifestEntry {
+        PathManifestEntry {
+            store_path: store_path.to_owned(),
+            references: references.iter().map(|r| (*r).to_owned()).collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn runtime_closure_includes_references() {
+        let roots = vec!["/nix/store/aaa-hello".to_owned()];
+        let available = vec![
+            entry("/nix/store/aaa-hello", &["aaa-hello", "bbb-glibc"]),
+            entry(
+                "/nix/store/bbb-glibc",
+                &["/nix/store/bbb-glibc", "ccc-libidn"],
+            ),
+        ];
+
+        assert_eq!(
+            runtime_closure_paths(&roots, &available),
+            vec![
+                "/nix/store/aaa-hello",
+                "/nix/store/bbb-glibc",
+                "/nix/store/ccc-libidn",
+            ]
+        );
+    }
+
+    #[test]
+    fn runtime_closure_keeps_roots_missing_from_server() {
+        let roots = vec!["/nix/store/zzz-unknown".to_owned()];
+
+        assert_eq!(
+            runtime_closure_paths(&roots, &[]),
+            vec!["/nix/store/zzz-unknown"]
+        );
+    }
+
+    #[test]
+    fn store_path_hashes_extracts_hashes() {
+        let paths = vec![
+            "/nix/store/aaa-hello-2.12".to_owned(),
+            "/nix/store/bbb-glibc".to_owned(),
+        ];
+
+        assert_eq!(store_path_hashes(&paths), vec!["aaa", "bbb"]);
+    }
 }

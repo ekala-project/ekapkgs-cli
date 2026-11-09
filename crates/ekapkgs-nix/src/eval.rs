@@ -134,6 +134,29 @@ pub fn derivation_closure_paths(installable: &Installable) -> Result<Vec<String>
         .arg(&installable.raw)
         .json()?;
 
+    Ok(collect_output_paths(&show))
+}
+
+/// Get the output store paths of an installable, without any dependencies.
+///
+/// A bare store path (not a `.drv`) is returned as-is, since it is already an
+/// output and need not be valid locally. Anything else is resolved with
+/// `nix derivation show` (non-recursive), returning every output of the
+/// installable's derivation.
+pub fn output_paths(installable: &Installable) -> Result<Vec<String>, NixError> {
+    if installable.raw.starts_with("/nix/store/") && !installable.raw.ends_with(".drv") {
+        return Ok(vec![installable.raw.clone()]);
+    }
+
+    let show: DerivationShowOutput = NixCommand::new(&["derivation", "show"])
+        .arg(&installable.raw)
+        .json()?;
+
+    Ok(collect_output_paths(&show))
+}
+
+/// Collect the sorted, deduplicated output paths from `nix derivation show`.
+fn collect_output_paths(show: &DerivationShowOutput) -> Vec<String> {
     let mut paths = Vec::new();
     for drv in show.derivations.values() {
         for output in drv.outputs.values() {
@@ -150,7 +173,7 @@ pub fn derivation_closure_paths(installable: &Installable) -> Result<Vec<String>
 
     paths.sort();
     paths.dedup();
-    Ok(paths)
+    paths
 }
 
 /// Get the raw derivation graph JSON for an installable.
