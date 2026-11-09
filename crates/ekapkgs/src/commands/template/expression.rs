@@ -14,9 +14,9 @@ pub fn generate(info: &ExpressionInfo) -> String {
 
 fn render_fetch_block(info: &ExpressionInfo) -> (Vec<&'static str>, String) {
     let tag_value = if info.version_has_v_prefix {
-        "v${finalAttrs.version}"
+        "\"v${finalAttrs.version}\""
     } else {
-        "${finalAttrs.version}"
+        "finalAttrs.version"
     };
 
     match &info.fetcher {
@@ -32,8 +32,8 @@ fn render_fetch_block(info: &ExpressionInfo) -> (Vec<&'static str>, String) {
             };
             let block = format!(
                 "  src = fetchFromGitHub {{\n\x20   owner = \"{owner}\";\n\x20   repo = \
-                 \"{repo}\";{domain_line}\n\x20   tag = \"{tag}\";\n\x20   hash = \
-                 \"{hash}\";\n\x20 }};",
+                 \"{repo}\";{domain_line}\n\x20   tag = {tag};\n\x20   hash = \"{hash}\";\n\x20 \
+                 }};",
                 owner = owner,
                 repo = repo,
                 domain_line = domain_line,
@@ -54,8 +54,8 @@ fn render_fetch_block(info: &ExpressionInfo) -> (Vec<&'static str>, String) {
             };
             let block = format!(
                 "  src = fetchFromGitLab {{\n\x20   owner = \"{owner}\";\n\x20   repo = \
-                 \"{repo}\";{domain_line}\n\x20   tag = \"{tag}\";\n\x20   hash = \
-                 \"{hash}\";\n\x20 }};",
+                 \"{repo}\";{domain_line}\n\x20   tag = {tag};\n\x20   hash = \"{hash}\";\n\x20 \
+                 }};",
                 owner = owner,
                 repo = repo,
                 domain_line = domain_line,
@@ -246,6 +246,14 @@ mod tests {
         let out = generate(&test_info(TemplateKind::Stdenv));
         assert!(out.contains("tag = \"v${finalAttrs.version}\";"));
         assert!(!out.contains("rev ="));
+    }
+
+    #[test]
+    fn tag_without_v_prefix_is_not_interpolated() {
+        let mut info = test_info(TemplateKind::Stdenv);
+        info.version_has_v_prefix = false;
+        let out = generate(&info);
+        assert!(out.contains("tag = finalAttrs.version;"));
     }
 
     #[test]
