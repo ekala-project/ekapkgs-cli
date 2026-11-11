@@ -25,9 +25,13 @@ pub fn execute(
     // Phase 1: Build
     tracing::info!("Building {installable}...");
 
-    if config.primary_cache().is_some() {
+    if let Some(cache) = config.primary_cache() {
         let spinner = ekapkgs_ui::progress::spinner("Evaluating closure...");
-        let closure_paths = eval::derivation_closure_paths(&inst)?;
+        let closure_paths = crate::build_closure::build_closure_paths(
+            &cache.url,
+            &inst,
+            crate::build_closure::Goal::Outputs,
+        )?;
         spinner.finish_and_clear();
 
         crate::prefetch::prefetch_closure(&config, &closure_paths)?;

@@ -1,5 +1,5 @@
+use ekapkgs_nix::NixCommand;
 use ekapkgs_nix::installable::Installable;
-use ekapkgs_nix::{NixCommand, eval};
 
 use crate::config::ClientConfig;
 
@@ -8,11 +8,15 @@ pub fn execute(installable: &str, extra: &[String]) -> color_eyre::Result<()> {
     let config = ClientConfig::load()?;
     let inst = Installable::new(installable);
 
-    if config.primary_cache().is_some() {
+    if let Some(cache) = config.primary_cache() {
         tracing::info!("Preparing dev environment for {installable}");
 
         let spinner = ekapkgs_ui::progress::spinner("Evaluating dev shell closure...");
-        let closure_paths = eval::derivation_closure_paths(&inst)?;
+        let closure_paths = crate::build_closure::build_closure_paths(
+            &cache.url,
+            &inst,
+            crate::build_closure::Goal::Inputs,
+        )?;
         spinner.finish_and_clear();
 
         crate::prefetch::prefetch_closure(&config, &closure_paths)?;
