@@ -111,6 +111,39 @@ impl NixCommand {
         Ok(status)
     }
 
+    /// Run with inherited stdout/stderr, writing `input` to the command's stdin.
+    pub fn stream_with_stdin(&self, input: &[u8]) -> Result<ExitStatus, NixError> {
+        use std::io::Write;
+
+        tracing::debug!(cmd = %self, "streaming nix command with stdin");
+        let mut child = self
+            .build_command()
+            .stdin(Stdio::piped())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .map_err(NixError::Spawn)?;
+
+        // Dropping stdin after the write closes the pipe so nix sees EOF. A
+        // write failure usually means nix exited early, so report its exit
+        // status in preference to the write error.
+        let write_result = child
+            .stdin
+            .take()
+            .map_or(Ok(()), |mut stdin| stdin.write_all(input));
+        let status = child.wait().map_err(NixError::Io)?;
+
+        if !status.success() {
+            return Err(NixError::Failed {
+                status,
+                stderr: String::new(),
+            });
+        }
+        write_result.map_err(NixError::Io)?;
+
+        Ok(status)
+    }
+
     /// Run with a build monitor that parses nix's internal-json output.
     ///
     /// Adds `--log-format internal-json` to the command and pipes stderr
@@ -204,6 +237,9 @@ impl std::fmt::Display for NixCommand {
 pub enum NixError {
     #[error("failed to spawn nix: {0}")]
     Spawn(#[source] std::io::Error),
+
+    #[error("I/O error: {0}")]
+    Io(#[source] std::io::Error),
 
     #[error("nix exited with {status}: {stderr}")]
     Failed { status: ExitStatus, stderr: String },
