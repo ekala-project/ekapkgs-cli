@@ -1,4 +1,5 @@
 mod background_apply;
+mod build_closure;
 mod cas_pull;
 mod chunk_store;
 mod cli;

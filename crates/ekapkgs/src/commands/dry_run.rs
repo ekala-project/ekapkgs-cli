@@ -8,7 +8,14 @@ pub fn execute(installable: &str, extra: &[String]) -> color_eyre::Result<()> {
     let inst = Installable::new(installable);
 
     let spinner = ekapkgs_ui::progress::spinner("Evaluating closure...");
-    let closure_paths = eval::derivation_closure_paths(&inst)?;
+    let closure_paths = match config.primary_cache() {
+        Some(cache) => crate::build_closure::build_closure_paths(
+            &cache.url,
+            &inst,
+            crate::build_closure::Goal::Outputs,
+        )?,
+        None => eval::derivation_closure_paths(&inst)?,
+    };
     let (have, want) = store::partition_local(&closure_paths)?;
     spinner.finish_and_clear();
 

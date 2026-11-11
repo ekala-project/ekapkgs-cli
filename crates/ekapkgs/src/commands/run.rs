@@ -1,5 +1,5 @@
 use ekapkgs_nix::installable::Installable;
-use ekapkgs_nix::{NixCommand, eval, store};
+use ekapkgs_nix::{NixCommand, store};
 
 use crate::config::ClientConfig;
 
@@ -27,7 +27,11 @@ pub fn execute(installable: &str, extra: &[String]) -> color_eyre::Result<()> {
             tracing::info!("Running {installable}");
 
             let spinner = ekapkgs_ui::progress::spinner("Evaluating closure...");
-            let closure_paths = eval::derivation_closure_paths(&inst)?;
+            let closure_paths = crate::build_closure::build_closure_paths(
+                &server_url,
+                &inst,
+                crate::build_closure::Goal::Outputs,
+            )?;
 
             spinner.set_message("Checking local store...");
             let (have, want) = store::partition_local(&closure_paths)?;
