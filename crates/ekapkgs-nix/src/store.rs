@@ -104,17 +104,53 @@ pub fn partition_local(paths: &[String]) -> Result<(Vec<String>, Vec<String>), N
 
 /// Import paths from a local binary cache directory into the nix store.
 ///
-/// Uses `nix copy --all --from file://<path>` to bulk import.
+/// Passes the staged store paths to `nix copy --from file://<path> --stdin`
+/// rather than using `--all`: nix lists a local binary cache by narinfo
+/// filename alone, so `--all` reports every path as `<hash>-x` in its logs.
+/// `--no-recursive` keeps nix from resolving references in the staging
+/// cache, which only holds the paths missing locally.
 pub fn import_from_local_cache(cache_dir: &std::path::Path) -> Result<(), NixError> {
+    let paths = staged_store_paths(cache_dir).map_err(NixError::Io)?;
+    if paths.is_empty() {
+        return Ok(());
+    }
+
     let url = format!("file://{}", cache_dir.display());
+    let mut input = paths.join("\n");
+    input.push('\n');
 
     NixCommand::new(&["copy"])
-        .arg("--all")
         .arg("--from")
         .arg(&url)
-        .stream()?;
+        .arg("--stdin")
+        .arg("--no-recursive")
+        .stream_with_stdin(input.as_bytes())?;
 
     Ok(())
+}
+
+/// Read the `StorePath` of every narinfo staged in a local binary cache.
+fn staged_store_paths(cache_dir: &std::path::Path) -> std::io::Result<Vec<String>> {
+    let mut paths = Vec::new();
+    for entry in std::fs::read_dir(cache_dir)? {
+        let path = entry?.path();
+        if path.extension().is_some_and(|ext| ext == "narinfo") {
+            let narinfo = std::fs::read_to_string(&path)?;
+            if let Some(store_path) = narinfo_store_path(&narinfo) {
+                paths.push(store_path.to_owned());
+            }
+        }
+    }
+    paths.sort();
+    Ok(paths)
+}
+
+/// Extract the `StorePath:` field from narinfo text.
+fn narinfo_store_path(narinfo: &str) -> Option<&str> {
+    narinfo
+        .lines()
+        .find_map(|line| line.strip_prefix("StorePath:"))
+        .map(str::trim)
 }
 
 /// Extract the hash portion from a store path.
@@ -164,6 +200,20 @@ pub fn parse_store_path_name(path: &str) -> (&str, &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn narinfo_store_path_parses_field() {
+        let narinfo = "StorePath: /nix/store/abc123-hello-2.12.3\nURL: nar/abc.nar\n";
+        assert_eq!(
+            narinfo_store_path(narinfo),
+            Some("/nix/store/abc123-hello-2.12.3")
+        );
+    }
+
+    #[test]
+    fn narinfo_store_path_missing() {
+        assert_eq!(narinfo_store_path("URL: nar/abc.nar\n"), None);
+    }
 
     #[test]
     fn parse_simple_package() {
