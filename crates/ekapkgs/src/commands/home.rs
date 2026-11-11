@@ -1,8 +1,8 @@
 use std::process::Stdio;
 
+use ekapkgs_nix::NixCommand;
 use ekapkgs_nix::eval::BuildOutput;
 use ekapkgs_nix::installable::Installable;
-use ekapkgs_nix::{NixCommand, eval};
 use yansi::Paint;
 
 use crate::cli::{HomeCommand, HomePackagesCommand, HomeServicesCommand};
@@ -230,9 +230,13 @@ fn build_home(installable: &str, extra: &[String]) -> color_eyre::Result<String>
     let inst = Installable::new(installable);
 
     // Pre-fetch from cache if configured.
-    if config.primary_cache().is_some() {
+    if let Some(cache) = config.primary_cache() {
         let spinner = ekapkgs_ui::progress::spinner("Evaluating home closure...");
-        match eval::derivation_closure_paths(&inst) {
+        match crate::build_closure::build_closure_paths(
+            &cache.url,
+            &inst,
+            crate::build_closure::Goal::Outputs,
+        ) {
             Ok(closure_paths) => {
                 spinner.finish_and_clear();
                 crate::prefetch::prefetch_closure(&config, &closure_paths)?;
