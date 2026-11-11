@@ -107,6 +107,8 @@ fn cmd_switch(installable: &str, extra: &[String]) -> color_eyre::Result<()> {
             {
                 Ok(s) if s.success() => {
                     tracing::info!("Rolled back to generation {prev_num}");
+                    // The failed activation may have linked new unit files.
+                    super::home_units::reload();
                 },
                 Ok(s) => {
                     tracing::error!(
@@ -130,6 +132,12 @@ fn cmd_switch(installable: &str, extra: &[String]) -> color_eyre::Result<()> {
     }
 
     tracing::info!("Home configuration activated");
+
+    // Start, restart and stop user units to match the new generation.
+    if let Some((_, new_path)) = find_current_generation() {
+        let old_path = prev_generation.as_ref().map(|(_, p)| p.as_path());
+        super::home_units::reconcile(old_path, &new_path);
+    }
 
     // Hint about session-vars.sh if it doesn't appear to be sourced.
     hint_session_vars();
@@ -167,6 +175,7 @@ fn cmd_update(installable: &str, extra: &[String]) -> color_eyre::Result<()> {
 }
 
 fn cmd_rollback() -> color_eyre::Result<()> {
+    let current = find_current_generation();
     let (prev_num, prev_path) = find_previous_generation().ok_or_else(|| {
         color_eyre::eyre::eyre!("No previous home generation found to roll back to")
     })?;
@@ -189,6 +198,8 @@ fn cmd_rollback() -> color_eyre::Result<()> {
     }
 
     tracing::info!("Rolled back to generation {prev_num}");
+
+    super::home_units::reconcile(current.as_ref().map(|(_, p)| p.as_path()), &prev_path);
     Ok(())
 }
 
