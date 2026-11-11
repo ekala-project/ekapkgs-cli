@@ -3,9 +3,9 @@ use std::path::PathBuf;
 
 use ekapkgs_nix::installable::Installable;
 use ekapkgs_nix::{NixCommand, eval, store};
-use ekapkgs_protocol::ekapkgs::v1::PathManifestEntry;
 use futures::StreamExt;
 
+use crate::build_closure::{runtime_closure_paths, store_path_hashes};
 use crate::cli::{AuthCommand, CacheCommand};
 use crate::config::ClientConfig;
 
@@ -984,37 +984,6 @@ fn cmd_pull(paths: &[String], cache_name: Option<&str>) -> color_eyre::Result<()
     Ok(())
 }
 
-/// Extract the hash portion of each store path, skipping malformed ones.
-fn store_path_hashes(paths: &[String]) -> Vec<String> {
-    paths
-        .iter()
-        .filter_map(|p| store::store_path_hash(p).map(String::from))
-        .collect()
-}
-
-/// Collect the full runtime closure from a closure-expanded negotiate
-/// response.
-///
-/// Includes each available entry and everything it references, plus the
-/// requested `roots`. References of paths the server lacks are not known, so
-/// those paths are included but not expanded.
-fn runtime_closure_paths(roots: &[String], available: &[PathManifestEntry]) -> Vec<String> {
-    let mut paths: Vec<String> = roots.to_vec();
-    for entry in available {
-        paths.push(entry.store_path.clone());
-        for reference in &entry.references {
-            if reference.starts_with("/nix/store/") {
-                paths.push(reference.clone());
-            } else {
-                paths.push(format!("/nix/store/{reference}"));
-            }
-        }
-    }
-    paths.sort();
-    paths.dedup();
-    paths
-}
-
 // --- warm ---
 
 fn cmd_warm(
@@ -1497,58 +1466,4 @@ fn save_config(config: &ClientConfig) -> color_eyre::Result<()> {
         file.write_all(content.as_bytes())?;
     }
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn entry(store_path: &str, references: &[&str]) -> PathManifestEntry {
-        PathManifestEntry {
-            store_path: store_path.to_owned(),
-            references: references.iter().map(|r| (*r).to_owned()).collect(),
-            ..Default::default()
-        }
-    }
-
-    #[test]
-    fn runtime_closure_includes_references() {
-        let roots = vec!["/nix/store/aaa-hello".to_owned()];
-        let available = vec![
-            entry("/nix/store/aaa-hello", &["aaa-hello", "bbb-glibc"]),
-            entry(
-                "/nix/store/bbb-glibc",
-                &["/nix/store/bbb-glibc", "ccc-libidn"],
-            ),
-        ];
-
-        assert_eq!(
-            runtime_closure_paths(&roots, &available),
-            vec![
-                "/nix/store/aaa-hello",
-                "/nix/store/bbb-glibc",
-                "/nix/store/ccc-libidn",
-            ]
-        );
-    }
-
-    #[test]
-    fn runtime_closure_keeps_roots_missing_from_server() {
-        let roots = vec!["/nix/store/zzz-unknown".to_owned()];
-
-        assert_eq!(
-            runtime_closure_paths(&roots, &[]),
-            vec!["/nix/store/zzz-unknown"]
-        );
-    }
-
-    #[test]
-    fn store_path_hashes_extracts_hashes() {
-        let paths = vec![
-            "/nix/store/aaa-hello-2.12".to_owned(),
-            "/nix/store/bbb-glibc".to_owned(),
-        ];
-
-        assert_eq!(store_path_hashes(&paths), vec!["aaa", "bbb"]);
-    }
 }
