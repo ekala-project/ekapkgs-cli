@@ -11,6 +11,7 @@ mod env;
 mod flake;
 mod fuse;
 mod home;
+mod home_units;
 mod log;
 mod registry;
 mod run;
