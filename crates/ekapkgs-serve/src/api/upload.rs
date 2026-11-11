@@ -113,10 +113,9 @@ pub async fn put_narinfo(
                 ni.nar_size,
                 &ni.references,
             );
-            let sig = state.signer.sign(&fingerprint);
-            if !ni.signatures.contains(&sig) {
-                ni.signatures.push(sig);
-            }
+            state
+                .signer
+                .apply_signature(&mut ni.signatures, &fingerprint);
             ni
         },
         None => return (StatusCode::BAD_REQUEST, "invalid narinfo").into_response(),

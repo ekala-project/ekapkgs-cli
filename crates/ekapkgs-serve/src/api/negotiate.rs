@@ -85,10 +85,9 @@ impl CacheService for NegotiateService {
                 ni.nar_size,
                 &ni.references,
             );
-            let sig = self.state.signer.sign(&fingerprint);
-            if !ni.signatures.contains(&sig) {
-                ni.signatures.push(sig);
-            }
+            self.state
+                .signer
+                .apply_signature(&mut ni.signatures, &fingerprint);
 
             let compression = match ni.compression.as_str() {
                 "zstd" => Compression::Zstd as i32,
