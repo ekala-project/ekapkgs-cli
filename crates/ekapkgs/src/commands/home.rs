@@ -82,9 +82,12 @@ fn cmd_switch(installable: &str, extra: &[String]) -> color_eyre::Result<()> {
     // this is still the newest entry after the attempt.
     let prev_generation = find_current_generation();
 
-    // Activate as current user (no sudo).
-    tracing::info!("Activating home configuration...");
-    let activate_path = format!("{store_path}/activate");
+    // Activate as current user (no sudo), and only the current user's home:
+    // the combined package's top-level activate would apply every configured
+    // user's files to this user's $HOME.
+    let user = current_username()?;
+    let activate_path = user_activation_script(std::path::Path::new(&store_path), &user)?;
+    tracing::info!("Activating home configuration for {user}...");
     let status = std::process::Command::new(&activate_path)
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
@@ -201,6 +204,60 @@ fn cmd_rollback() -> color_eyre::Result<()> {
 
     super::home_units::reconcile(current.as_ref().map(|(_, p)| p.as_path()), &prev_path);
     Ok(())
+}
+
+/// Name of the user running the CLI, as the activation script's `whoami` sees it.
+fn current_username() -> color_eyre::Result<String> {
+    if let Ok(out) = std::process::Command::new("id").arg("-un").output() {
+        let name = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+        if out.status.success() && !name.is_empty() {
+            return Ok(name);
+        }
+    }
+    std::env::var("USER")
+        .ok()
+        .filter(|u| !u.is_empty())
+        .ok_or_else(|| color_eyre::eyre::eyre!("could not determine the current user"))
+}
+
+/// Pick the activation script for `user` from a built home package.
+///
+/// The combined package (`config.home.build.activationPackage`) holds one
+/// activation package per configured user under `users/<name>/`. A per-user
+/// package (`config.home.build.activationPackages.<name>`) is used as is.
+fn user_activation_script(store_path: &std::path::Path, user: &str) -> color_eyre::Result<String> {
+    let users_dir = store_path.join("users");
+    if !users_dir.is_dir() {
+        return Ok(store_path.join("activate").to_string_lossy().into_owned());
+    }
+
+    let user_dir = users_dir.join(user);
+    if user_dir.join("activate").exists() {
+        // Resolve `users/<name>` to the per-user package so the activation
+        // records that store path as the generation, not a path inside the
+        // combined package.
+        let user_dir = std::fs::canonicalize(&user_dir).unwrap_or(user_dir);
+        return Ok(user_dir.join("activate").to_string_lossy().into_owned());
+    }
+
+    let mut configured: Vec<String> = std::fs::read_dir(&users_dir)
+        .map(|entries| {
+            entries
+                .filter_map(Result::ok)
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default();
+    configured.sort();
+    let configured = if configured.is_empty() {
+        "none".to_owned()
+    } else {
+        configured.join(", ")
+    };
+    Err(color_eyre::eyre::eyre!(
+        "this home configuration has no user '{user}' (configured users: {configured}); add \
+         home.users.{user} or run as one of the configured users"
+    ))
 }
 
 /// Find the active home generation (the newest recorded one).
@@ -2633,6 +2690,33 @@ mod tests {
         let current = entries.pop().unwrap();
         assert_eq!(current, (3, "/nix/store/gen-3".into()));
         assert_eq!(entries.pop().unwrap().0, 2);
+    }
+
+    #[test]
+    fn activation_script_selects_current_user() {
+        let pkg = tempfile::tempdir().unwrap();
+        for user in ["alice", "jon"] {
+            let dir = pkg.path().join("users").join(user);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("activate"), "").unwrap();
+        }
+
+        let script = user_activation_script(pkg.path(), "jon").unwrap();
+        assert!(script.ends_with("users/jon/activate"));
+
+        let err = user_activation_script(pkg.path(), "bob")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no user 'bob'"), "{err}");
+        assert!(err.contains("alice, jon"), "{err}");
+    }
+
+    #[test]
+    fn activation_script_uses_per_user_package_directly() {
+        let pkg = tempfile::tempdir().unwrap();
+        std::fs::write(pkg.path().join("activate"), "").unwrap();
+        let script = user_activation_script(pkg.path(), "anyone").unwrap();
+        assert_eq!(script, pkg.path().join("activate").to_string_lossy());
     }
 
     #[test]
