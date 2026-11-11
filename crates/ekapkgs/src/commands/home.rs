@@ -77,8 +77,10 @@ pub fn execute(command: HomeCommand) -> color_eyre::Result<()> {
 fn cmd_switch(installable: &str, extra: &[String]) -> color_eyre::Result<()> {
     let store_path = build_home(installable, extra)?;
 
-    // Record the previous generation so we can roll back on failure.
-    let prev_generation = find_previous_generation();
+    // Record the generation that is active now, so a failed activation can
+    // restore it. A failed activation does not record a new generation, so
+    // this is still the newest entry after the attempt.
+    let prev_generation = find_current_generation();
 
     // Activate as current user (no sudo).
     tracing::info!("Activating home configuration...");
@@ -190,15 +192,25 @@ fn cmd_rollback() -> color_eyre::Result<()> {
     Ok(())
 }
 
-/// Find the previous home generation by reading the generations directory.
-fn find_previous_generation() -> Option<(u64, std::path::PathBuf)> {
-    let state_dir = dirs_path().ok()?.join("generations");
-    if !state_dir.exists() {
-        return None;
-    }
+/// Find the active home generation (the newest recorded one).
+fn find_current_generation() -> Option<(u64, std::path::PathBuf)> {
+    read_generations(&dirs_path().ok()?.join("generations")).pop()
+}
 
-    let mut entries: Vec<(u64, std::path::PathBuf)> = std::fs::read_dir(&state_dir)
-        .ok()?
+/// Find the generation before the active one, the target of `home rollback`.
+fn find_previous_generation() -> Option<(u64, std::path::PathBuf)> {
+    let mut entries = read_generations(&dirs_path().ok()?.join("generations"));
+    entries.pop()?;
+    entries.pop()
+}
+
+/// Read the numbered generation symlinks in `dir`, sorted oldest first.
+fn read_generations(dir: &std::path::Path) -> Vec<(u64, std::path::PathBuf)> {
+    let Ok(read_dir) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+
+    let mut entries: Vec<(u64, std::path::PathBuf)> = read_dir
         .filter_map(std::result::Result::ok)
         .filter_map(|e| {
             let name = e.file_name().to_string_lossy().into_owned();
@@ -209,13 +221,7 @@ fn find_previous_generation() -> Option<(u64, std::path::PathBuf)> {
         .collect();
 
     entries.sort_by_key(|(num, _)| *num);
-
-    // The previous generation is the second-to-last entry.
-    if entries.len() >= 2 {
-        Some(entries[entries.len() - 2].clone())
-    } else {
-        None
-    }
+    entries
 }
 
 fn cmd_build(installable: &str, extra: &[String]) -> color_eyre::Result<()> {
@@ -2579,4 +2585,48 @@ fn hint_session_vars() {
 #[serde(rename_all = "camelCase")]
 struct BuildOutput {
     outputs: std::collections::HashMap<String, String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_generations(gens: &[u64]) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        for n in gens {
+            std::os::unix::fs::symlink(
+                format!("/nix/store/gen-{n}"),
+                dir.path().join(n.to_string()),
+            )
+            .unwrap();
+        }
+        // Non-generation entries are ignored.
+        std::fs::write(dir.path().join("README"), "").unwrap();
+        dir
+    }
+
+    #[test]
+    fn generations_sort_numerically() {
+        let dir = make_generations(&[10, 2, 1]);
+        let nums: Vec<u64> = read_generations(dir.path())
+            .into_iter()
+            .map(|(n, _)| n)
+            .collect();
+        assert_eq!(nums, vec![1, 2, 10]);
+    }
+
+    #[test]
+    fn current_is_newest_and_previous_is_one_before() {
+        let dir = make_generations(&[1, 2, 3]);
+        let mut entries = read_generations(dir.path());
+        let current = entries.pop().unwrap();
+        assert_eq!(current, (3, "/nix/store/gen-3".into()));
+        assert_eq!(entries.pop().unwrap().0, 2);
+    }
+
+    #[test]
+    fn missing_dir_has_no_generations() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(read_generations(&dir.path().join("generations")).is_empty());
+    }
 }
