@@ -8,7 +8,7 @@ description = "Switch a running ekaos system to a new toplevel"
 [dependencies]
 thiserror.workspace = true
 tracing.workspace = true
-zbus = "6"
+zbus = { version = "6", features = ["p2p"] }
 futures.workspace = true
 nix = { version = "0.29", features = ["fs", "user"] }
 
