@@ -402,10 +402,9 @@ pub async fn get_narinfo(
                 ni.nar_size,
                 &ni.references,
             );
-            let sig = state.signer.sign(&fingerprint);
-            if !ni.signatures.contains(&sig) {
-                ni.signatures.push(sig);
-            }
+            state
+                .signer
+                .apply_signature(&mut ni.signatures, &fingerprint);
             ni
         },
         Ok(None) => {
