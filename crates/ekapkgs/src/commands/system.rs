@@ -2,8 +2,8 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+use ekapkgs_nix::NixCommand;
 use ekapkgs_nix::installable::Installable;
-use ekapkgs_nix::{NixCommand, eval};
 use jiff::Timestamp;
 use yansi::Paint;
 
@@ -587,9 +587,13 @@ fn build_system(installable: &str, extra: &[String]) -> color_eyre::Result<Strin
     let inst = Installable::new(installable);
 
     // Pre-fetch from cache if configured.
-    if config.primary_cache().is_some() {
+    if let Some(cache) = config.primary_cache() {
         let spinner = ekapkgs_ui::progress::spinner("Evaluating system closure...");
-        match eval::derivation_closure_paths(&inst) {
+        match crate::build_closure::build_closure_paths(
+            &cache.url,
+            &inst,
+            crate::build_closure::Goal::Outputs,
+        ) {
             Ok(closure_paths) => {
                 spinner.finish_and_clear();
                 crate::prefetch::prefetch_closure(&config, &closure_paths)?;
