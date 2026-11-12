@@ -9,6 +9,16 @@
 //!
 //! The toplevel must implement a [`contract`] version this engine knows.
 
+/// Print a progress line to stderr. Unlike `eprintln!`, it does not
+/// panic when stderr is gone, so an SSH session that drops mid-switch
+/// does not abort the switch halfway.
+macro_rules! say {
+    ($($arg:tt)*) => {{
+        use std::io::Write as _;
+        let _ = writeln!(std::io::stderr(), $($arg)*);
+    }};
+}
+
 pub mod contract;
 pub mod fstab;
 pub mod manager;
