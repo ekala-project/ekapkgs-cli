@@ -131,20 +131,27 @@ ekapkgs registry resolve nixpkgs           # show resolved URL
 Replaces `nixos-rebuild` for local system configuration:
 
 ```
-ekapkgs system switch                      # build and activate
-ekapkgs system boot                        # add boot entry, activate on reboot
-ekapkgs system test                        # activate without updating boot entry
+sudo ekapkgs system switch                 # build and activate
+sudo ekapkgs system switch --dry-run       # show what activating would change
+sudo ekapkgs system boot                   # add boot entry, activate on reboot
+sudo ekapkgs system test                   # activate, leaving profile and boot entry
 ekapkgs system build                       # build only, print store path
 ekapkgs system list-generations            # list system generations
-ekapkgs system rollback                    # roll back to previous generation
+sudo ekapkgs system rollback               # roll back to previous generation
 ekapkgs system rollback --dry-run          # preview rollback
 ekapkgs system prune-boot-entries          # remove orphaned boot entries from ESP
 ekapkgs system prune-boot-entries --gc     # garbage collect first, then prune
 ekapkgs system prune-boot-entries --dry-run
 ```
 
-If activation fails during `system switch`, the previous profile is
-automatically restored and re-activated.
+`switch`, `boot`, `test`, `rollback` and `update` need root. ekaos
+configurations are switched in-process: units are stopped, started,
+restarted and reloaded the way NixOS's switch-to-configuration does it,
+one switch at a time, and a dropped SSH session does not interrupt it.
+Other configurations, e.g. NixOS, run their own `switch-to-configuration`.
+
+If activation fails, the previous profile is restored and the previous
+system is re-activated (`boot` reinstalls its boot entry instead).
 
 #### Imperative system packages
 
