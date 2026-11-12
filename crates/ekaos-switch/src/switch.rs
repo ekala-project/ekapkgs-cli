@@ -76,7 +76,7 @@ fn sorted(units: impl IntoIterator<Item = impl AsRef<str>>) -> String {
 fn report(prefix: &str, units: impl IntoIterator<Item = impl AsRef<str>>) {
     let units = sorted(units);
     if !units.is_empty() {
-        eprintln!("{prefix}: {units}");
+        say!("{prefix}: {units}");
     }
 }
 
@@ -110,7 +110,7 @@ fn submit_all(
     ordered.sort_by_key(|u| u.to_lowercase());
     for unit in ordered {
         if let Err(e) = manager.submit(kind, unit) {
-            eprintln!("failed to {kind} {unit}: {e}");
+            say!("failed to {kind} {unit}: {e}");
             outcome.failed_jobs.push(crate::FailedJob {
                 unit: unit.clone(),
                 kind,
@@ -148,7 +148,7 @@ pub(crate) fn activate(
     let new_version = std::fs::read_to_string(toplevel.join("init-interface-version"))
         .map_err(|e| Error::io("reading init-interface-version", e))?;
     if current_version != new_version {
-        eprintln!(
+        say!(
             "warning: the new configuration has an init that is incompatible with the running \
              one; it will take effect after a reboot"
         );
@@ -185,11 +185,11 @@ pub(crate) fn activate(
         report("would stop the following units", plan.shown(&plan.stop));
         report("would NOT stop the following changed units", &plan.skip);
         for device in &plan.swapoff {
-            eprintln!("would stop swap device: {device}");
+            say!("would stop swap device: {device}");
         }
-        eprintln!("would activate the configuration...");
+        say!("would activate the configuration...");
         if restart_systemd {
-            eprintln!("would restart systemd");
+            say!("would restart systemd");
         }
         report("would reload the following units", &plan.reload);
         report("would restart the following units", &plan.restart);
@@ -200,10 +200,10 @@ pub(crate) fn activate(
     tracing::info!("switching to system configuration {}", toplevel.display());
 
     for device in &planner.plan.swapoff {
-        eprintln!("stopping swap device: {device}");
+        say!("stopping swap device: {device}");
         let swapoff = toplevel.join("sw/bin/swapoff");
         if let Err(e) = run(Command::new(swapoff).arg(device), "swapoff") {
-            eprintln!("failed to stop swapping to {device}: {e}");
+            say!("failed to stop swapping to {device}: {e}");
         }
     }
 
@@ -225,7 +225,7 @@ pub(crate) fn activate(
         &planner.plan.skip,
     );
 
-    eprintln!("activating the configuration...");
+    say!("activating the configuration...");
     let activate = toplevel.join("activate");
     match Command::new(&activate)
         .arg(opts.action.as_str())
@@ -236,11 +236,11 @@ pub(crate) fn activate(
         // A toplevel may have no activation script.
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {},
         Ok(status) => {
-            eprintln!("the activation script failed ({status})");
+            say!("the activation script failed ({status})");
             outcome.activation_failed = true;
         },
         Err(e) => {
-            eprintln!("failed to run the activation script: {e}");
+            say!("failed to run the activation script: {e}");
             outcome.activation_failed = true;
         },
     }
@@ -256,7 +256,7 @@ pub(crate) fn activate(
     // Re-execute with the running systemd first, in case the new one has
     // trouble talking to it.
     if restart_systemd {
-        eprintln!("restarting systemd...");
+        say!("restarting systemd...");
         manager.reexecute()?;
     }
     manager.reset_failed()?;
@@ -268,26 +268,26 @@ pub(crate) fn activate(
     match manager.users() {
         Ok(users) => {
             for user in users {
-                eprintln!("reloading user units for {}...", user.name);
+                say!("reloading user units for {}...", user.name);
                 let machine = format!("{}@", user.uid);
                 if let Err(e) = run(
                     Command::new(&systemctl).args(["--user", "-M", &machine, "daemon-reexec"]),
                     "systemctl --user daemon-reexec",
                 ) {
-                    eprintln!("failed to reload user units for {}: {e}", user.name);
+                    say!("failed to reload user units for {}: {e}", user.name);
                 }
             }
         },
-        Err(e) => eprintln!("unable to list users with logind: {e}"),
+        Err(e) => say!("unable to list users with logind: {e}"),
     }
 
     // Re-run units ordered before sysinit.target, in order. Restarting
     // sysinit.target itself would restart everything.
-    eprintln!("restarting {SYSINIT_REACTIVATION_TARGET}");
+    say!("restarting {SYSINIT_REACTIVATION_TARGET}");
     match manager.submit(JobKind::Restart, SYSINIT_REACTIVATION_TARGET) {
         Ok(()) => manager.wait_jobs()?,
         Err(e) => {
-            eprintln!("failed to restart {SYSINIT_REACTIVATION_TARGET}: {e}");
+            say!("failed to restart {SYSINIT_REACTIVATION_TARGET}: {e}");
             outcome.failed_jobs.push(crate::FailedJob {
                 unit: SYSINIT_REACTIVATION_TARGET.to_owned(),
                 kind: JobKind::Restart,
@@ -333,7 +333,7 @@ pub(crate) fn activate(
     journal.clear(List::Start)?;
 
     for job in manager.failed_jobs() {
-        eprintln!("failed to {} {}", job.kind, job.unit);
+        say!("failed to {} {}", job.kind, job.unit);
         outcome.failed_jobs.push(job);
     }
 
