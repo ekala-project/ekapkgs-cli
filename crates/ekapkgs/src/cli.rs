@@ -973,7 +973,8 @@ pub enum SystemCommand {
         /// then falls back to `.#config.system.build.toplevel`.
         installable: Option<String>,
 
-        /// Only show what would be done.
+        /// Show which units activating would stop, start, restart or
+        /// reload, without changing anything.
         #[arg(long)]
         dry_run: bool,
 
@@ -1033,7 +1034,7 @@ pub enum SystemCommand {
         extra: Vec<String>,
     },
 
-    /// Build and activate without updating the boot entry.
+    /// Build and activate without updating the profile or boot entry.
     ///
     /// Useful for testing a configuration without committing to it
     /// across reboots.
