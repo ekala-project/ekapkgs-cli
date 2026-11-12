@@ -7,10 +7,13 @@ use ekapkgs_nix::installable::Installable;
 use jiff::Timestamp;
 use yansi::Paint;
 
+use self::activation::Action;
 use crate::cli::{SystemCommand, SystemPackagesCommand};
 use crate::config::{
     ClientConfig, SystemPackageEntry, SystemPackages, provenance_caller, provenance_timestamp,
 };
+
+mod activation;
 
 const SYSTEM_PROFILE: &str = "/nix/var/nix/profiles/system";
 
@@ -119,6 +122,7 @@ pub fn execute(command: SystemCommand) -> color_eyre::Result<()> {
             profile_name,
             extra,
         } => {
+            activation::prepare("switch")?;
             let inst = resolve_system_installable(installable.as_deref());
             if let Some(ch) = &channel {
                 apply_channel(ch, &inst)?;
@@ -128,7 +132,12 @@ pub fn execute(command: SystemCommand) -> color_eyre::Result<()> {
                 install_bootloader,
                 specialisation,
             };
-            cmd_activate(&inst, "switch", dry_run, &extra, &opts)
+            let action = if dry_run {
+                Action::DryActivate
+            } else {
+                Action::Switch
+            };
+            cmd_activate(&inst, action, &extra, &opts)
         },
         SystemCommand::Boot {
             installable,
@@ -138,6 +147,7 @@ pub fn execute(command: SystemCommand) -> color_eyre::Result<()> {
             profile_name,
             extra,
         } => {
+            activation::prepare("boot")?;
             let inst = resolve_system_installable(installable.as_deref());
             if let Some(ch) = &channel {
                 apply_channel(ch, &inst)?;
@@ -147,7 +157,7 @@ pub fn execute(command: SystemCommand) -> color_eyre::Result<()> {
                 install_bootloader,
                 specialisation,
             };
-            cmd_activate(&inst, "boot", false, &extra, &opts)
+            cmd_activate(&inst, Action::Boot, &extra, &opts)
         },
         SystemCommand::Test {
             installable,
@@ -155,13 +165,14 @@ pub fn execute(command: SystemCommand) -> color_eyre::Result<()> {
             profile_name,
             extra,
         } => {
+            activation::prepare("test")?;
             let inst = resolve_system_installable(installable.as_deref());
             let opts = ActivateOpts {
                 profile_name,
                 install_bootloader: false,
                 specialisation,
             };
-            cmd_activate(&inst, "test", false, &extra, &opts)
+            cmd_activate(&inst, Action::Test, &extra, &opts)
         },
         SystemCommand::Build {
             installable,
@@ -184,6 +195,9 @@ pub fn execute(command: SystemCommand) -> color_eyre::Result<()> {
             dry_run,
             profile_name,
         } => {
+            if !dry_run {
+                activation::prepare("rollback")?;
+            }
             let profile = resolve_profile_path(profile_name.as_deref());
             cmd_rollback(generation, dry_run, &profile)
         },
@@ -201,6 +215,7 @@ pub fn execute(command: SystemCommand) -> color_eyre::Result<()> {
             dry_run,
         } => cmd_prune_boot_entries(&boot_mount, gc, dry_run),
         SystemCommand::Update { installable, extra } => {
+            activation::prepare("update")?;
             let inst = resolve_system_installable(installable.as_deref());
             cmd_update(&inst, &extra)
         },
@@ -255,162 +270,22 @@ fn apply_channel(channel: &str, installable: &str) -> color_eyre::Result<()> {
 
 fn cmd_activate(
     installable: &str,
-    mode: &str,
-    dry_run: bool,
+    action: Action,
     extra: &[String],
     opts: &ActivateOpts,
 ) -> color_eyre::Result<()> {
     let system_path = build_system(installable, extra)?;
-
-    // Validate specialisation before activation.
-    if let Some(spec) = &opts.specialisation {
-        let spec_path = format!("{system_path}/specialisation/{spec}");
-        if !Path::new(&spec_path).exists() {
-            return Err(color_eyre::eyre::eyre!(
-                "Specialisation '{spec}' not found at {spec_path}"
-            ));
-        }
-    }
-
-    if dry_run {
-        println!("Dry run:");
-        println!("  System path: {system_path}");
-        println!("  Mode:        {mode}");
-        if let Some(spec) = &opts.specialisation {
-            println!("  Specialisation: {spec}");
-        }
-        if opts.install_bootloader {
-            println!("  Install bootloader: yes");
-        }
-        if let Some(name) = &opts.profile_name {
-            println!("  Profile: {name}");
-        }
-        return Ok(());
-    }
-
     let profile = resolve_profile_path(opts.profile_name.as_deref());
 
-    // Ensure the profile parent directory exists for named profiles.
-    if opts.profile_name.is_some() {
-        let profile_dir = Path::new(&profile).parent().unwrap_or(Path::new("/"));
-        if !profile_dir.exists() {
-            let _ = Command::new("sudo")
-                .arg("mkdir")
-                .arg("-p")
-                .arg(profile_dir)
-                .status();
-        }
-    }
-
-    // Record previous profile target so we can roll back on failure.
-    let prev_target = std::fs::read_link(&profile).ok();
-
-    // Update the system profile (requires root).
-    tracing::info!("Setting system profile...");
-    let status = Command::new("sudo")
-        .arg("nix-env")
-        .arg("--profile")
-        .arg(&profile)
-        .arg("--set")
-        .arg(&system_path)
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .status()
-        .map_err(|e| color_eyre::eyre::eyre!("failed to set system profile: {e}"))?;
-
-    if !status.success() {
-        return Err(color_eyre::eyre::eyre!(
-            "Failed to set system profile (exit {})",
-            status.code().unwrap_or(1)
-        ));
-    }
-
-    // Activate the configuration.
-    tracing::info!("Activating ({mode})...");
-    let activate_cmd = format!("{system_path}/bin/switch-to-configuration");
-    let mut cmd = Command::new("sudo");
-
-    // Pass environment variables through sudo using `env VAR=val`.
-    let mut env_args: Vec<String> = Vec::new();
-    if opts.install_bootloader {
-        env_args.push("NIXOS_INSTALL_BOOTLOADER=1".to_owned());
-    }
-    if let Some(spec) = &opts.specialisation {
-        env_args.push(format!("NIXOS_SPECIALISATION={spec}"));
-    }
-    if !env_args.is_empty() {
-        cmd.arg("env");
-        for arg in &env_args {
-            cmd.arg(arg);
-        }
-    }
-
-    let status = cmd
-        .arg(&activate_cmd)
-        .arg(mode)
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .status()
-        .map_err(|e| color_eyre::eyre::eyre!("failed to run activation: {e}"))?;
-
-    if !status.success() {
-        // Activation failed — try to restore the previous profile and
-        // re-activate it so the system isn't left in a broken state.
-        // Rollback uses no specialisation or bootloader env vars.
-        if let Some(prev) = &prev_target {
-            let prev_str = prev.to_string_lossy();
-            tracing::warn!(
-                "Activation failed, rolling back to previous configuration ({prev_str})..."
-            );
-
-            let profile_restored = Command::new("sudo")
-                .args(["nix-env", "--profile"])
-                .arg(&profile)
-                .arg("--set")
-                .arg(prev_str.as_ref())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status()
-                .is_ok_and(|s| s.success());
-
-            if profile_restored {
-                let prev_activate = format!("{prev_str}/bin/switch-to-configuration");
-                match Command::new("sudo")
-                    .arg(&prev_activate)
-                    .arg("switch")
-                    .stdout(Stdio::inherit())
-                    .stderr(Stdio::inherit())
-                    .status()
-                {
-                    Ok(s) if s.success() => {
-                        tracing::info!("Rolled back to previous configuration");
-                    },
-                    Ok(s) => {
-                        tracing::error!(
-                            "Rollback activation also failed (exit {}); system may be in an \
-                             inconsistent state",
-                            s.code().unwrap_or(1)
-                        );
-                    },
-                    Err(e) => {
-                        tracing::error!(
-                            "Failed to run rollback activation: {e}; system may be in an \
-                             inconsistent state"
-                        );
-                    },
-                }
-            } else {
-                tracing::error!(
-                    "Failed to restore system profile; system may be in an inconsistent state — \
-                     manually run: sudo nix-env --profile {} --set {prev_str}",
-                    profile
-                );
-            }
-        }
-        return Err(color_eyre::eyre::eyre!(
-            "Activation failed (exit {})",
-            status.code().unwrap_or(1)
-        ));
+    activation::apply(&activation::Request {
+        profile: &profile,
+        generation: Path::new(&system_path),
+        specialisation: opts.specialisation.as_deref(),
+        action,
+        install_bootloader: opts.install_bootloader,
+    })?;
+    if action == Action::DryActivate {
+        return Ok(());
     }
 
     tracing::info!("System activation complete");
@@ -439,7 +314,7 @@ fn cmd_update(installable: &str, extra: &[String]) -> color_eyre::Result<()> {
         install_bootloader: false,
         specialisation: None,
     };
-    cmd_activate(installable, "switch", false, extra, &opts)
+    cmd_activate(installable, Action::Switch, extra, &opts)
 }
 
 /// Populate the store path index from the closure of a built store path.
@@ -717,45 +592,13 @@ fn cmd_rollback(target_gen: Option<u64>, dry_run: bool, profile: &str) -> color_
         return Ok(());
     }
 
-    let target_path_str = target_path
-        .to_str()
-        .ok_or_else(|| color_eyre::eyre::eyre!("generation path is not valid UTF-8"))?;
-
-    // Set the profile to the target generation.
-    let status = Command::new("sudo")
-        .arg("nix-env")
-        .arg("--profile")
-        .arg(profile)
-        .arg("--set")
-        .arg(target_path_str)
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .status()
-        .map_err(|e| color_eyre::eyre::eyre!("failed to set system profile: {e}"))?;
-
-    if !status.success() {
-        return Err(color_eyre::eyre::eyre!(
-            "Failed to set system profile (exit {})",
-            status.code().unwrap_or(1)
-        ));
-    }
-
-    // Activate.
-    let activate_cmd = format!("{target_path_str}/bin/switch-to-configuration");
-    let status = Command::new("sudo")
-        .arg(&activate_cmd)
-        .arg("switch")
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .status()
-        .map_err(|e| color_eyre::eyre::eyre!("failed to run activation: {e}"))?;
-
-    if !status.success() {
-        return Err(color_eyre::eyre::eyre!(
-            "Rollback activation failed (exit {})",
-            status.code().unwrap_or(1)
-        ));
-    }
+    activation::apply(&activation::Request {
+        profile,
+        generation: target_path,
+        specialisation: None,
+        action: Action::Switch,
+        install_bootloader: false,
+    })?;
 
     tracing::info!("Rolled back to generation {target_num}");
     Ok(())
