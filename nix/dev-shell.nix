@@ -4,6 +4,7 @@
   pkg-config,
   protobuf,
   fuse3,
+  iets,
 }:
 
 stdenv.mkDerivation {
@@ -19,6 +20,7 @@ stdenv.mkDerivation {
       "rustc"
       "rustfmt-preview"
     ])
+    iets
   ];
 
   buildInputs = [

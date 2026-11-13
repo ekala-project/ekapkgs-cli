@@ -43,6 +43,22 @@
         "type": "github"
       }
     },
+    "iets-src": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1794002605,
+        "narHash": "sha256-RdC/th6UsZ+QBbtgrs2nFXhFX3sY/lAxTbd4B+vhDz8=",
+        "owner": "numtide",
+        "repo": "iets",
+        "rev": "5e9589e7570bfdf7997e5583d08533f0b95b5393",
+        "type": "github"
+      },
+      "original": {
+        "owner": "numtide",
+        "repo": "iets",
+        "type": "github"
+      }
+    },
     "nix-lib": {
       "locked": {
         "lastModified": 1794347280,
@@ -94,6 +110,7 @@
       "inputs": {
         "corepkgs": "corepkgs",
         "fenix": "fenix",
+        "iets-src": "iets-src",
         "nixpkgs": "nixpkgs",
         "treefmt-nix": "treefmt-nix",
         "utils": "utils"
