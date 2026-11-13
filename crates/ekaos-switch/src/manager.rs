@@ -1,9 +1,4 @@
 //! The running system manager, over D-Bus.
-//!
-//! systemd is reached on its private socket, as root's `systemctl` does,
-//! so a switch works without a system bus daemon and survives the bus
-//! being restarted by the switch itself. Only the logind query uses the
-//! system bus.
 
 use std::collections::{BTreeMap, HashMap};
 use std::num::NonZeroUsize;
@@ -12,9 +7,8 @@ use std::time::Duration;
 use futures::StreamExt as _;
 use futures::channel::oneshot;
 use futures::future::{Either, select};
-use zbus::message::Type as MessageType;
 use zbus::proxy::CacheProperties;
-use zbus::{Connection, MatchRule, MessageStream, OwnedObjectPath};
+use zbus::{Connection, OwnedObjectPath};
 
 use crate::Error;
 use crate::plan::UnitState;
@@ -25,11 +19,6 @@ const DAEMON_RELOAD_TIMEOUT: Duration = Duration::from_secs(180);
 const SETTLE_INTERVAL: Duration = Duration::from_millis(250);
 const SETTLE_MAX: Duration = Duration::from_secs(90);
 const BUS_TIMEOUT: Duration = Duration::from_secs(25);
-const RECONNECT_INTERVAL: Duration = Duration::from_millis(250);
-
-const PRIVATE_SOCKET: &str = "unix:path=/run/systemd/private";
-const SYSTEMD_PATH: &str = "/org/freedesktop/systemd1";
-const SYSTEMD_MANAGER: &str = "org.freedesktop.systemd1.Manager";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JobKind {
@@ -171,80 +160,85 @@ fn sleep(duration: Duration) -> oneshot::Receiver<()> {
     rx
 }
 
-/// A connection to systemd's private socket, subscribed to job signals.
-struct Private {
+/// The system manager on the system bus.
+pub struct DbusManager {
     conn: Connection,
     systemd: Systemd1ManagerProxy<'static>,
-    jobs_removed: MessageStream,
-    reloading: MessageStream,
-}
-
-impl Private {
-    async fn connect() -> zbus::Result<Self> {
-        let mut conn = zbus::conn::Builder::address(PRIVATE_SOCKET)
-            .p2p()
-            .method_timeout(BUS_TIMEOUT)
-            .build()
-            .await?;
-        // Every job of a large switch is reported through these streams;
-        // don't let notifications back up.
-        conn.set_max_queued(NonZeroUsize::new(1 << 16).expect("non-zero"));
-        let systemd = Systemd1ManagerProxy::builder(&conn)
-            .cache_properties(CacheProperties::No)
-            .build()
-            .await?;
-        // A proxy's signal streams look the sender up on the bus, which a
-        // peer connection has none of, so match the signals directly.
-        // The streams exist before Subscribe, so no job signal is missed.
-        let jobs_removed = signal_stream(&conn, "JobRemoved").await?;
-        let reloading = signal_stream(&conn, "Reloading").await?;
-        systemd.subscribe().await?;
-        Ok(Self {
-            conn,
-            systemd,
-            jobs_removed,
-            reloading,
-        })
-    }
-}
-
-async fn signal_stream(conn: &Connection, member: &'static str) -> zbus::Result<MessageStream> {
-    let rule = MatchRule::builder()
-        .msg_type(MessageType::Signal)
-        .path(SYSTEMD_PATH)
-        .interface(SYSTEMD_MANAGER)
-        .member(member)
-        .build()?;
-    MessageStream::for_match_rule(rule, conn, None).await
-}
-
-/// The system manager, on systemd's private socket.
-pub struct DbusManager {
-    bus: Private,
+    jobs_removed: JobRemovedStream,
+    reloading: ReloadingStream,
     pending: HashMap<OwnedObjectPath, (String, JobKind)>,
     failed: Vec<FailedJob>,
 }
 
 impl DbusManager {
     pub fn system() -> Result<Self, Error> {
-        let bus = zbus::block_on(Private::connect()).map_err(Error::Dbus)?;
-        Ok(Self {
-            bus,
-            pending: HashMap::new(),
-            failed: Vec::new(),
+        zbus::block_on(async {
+            let mut conn = zbus::conn::Builder::system()
+                .method_timeout(BUS_TIMEOUT)
+                .build()
+                .await?;
+            // Every job of a large switch is reported through this stream;
+            // don't let notifications back up.
+            conn.set_max_queued(NonZeroUsize::new(1 << 16).expect("non-zero"));
+            let systemd = Systemd1ManagerProxy::builder(&conn)
+                .cache_properties(CacheProperties::No)
+                .build()
+                .await?;
+            // Match rules are in place before Subscribe, so no job signal
+            // is missed.
+            let jobs_removed = systemd.receive_job_removed().await?;
+            let reloading = systemd.receive_reloading().await?;
+            systemd.subscribe().await?;
+            Ok::<_, zbus::Error>(Self {
+                conn,
+                systemd,
+                jobs_removed,
+                reloading,
+                pending: HashMap::new(),
+                failed: Vec::new(),
+            })
         })
+        .map_err(Error::Dbus)
     }
 
     async fn unit_path(&self, unit: &str) -> zbus::Result<OwnedObjectPath> {
-        self.bus.systemd.get_unit(unit).await
+        self.systemd.get_unit(unit).await
     }
 
     async fn unit_proxy(&self, path: OwnedObjectPath) -> zbus::Result<Systemd1UnitProxy<'static>> {
-        Systemd1UnitProxy::builder(&self.bus.conn)
+        Systemd1UnitProxy::builder(&self.conn)
             .path(path)
             .cache_properties(CacheProperties::No)
             .build()
             .await
+    }
+
+    /// Call a method that only signals completion, and wait for it.
+    fn reload_like(
+        &mut self,
+        what: &'static str,
+        call: impl AsyncFnOnce(&Systemd1ManagerProxy<'static>) -> zbus::Result<()>,
+    ) -> Result<(), Error> {
+        let systemd = self.systemd.clone();
+        let reloading = &mut self.reloading;
+        zbus::block_on(async move {
+            call(&systemd).await?;
+            let finished = async {
+                while let Some(signal) = reloading.next().await {
+                    if let Ok(args) = signal.args()
+                        && !*args.active()
+                    {
+                        return true;
+                    }
+                }
+                false
+            };
+            match select(Box::pin(finished), sleep(DAEMON_RELOAD_TIMEOUT)).await {
+                Either::Left((true, _)) => Ok(()),
+                Either::Left((false, _)) => Err(Error::Disconnected(what)),
+                Either::Right(_) => Err(Error::Timeout(what)),
+            }
+        })
     }
 }
 
@@ -253,7 +247,7 @@ impl Manager for DbusManager {
         zbus::block_on(async {
             let mut active = BTreeMap::new();
             for (id, _, _, state, substate, following, path, ..) in
-                self.bus.systemd.list_units().await?
+                self.systemd.list_units().await?
             {
                 if !following.is_empty() || state == "inactive" {
                     continue;
@@ -289,7 +283,7 @@ impl Manager for DbusManager {
     fn exec_main_status(&mut self, unit: &str) -> Result<i32, Error> {
         zbus::block_on(async {
             let path = self.unit_path(unit).await?;
-            Systemd1ServiceProxy::builder(&self.bus.conn)
+            Systemd1ServiceProxy::builder(&self.conn)
                 .path(path)
                 .cache_properties(CacheProperties::No)
                 .build()
@@ -303,10 +297,10 @@ impl Manager for DbusManager {
     fn submit(&mut self, kind: JobKind, unit: &str) -> Result<(), Error> {
         let job = zbus::block_on(async {
             match kind {
-                JobKind::Start => self.bus.systemd.start_unit(unit, "replace").await,
-                JobKind::Stop => self.bus.systemd.stop_unit(unit, "replace").await,
-                JobKind::Restart => self.bus.systemd.restart_unit(unit, "replace").await,
-                JobKind::Reload => self.bus.systemd.reload_unit(unit, "replace").await,
+                JobKind::Start => self.systemd.start_unit(unit, "replace").await,
+                JobKind::Stop => self.systemd.stop_unit(unit, "replace").await,
+                JobKind::Restart => self.systemd.restart_unit(unit, "replace").await,
+                JobKind::Reload => self.systemd.reload_unit(unit, "replace").await,
             }
         })
         .map_err(Error::Dbus)?;
@@ -317,15 +311,12 @@ impl Manager for DbusManager {
     fn wait_jobs(&mut self) -> Result<(), Error> {
         let pending = &mut self.pending;
         let failed = &mut self.failed;
-        let stream = &mut self.bus.jobs_removed;
+        let stream = &mut self.jobs_removed;
         zbus::block_on(async {
             while !pending.is_empty() {
                 tracing::debug!("waiting for {} job(s)", pending.len());
-                let Some(msg) = stream.next().await else {
+                let Some(signal) = stream.next().await else {
                     return Err(Error::Disconnected("waiting for jobs"));
-                };
-                let Some(signal) = msg.ok().and_then(JobRemoved::from_message) else {
-                    continue;
                 };
                 let Ok(args) = signal.args() else { continue };
                 if let Some((unit, kind)) = pending.remove(args.job())
@@ -347,65 +338,19 @@ impl Manager for DbusManager {
     }
 
     fn reexecute(&mut self) -> Result<(), Error> {
-        let bus = &mut self.bus;
-        zbus::block_on(async {
-            // systemd drops its private connections when it re-executes;
-            // that is the only sign it has gone, so wait for it and connect
-            // to the new instance.
-            bus.systemd.reexecute().await?;
-            let disconnected = async { while bus.reloading.next().await.is_some() {} };
-            if let Either::Right(_) =
-                select(Box::pin(disconnected), sleep(DAEMON_RELOAD_TIMEOUT)).await
-            {
-                return Err(Error::Timeout("systemd re-execution"));
-            }
-
-            let mut waited = Duration::ZERO;
-            loop {
-                match Private::connect().await {
-                    Ok(new) => {
-                        *bus = new;
-                        return Ok(());
-                    },
-                    Err(e) if waited >= DAEMON_RELOAD_TIMEOUT => return Err(Error::Dbus(e)),
-                    Err(e) => tracing::debug!("systemd not back yet: {e}"),
-                }
-                let _ = sleep(RECONNECT_INTERVAL).await;
-                waited += RECONNECT_INTERVAL;
-            }
-        })
+        self.reload_like("systemd re-execution", async |s| s.reexecute().await)
     }
 
     fn reload(&mut self) -> Result<(), Error> {
-        let bus = &mut self.bus;
-        zbus::block_on(async {
-            bus.systemd.reload().await?;
-            let finished = async {
-                while let Some(msg) = bus.reloading.next().await {
-                    let Ok(msg) = msg else { continue };
-                    if let Some(signal) = Reloading::from_message(msg)
-                        && let Ok(args) = signal.args()
-                        && !*args.active()
-                    {
-                        return true;
-                    }
-                }
-                false
-            };
-            match select(Box::pin(finished), sleep(DAEMON_RELOAD_TIMEOUT)).await {
-                Either::Left((true, _)) => Ok(()),
-                Either::Left((false, _)) => Err(Error::Disconnected("reloading systemd")),
-                Either::Right(_) => Err(Error::Timeout("systemd reload")),
-            }
-        })
+        self.reload_like("systemd reload", async |s| s.reload().await)
     }
 
     fn reset_failed(&mut self) -> Result<(), Error> {
-        zbus::block_on(self.bus.systemd.reset_failed()).map_err(Error::Dbus)
+        zbus::block_on(self.systemd.reset_failed()).map_err(Error::Dbus)
     }
 
     fn settle(&mut self) {
-        let stream = &mut self.bus.jobs_removed;
+        let stream = &mut self.jobs_removed;
         zbus::block_on(async {
             let mut waited = Duration::ZERO;
             while waited < SETTLE_MAX {
@@ -420,20 +365,7 @@ impl Manager for DbusManager {
 
     fn users(&mut self) -> Result<Vec<User>, Error> {
         zbus::block_on(async {
-            // logind is only on the system bus. Without one there is no
-            // logind, so no user managers to update.
-            let conn = match zbus::conn::Builder::system()
-                .method_timeout(BUS_TIMEOUT)
-                .build()
-                .await
-            {
-                Ok(conn) => conn,
-                Err(e) => {
-                    tracing::debug!("no system bus, skipping user managers: {e}");
-                    return Ok(Vec::new());
-                },
-            };
-            let logind = Login1ManagerProxy::new(&conn).await?;
+            let logind = Login1ManagerProxy::new(&self.conn).await?;
             let users = logind.list_users().await?;
             Ok::<_, zbus::Error>(
                 users
