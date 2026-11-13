@@ -9,6 +9,7 @@
   - `system`, `home` and `deploy` builds use `--print-out-paths` instead of `--json`, so they run on iets
   - `system` and `home` probe their default configuration with `nix eval --raw <installable>.type` instead of `--apply`, so the probe runs on iets
   - `template` prefetches source hashes with `iets prefetch`
+- `cache add`, `cache remove` and the `cache auth` commands keep every key when they rewrite `config.toml`; they dropped `channel_input`, `channel_url`, `index_url` and `evaluator` from `[defaults]`
 - `cache warm` evaluates against each lock with `--reference-lock-file --no-write-lock-file` instead of copying `flake.nix` and `nix/` to a temp directory, so flakes that use other files evaluate correctly
   - `evaluator = "auto" | "iets" | "nix"` under `[defaults]` in `config.toml` selects the evaluator (default `auto`); `EKAPKGS_EVALUATOR` overrides it
   - The Nix package wraps `ekapkgs` with iets on `PATH`, and the dev shell includes it

@@ -1374,40 +1374,7 @@ fn save_config(config: &ClientConfig) -> color_eyre::Result<()> {
     std::fs::create_dir_all(&config_dir)?;
     let config_path = config_dir.join("config.toml");
 
-    // Serialize manually to TOML since we need serde::Serialize.
-    let mut content = String::new();
-
-    content.push_str("[defaults]\n");
-    content.push_str(&format!(
-        "max_parallel_downloads = {}\n",
-        config.defaults.max_parallel_downloads
-    ));
-    if config.defaults.evaluator != ekapkgs_nix::iets::Evaluator::default() {
-        content.push_str(&format!(
-            "evaluator = {:?}\n",
-            config.defaults.evaluator.as_str()
-        ));
-    }
-    content.push('\n');
-
-    for cache in &config.caches {
-        content.push_str("[[caches]]\n");
-        content.push_str(&format!("name = {:?}\n", cache.name));
-        content.push_str(&format!("url = {:?}\n", cache.url));
-        if let Some(ref key) = cache.trusted_key {
-            content.push_str(&format!("trusted_key = {:?}\n", key));
-        }
-        if let Some(ref root) = cache.trust_root {
-            content.push_str(&format!("trust_root = {:?}\n", root));
-        }
-        if let Some(ref token) = cache.token {
-            content.push_str(&format!("token = {:?}\n", token));
-        }
-        content.push_str(&format!("priority = {}\n", cache.priority));
-        let protocol = format!("{:?}", cache.protocol).to_lowercase();
-        content.push_str(&format!("protocol = {:?}\n", protocol));
-        content.push('\n');
-    }
+    let content = toml::to_string_pretty(config)?;
 
     // Write with restrictive permissions since the file may contain tokens.
     {
