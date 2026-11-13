@@ -17,8 +17,8 @@ use crate::unit::{self, Comparison, UnitInfo};
 pub struct UnitState {
     pub state: String,
     pub substate: String,
-    /// Where the unit was loaded from. Only units under the system unit
-    /// directory are managed by the engine.
+    /// Where the unit was loaded from. systemd follows the unit file's
+    /// symlinks, so a managed unit may be reported at its store path.
     pub fragment_path: String,
 }
 
@@ -250,11 +250,10 @@ impl<'a> Planner<'a> {
 
     /// Classify every active unit that the running generation manages.
     pub fn classify_active(&mut self) -> Result<(), Error> {
-        let current_dir = self.current_units.to_string_lossy().into_owned();
-
         for (unit, state) in self.active {
-            // Leave units from generators and other directories alone.
-            if !state.fragment_path.starts_with(&current_dir) {
+            // A unit loaded from a directory that takes precedence over
+            // the managed one is not the generation's to switch.
+            if overrides_unit_dir(&state.fragment_path) {
                 continue;
             }
             if !matches!(state.state.as_str(), "active" | "activating") {
@@ -510,6 +509,22 @@ impl<'a> Planner<'a> {
     }
 }
 
+/// Unit directories that take precedence over /etc/systemd/system.
+const OVERRIDING_UNIT_DIRS: &[&str] = &[
+    "/etc/systemd/system.control/",
+    "/run/systemd/system.control/",
+    "/run/systemd/transient/",
+    "/run/systemd/generator.early/",
+];
+
+/// Whether a unit was loaded from a directory that overrides the
+/// generation's units.
+fn overrides_unit_dir(fragment_path: &str) -> bool {
+    OVERRIDING_UNIT_DIRS
+        .iter()
+        .any(|dir| fragment_path.starts_with(dir))
+}
+
 fn load(unit_file: &Path, base: &Path) -> Result<UnitInfo, Error> {
     UnitInfo::load(unit_file, base)
         .map_err(|e| Error::io(format!("reading unit {}", unit_file.display()), e))
@@ -682,12 +697,31 @@ mod tests {
     }
 
     #[test]
-    fn units_outside_the_unit_directory_are_ignored() {
+    fn units_from_overriding_directories_are_ignored() {
+        for dir in ["/run/systemd/transient", "/run/systemd/generator.early"] {
+            let mut f = Fixture::new();
+            f.both("a.service", A, B).active("a.service");
+            f.active.get_mut("a.service").unwrap().fragment_path = format!("{dir}/a.service");
+            assert_eq!(f.plan(), Plan::default(), "{dir}");
+        }
+    }
+
+    #[test]
+    fn units_reported_at_their_store_path_are_managed() {
+        // systemd reports e.g. multi-user.target at the file its
+        // /etc/systemd/system link resolves to.
         let mut f = Fixture::new();
-        f.both("a.service", A, B).active("a.service");
-        f.active.get_mut("a.service").unwrap().fragment_path =
-            "/run/systemd/generator/a.service".to_owned();
-        assert_eq!(f.plan(), Plan::default());
+        f.both("a.service", A, B)
+            .both("multi-user.target", "[Unit]\n", "[Unit]\n")
+            .active("a.service")
+            .active("multi-user.target");
+        for unit in ["a.service", "multi-user.target"] {
+            f.active.get_mut(unit).unwrap().fragment_path =
+                format!("/nix/store/aaaa-systemd/example/systemd/system/{unit}");
+        }
+        let plan = f.plan();
+        assert_eq!(plan.stop, set(&["a.service"]));
+        assert_eq!(plan.start, set(&["a.service", "multi-user.target"]));
     }
 
     #[test]
