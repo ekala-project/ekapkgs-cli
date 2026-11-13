@@ -109,6 +109,32 @@ fn discover_generations(profile_path: &str) -> color_eyre::Result<Vec<Generation
     Ok(generations)
 }
 
+/// The number of the generation `profile` points at.
+///
+/// nix-env points a profile at its generation link (`system-2-link`), so
+/// the generation is read from the link name; several generations can
+/// hold the same store path. A profile set some other way is matched by
+/// its store path.
+fn current_generation(profile: &str, generations: &[Generation]) -> Option<u64> {
+    let target = std::fs::read_link(profile).ok()?;
+    let base = Path::new(profile).file_name()?.to_string_lossy();
+    let by_link = target
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.strip_prefix(&format!("{base}-")))
+        .and_then(|rest| rest.strip_suffix("-link"))
+        .and_then(|n| n.parse().ok())
+        .filter(|n| generations.iter().any(|g| g.number == *n));
+    by_link.or_else(|| {
+        let path = std::fs::canonicalize(profile).ok()?;
+        generations
+            .iter()
+            .rev()
+            .find(|g| std::fs::canonicalize(&g.path).ok().as_ref() == Some(&path))
+            .map(|g| g.number)
+    })
+}
+
 /// Nix profile for imperatively-installed system packages.
 const PACKAGES_PROFILE: &str = "/nix/var/nix/profiles/ekapkgs-system-packages";
 
@@ -510,8 +536,7 @@ fn cmd_list_generations(json_output: bool, profile: &str) -> color_eyre::Result<
         return Ok(());
     }
 
-    // Find current generation.
-    let current_target = std::fs::read_link(profile).ok();
+    let current = current_generation(profile, &generations);
 
     if json_output {
         let entries: Vec<serde_json::Value> = generations
@@ -521,14 +546,14 @@ fn cmd_list_generations(json_output: bool, profile: &str) -> color_eyre::Result<
                     "number": g.number,
                     "path": g.path.to_string_lossy(),
                     "created_at": g.created.to_string(),
-                    "current": current_target.as_ref() == Some(&g.path),
+                    "current": current == Some(g.number),
                 })
             })
             .collect();
         println!("{}", serde_json::to_string_pretty(&entries)?);
     } else {
         for g in &generations {
-            let marker = if current_target.as_ref() == Some(&g.path) {
+            let marker = if current == Some(g.number) {
                 " (current)"
             } else {
                 ""
@@ -541,10 +566,8 @@ fn cmd_list_generations(json_output: bool, profile: &str) -> color_eyre::Result<
 }
 
 fn cmd_rollback(target_gen: Option<u64>, dry_run: bool, profile: &str) -> color_eyre::Result<()> {
-    let current_target = std::fs::read_link(profile)
-        .map_err(|e| color_eyre::eyre::eyre!("failed to read system profile: {e}"))?;
-
     let generations = discover_generations(profile)?;
+    let current = current_generation(profile, &generations);
 
     let target = match target_gen {
         Some(num) => generations
@@ -558,7 +581,7 @@ fn cmd_rollback(target_gen: Option<u64>, dry_run: bool, profile: &str) -> color_
             })?,
         None => {
             // Find the generation before the current one.
-            let current_idx = generations.iter().position(|g| g.path == current_target);
+            let current_idx = current.and_then(|n| generations.iter().position(|g| g.number == n));
             match current_idx {
                 Some(idx) if idx > 0 => &generations[idx - 1],
                 Some(_) => {
@@ -573,7 +596,7 @@ fn cmd_rollback(target_gen: Option<u64>, dry_run: bool, profile: &str) -> color_
         },
     };
 
-    if target.path == current_target {
+    if current == Some(target.number) {
         tracing::warn!(
             "Generation {} is already the active generation",
             target.number
@@ -1113,4 +1136,48 @@ fn cmd_packages_import(file: &str, merge: bool) -> color_eyre::Result<()> {
     );
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn generation(number: u64, path: &Path) -> Generation {
+        Generation {
+            number,
+            path: path.to_owned(),
+            created: Timestamp::UNIX_EPOCH,
+        }
+    }
+
+    #[test]
+    fn the_current_generation_is_read_from_the_profile_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = (dir.path().join("a"), dir.path().join("b"));
+        std::fs::create_dir(&a).unwrap();
+        std::fs::create_dir(&b).unwrap();
+        // Generations 1 and 3 hold the same system
+        for (n, target) in [(1, &a), (2, &b), (3, &a)] {
+            std::os::unix::fs::symlink(target, dir.path().join(format!("system-{n}-link")))
+                .unwrap();
+        }
+        let profile = dir.path().join("system");
+        std::os::unix::fs::symlink("system-1-link", &profile).unwrap();
+        let profile = profile.to_str().unwrap();
+
+        let gens = discover_generations(profile).unwrap();
+        assert_eq!(current_generation(profile, &gens), Some(1));
+
+        std::fs::remove_file(profile).unwrap();
+        std::os::unix::fs::symlink("system-3-link", profile).unwrap();
+        assert_eq!(current_generation(profile, &gens), Some(3));
+
+        // Not a generation link: matched by store path, newest first
+        std::fs::remove_file(profile).unwrap();
+        std::os::unix::fs::symlink(&a, profile).unwrap();
+        assert_eq!(
+            current_generation(profile, &[generation(1, &a), generation(3, &a)]),
+            Some(3)
+        );
+    }
 }
