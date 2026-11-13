@@ -14,16 +14,39 @@ The `castore` storage backend decomposes NARs into a content-addressed Merkle tr
 
 ```
 {root}/
-  chunks/{hex[0..4]}/{hex}.chunk   — FastCDC blob chunks (16K-256K, 64K avg)
+  chunks/{hex[0..4]}/{hex}.chunk   — FastCDC blob chunks of 1 KiB or more (16K-256K, 64K avg)
+  packs/pack-NNNNNN.dat            — chunks under 1 KiB, appended as records
   castore.db                       — SQLite metadata (WAL mode)
+  castore.db.recover-from          — present while a background copy is pending (see below)
 ```
 
-### SQLite schema (castore.db)
+### Pack files (`storage/pack.rs`)
+
+Chunks smaller than `INLINE_THRESHOLD` (1 KiB) are appended to pack files instead of being stored in SQLite, so the database holds only metadata. Each record is `digest (32) | len (u32 LE) | data`, after an 8-byte `EKPACK01` header.
+
+- Reads verify the stored digest, length and blake3 of the data; a damaged or torn record reads as a missing chunk.
+- Each process start writes to a new pack (never after a possibly torn tail). Packs rotate at 1 GiB.
+- Writers must call `PackStore::sync()` before committing rows that point into a pack (`put_nar`, `store_chunk`, recovery batches do).
+- Packs are never rewritten: chunks evicted by GC leave dead bytes. There is no compaction yet.
+
+### SQLite schema (castore.db, `SCHEMA_VERSION` = 2)
 
 - `cas_paths` — maps store path hash → root CaNode (protobuf), narinfo metadata, `last_access` for GC
-- `chunks` — chunk digest → size
-- `file_chunks` — file digest → ordered list of (chunk_digest, chunk_size) pairs
+- `chunks` (`WITHOUT ROWID`) — chunk digest → size, `zstd_level`, `disk_size`, and `pack_id`/`pack_offset` for packed chunks
+- `file_chunks` (`WITHOUT ROWID`) — file digest → ordered list of (chunk_digest, chunk_size) pairs
+- `path_files` (`WITHOUT ROWID`) — store path hash → file digests, for GC reference checks
 - `directories` — directory digest → serialized CaDirectory protobuf
+- `_meta` — `schema_version`, `clean_shutdown`
+
+The GC-only indexes (`GC_INDEXES`) are created in `open_db`, not `create_tables`, so they can be skipped while a background copy is pending.
+
+### Schema migration
+
+v1 databases (small chunk data in `chunks.data`, rowid tables, no `schema_version`) are not upgraded in place. `open_db` renames the file to `castore.db.v1-<ts>`, starts a fresh v2 database, and the background copy (`spawn_recovery`, same as corruption recovery) moves the rows over, appending inline data to packs. The cache is partially populated until the copy finishes. The old file is kept; the log says when it can be deleted. Offline tools (`compress-chunks`) refuse to run on a v1 database (`require_current_schema`).
+
+### WAL size
+
+`journal_size_limit` (64 MiB) shrinks the WAL whenever it is reset, and `spawn_wal_maintenance` tries a `wal_checkpoint(TRUNCATE)` every 5 minutes, waiting at most 250 ms for readers. Automatic PASSIVE checkpoints alone can't reset the WAL while readers are active, which let it grow to several GB.
 
 ### Ingest flow (`put_nar`)
 
@@ -67,6 +90,16 @@ The client pull command (`commands/cache.rs`) tries in order:
 3. **HTTP batch** — individual HTTP GET per NAR
 
 Each tier falls back to the next on failure or if the server doesn't support it.
+
+### Startup integrity and crash recovery
+
+Startup never scans the database, so systemd's start timeout can't be hit on a large cache.
+
+- `_meta.clean_shutdown` is set to `0` at startup and `1` in `on_shutdown`. The server handles SIGTERM/SIGINT by draining connections (10s cap) and then calling `on_shutdown`.
+- If the previous run was unclean, `spawn_integrity_check` runs `PRAGMA quick_check` on a read-only connection in the background while the server keeps serving. `mark_clean_shutdown` is skipped until that check passes, so an interrupted check runs again on the next start.
+- If corruption is found, it writes `castore.db.needs-recovery` and exits with status 75. On restart, `open_db` sees the marker, renames the DB to `castore.db.corrupt-<ts>`, starts with an empty DB, and `spawn_recovery` copies back whatever rows it can read.
+- The copy source is recorded in `castore.db.recover-from`. If the server restarts before the copy finishes, it resumes on the next start (inserts are `OR IGNORE`, and packed chunks are checked before appending). The marker is removed when the copy completes.
+- While recovery runs: the GC-only indexes (`GC_INDEXES`) are dropped and rebuilt at the end, the writer uses a 512 MiB cache and `synchronous=NORMAL`, the bloom filters stay bypassed so recovered rows are served immediately, and `path_files_ready` stays `false` so GC and the `path_files` backfill don't run.
 
 ### GC support
 

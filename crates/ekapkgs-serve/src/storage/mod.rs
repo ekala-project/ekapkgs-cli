@@ -1,6 +1,7 @@
 pub mod castore;
 pub mod filesystem;
 pub mod nix_store;
+pub mod pack;
 
 /// Parsed narinfo metadata.
 #[derive(Debug, Clone)]

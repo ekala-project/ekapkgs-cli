@@ -658,8 +658,8 @@ fn cmd_compress_chunks(
         "PRAGMA journal_mode=WAL;PRAGMA synchronous=FULL;PRAGMA busy_timeout=5000;",
     )?;
 
-    // Ensure new columns exist (idempotent migration).
-    storage::castore::ensure_compression_columns(&conn)?;
+    // Schema migrations happen in the server; don't touch an old database.
+    storage::castore::require_current_schema(&conn)?;
 
     const TARGET_LEVEL: i32 = 3;
 
@@ -1015,6 +1015,8 @@ async fn cmd_serve(cli: Cli) -> color_eyre::Result<()> {
                 )?);
                 storage_root = Some(path);
                 backend.spawn_warmup();
+                backend.spawn_wal_maintenance();
+                backend.spawn_integrity_check();
                 backend.spawn_recovery();
                 backend.spawn_backfill();
                 let gc_t = if let Some(gc_raw) = gc {
@@ -1173,11 +1175,22 @@ async fn cmd_serve(cli: Cli) -> color_eyre::Result<()> {
     // Check for systemd socket activation.
     let inherited_listener = try_socket_activation()?;
 
+    // Without this, SIGTERM from `systemctl stop` kills the process before
+    // `on_shutdown` runs, so every restart looks like a crash and triggers the
+    // integrity check.
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    tokio::spawn(async move {
+        shutdown_signal().await;
+        let _ = shutdown_tx.send(true);
+    });
+
     if let Some(listener) = inherited_listener {
         tracing::info!("Using systemd socket activation");
         notify_ready();
         spawn_watchdog();
-        axum::serve(listener, app).await?;
+        let serve = axum::serve(listener, app)
+            .with_graceful_shutdown(wait_for_shutdown(shutdown_rx.clone()));
+        serve_with_drain_deadline(serve, shutdown_rx).await?;
     } else if is_unix {
         let socket_path = bind_addr.strip_prefix("unix:").unwrap();
         // Remove stale socket file.
@@ -1192,7 +1205,9 @@ async fn cmd_serve(cli: Cli) -> color_eyre::Result<()> {
         tracing::info!("Listening on unix:{socket_path} (gRPC + HTTP)");
         notify_ready();
         spawn_watchdog();
-        axum::serve(listener, app.into_make_service()).await?;
+        let serve = axum::serve(listener, app.into_make_service())
+            .with_graceful_shutdown(wait_for_shutdown(shutdown_rx.clone()));
+        serve_with_drain_deadline(serve, shutdown_rx).await?;
     } else if use_tls {
         let cert_path = tls_cert_path.unwrap();
         let key_path = tls_key_path.unwrap();
@@ -1204,9 +1219,19 @@ async fn cmd_serve(cli: Cli) -> color_eyre::Result<()> {
         tracing::info!("Listening on {addr} with TLS (gRPC + HTTP)");
         notify_ready();
         spawn_watchdog();
-        axum_server::bind_rustls(addr, rustls_config)
-            .serve(app.into_make_service())
-            .await?;
+        let handle = axum_server::Handle::new();
+        {
+            let handle = handle.clone();
+            let rx = shutdown_rx.clone();
+            tokio::spawn(async move {
+                wait_for_shutdown(rx).await;
+                handle.graceful_shutdown(Some(SHUTDOWN_DRAIN_TIMEOUT));
+            });
+        }
+        let serve = axum_server::bind_rustls(addr, rustls_config)
+            .handle(handle)
+            .serve(app.into_make_service());
+        serve_with_drain_deadline(serve, shutdown_rx).await?;
     } else {
         let addr: SocketAddr = bind_addr.parse()?;
         let listener = tokio::net::TcpListener::bind(addr).await?;
@@ -1218,7 +1243,9 @@ async fn cmd_serve(cli: Cli) -> color_eyre::Result<()> {
         }
         notify_ready();
         spawn_watchdog();
-        axum::serve(listener, app).await?;
+        let serve = axum::serve(listener, app)
+            .with_graceful_shutdown(wait_for_shutdown(shutdown_rx.clone()));
+        serve_with_drain_deadline(serve, shutdown_rx).await?;
     };
 
     // Mark the storage backend for clean shutdown so the next startup can
@@ -1247,6 +1274,70 @@ fn warn_insecure_key_permissions(path: &std::path::Path) {
 fn warn_insecure_key_permissions(_path: &std::path::Path) {}
 
 /// Send `READY=1` to systemd if the notify socket is available.
+/// How long in-flight requests get to finish after a shutdown signal before
+/// the server stops anyway. Kept well under systemd's stop timeout so the
+/// clean-shutdown marker is always written.
+const SHUTDOWN_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Resolve on SIGTERM or SIGINT.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut sig) => {
+                sig.recv().await;
+            },
+            Err(e) => {
+                tracing::warn!("failed to install SIGTERM handler: {e}");
+                std::future::pending::<()>().await;
+            },
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        () = ctrl_c => {},
+        () = terminate => {},
+    }
+    tracing::info!("shutdown signal received — draining connections");
+    let _ = sd_notify::notify(false, &[sd_notify::NotifyState::Stopping]);
+}
+
+/// Resolve once the shutdown channel flips to `true`.
+async fn wait_for_shutdown(mut rx: tokio::sync::watch::Receiver<bool>) {
+    let _ = rx.wait_for(|stop| *stop).await;
+}
+
+/// Drive `serve` to completion, but once shutdown is requested give it at most
+/// `SHUTDOWN_DRAIN_TIMEOUT` to drain (long-lived streams would otherwise hold
+/// shutdown open until systemd sends SIGKILL).
+async fn serve_with_drain_deadline<F>(
+    serve: F,
+    shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) -> std::io::Result<()>
+where
+    F: std::future::IntoFuture<Output = std::io::Result<()>>,
+{
+    let serve = serve.into_future();
+    tokio::pin!(serve);
+    tokio::select! {
+        res = &mut serve => return res,
+        () = wait_for_shutdown(shutdown_rx) => {},
+    }
+    if let Ok(res) = tokio::time::timeout(SHUTDOWN_DRAIN_TIMEOUT, serve).await {
+        res
+    } else {
+        tracing::warn!(
+            "connections still open after {SHUTDOWN_DRAIN_TIMEOUT:?} — shutting down anyway"
+        );
+        Ok(())
+    }
+}
+
 fn notify_ready() {
     if let Err(e) = sd_notify::notify(false, &[sd_notify::NotifyState::Ready]) {
         tracing::warn!("sd_notify READY=1 failed (non-fatal): {e}");

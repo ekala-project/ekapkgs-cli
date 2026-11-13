@@ -5,8 +5,8 @@
 //! are stored only once.
 //!
 //! On-disk layout:
-//!   {root}/chunks/{hex[0..4]}/{hex}.chunk  — blob chunks
-//!   {root}/dirs/{hex}.dir                  — serialized CaDirectory protobufs
+//!   {root}/chunks/{hex[0..4]}/{hex}.chunk  — chunks of at least `INLINE_THRESHOLD` bytes
+//!   {root}/packs/pack-NNNNNN.dat           — smaller chunks (see `super::pack`)
 //!   {root}/castore.db                      — SQLite metadata
 
 use std::collections::HashSet;
@@ -25,6 +25,7 @@ use ekapkgs_protocol::ekapkgs::v1::{
 use prost::Message;
 use rusqlite::{Connection, params};
 
+use super::pack::{self, PackStore};
 use super::{NarInfo, StorageBackend};
 
 /// A file digest and its ordered list of (chunk_digest, chunk_size) pairs.
@@ -39,14 +40,19 @@ const CHUNK_MIN: u32 = 16 * 1024; // 16 KiB
 const CHUNK_AVG: u32 = 64 * 1024; // 64 KiB
 const CHUNK_MAX: u32 = 256 * 1024; // 256 KiB
 
-/// Chunks smaller than this are stored inline in SQLite instead of as files.
+/// Chunks smaller than this go into pack files instead of their own file.
 const INLINE_THRESHOLD: usize = 1024;
 
 /// Default zstd compression level for on-disk chunk storage.
 ///
-/// `NULL` in SQLite means either inline (when `data IS NOT NULL`) or
-/// incompressible (when `data IS NULL`) — never attempt compression again.
+/// `zstd_level = NULL` means the chunk is either in a pack (`pack_id IS NOT
+/// NULL`) or an incompressible raw file — never attempt compression again.
 const DEFAULT_CHUNK_LEVEL: i32 = 3;
+
+/// Current database schema. Version 2 moved small chunk data into pack files
+/// and made the blob-keyed tables `WITHOUT ROWID`. Older databases are copied
+/// into a fresh v2 database in the background (see `open_db`).
+const SCHEMA_VERSION: i64 = 2;
 
 /// Configuration for chunk compression.
 #[derive(Debug, Clone)]
@@ -241,13 +247,22 @@ pub struct CastoreBackend {
     /// While `false`, bloom lookups are bypassed (return `true` = "maybe
     /// present") so the server can accept requests immediately at startup.
     bloom_ready: AtomicBool,
-    /// Set to `true` once the background `path_files` backfill completes.
-    /// While `false`, GC eviction is skipped since the reference table is
-    /// incomplete.
+    /// Set to `true` once `path_files` is complete and the GC indexes exist,
+    /// i.e. after the background backfill or corruption recovery finishes.
+    /// While `false`, GC eviction is skipped.
     path_files_ready: AtomicBool,
-    /// Path to a corrupt database that was moved aside at startup.
-    /// When `Some`, background recovery will attempt to salvage rows from it.
-    corrupt_path: Option<PathBuf>,
+    /// Pack files holding chunks smaller than `INLINE_THRESHOLD`.
+    packs: PackStore,
+    /// A database (corrupt, or an older schema) whose rows still need copying
+    /// into the live one. When `Some`, background recovery copies them.
+    recover_from: Option<PathBuf>,
+    /// Path to the database file, used by the background integrity check.
+    db_path: PathBuf,
+    /// `true` once the database is known to be intact: either the previous
+    /// instance shut down cleanly, the DB was freshly created, or the
+    /// background integrity check passed. The clean-shutdown sentinel is only
+    /// written when this is set, so an unfinished check re-runs next startup.
+    integrity_verified: AtomicBool,
 }
 
 impl CastoreBackend {
@@ -263,9 +278,11 @@ impl CastoreBackend {
         let db_path = root.join("castore.db");
         let OpenDbResult {
             conn,
-            corrupt_path,
+            recover_from,
             needs_backfill,
+            needs_integrity_check,
         } = open_db(&db_path)?;
+        let packs = PackStore::open(root.join("packs"))?;
 
         // Migrate: move any existing on-disk directories into SQLite.
         let dirs_path = root.join("dirs");
@@ -304,8 +321,13 @@ impl CastoreBackend {
             chunk_compression: chunk_config,
             compress_nars,
             bloom_ready: AtomicBool::new(false),
-            path_files_ready: AtomicBool::new(!needs_backfill),
-            corrupt_path,
+            // Recovery fills path_files and drops the GC indexes while it
+            // runs, so GC has to wait for it too.
+            path_files_ready: AtomicBool::new(!needs_backfill && recover_from.is_none()),
+            packs,
+            recover_from,
+            db_path,
+            integrity_verified: AtomicBool::new(!needs_integrity_check),
         };
 
         Ok(backend)
@@ -328,13 +350,12 @@ impl CastoreBackend {
             .spawn(move || {
                 let t = Instant::now();
 
-                let chunk_bloom = backend.build_chunk_bloom();
-                *backend.chunk_bloom.lock().expect("chunk bloom lock") = chunk_bloom;
-
-                let path_bloom = backend.build_path_bloom();
-                *backend.path_bloom.lock().expect("path bloom lock") = path_bloom;
-
-                backend.bloom_ready.store(true, Ordering::Release);
+                // During recovery the blooms stay bypassed so recovered rows
+                // are visible as soon as they land; recovery builds them when
+                // it finishes.
+                if backend.recover_from.is_none() {
+                    backend.rebuild_blooms();
+                }
 
                 // Best-effort stats warmup; failures are harmless since
                 // cache_stats() will recompute on demand.
@@ -348,57 +369,122 @@ impl CastoreBackend {
             .expect("failed to spawn warmup thread");
     }
 
-    /// Spawn a background thread to recover salvageable rows from a corrupt
-    /// database. The server is already running with an empty DB; this fills
-    /// it back in so clients don't have to re-push everything.
+    /// Returns `true` once the database is known to be intact.
+    pub fn integrity_verified(&self) -> bool {
+        self.integrity_verified.load(Ordering::Acquire)
+    }
+
+    /// Spawn a background thread that runs `PRAGMA quick_check` when the
+    /// previous instance did not shut down cleanly.
     ///
-    /// Must be called after `spawn_warmup` — the bloom filters will be
-    /// rebuilt once recovery finishes.
+    /// The check scans every page, which can take minutes on a large cache, so
+    /// it must not block startup (systemd would kill the service before it
+    /// becomes ready). The server keeps serving while the check runs.
+    ///
+    /// If corruption is found, a marker file is written next to the database
+    /// and the process exits with a failure status. On the next start (via
+    /// systemd `Restart=on-failure`), `open_db` sees the marker, moves the
+    /// corrupt database aside and salvages what it can in the background.
+    pub fn spawn_integrity_check(self: &Arc<Self>) {
+        if self.integrity_verified() {
+            return;
+        }
+        let backend = Arc::clone(self);
+        std::thread::Builder::new()
+            .name("cas-integrity".into())
+            .spawn(move || {
+                let t = Instant::now();
+                tracing::info!(
+                    "previous shutdown was unclean — running background integrity check"
+                );
+                match run_quick_check(&backend.db_path) {
+                    IntegrityResult::Ok => {
+                        backend.integrity_verified.store(true, Ordering::Release);
+                        tracing::info!("integrity check passed in {:?}", t.elapsed());
+                    },
+                    IntegrityResult::Corrupt(detail) => {
+                        tracing::error!(
+                            "database corruption detected in {}: {detail}",
+                            backend.db_path.display()
+                        );
+                        let marker = recovery_marker_path(&backend.db_path);
+                        if let Err(e) = std::fs::write(&marker, detail.as_bytes()) {
+                            tracing::error!(
+                                "failed to write recovery marker {}: {e}",
+                                marker.display()
+                            );
+                        }
+                        tracing::error!(
+                            "exiting so the corrupt database is moved aside and recovered on \
+                             restart"
+                        );
+                        std::process::exit(EXIT_DB_CORRUPT);
+                    },
+                    IntegrityResult::Error(e) => {
+                        // Not proof of corruption (e.g. I/O hiccup). Leave the
+                        // sentinel dirty so the check runs again next start.
+                        tracing::warn!("integrity check could not complete: {e:#}");
+                    },
+                }
+            })
+            .expect("failed to spawn integrity check thread");
+    }
+
+    /// Spawn a background thread that copies rows from `recover_from` (a
+    /// corrupt database, or one with an older schema) into the live database.
+    /// The server is already running; this fills it back in so clients don't
+    /// have to re-push everything.
+    ///
+    /// Bloom filters stay bypassed (every lookup goes to SQLite) until
+    /// recovery finishes, so recovered rows are served as soon as they land.
     pub fn spawn_recovery(self: &Arc<Self>) {
-        let corrupt_path = match &self.corrupt_path {
-            Some(p) => p.clone(),
-            None => return,
+        let Some(source) = self.recover_from.clone() else {
+            return;
         };
         let backend = Arc::clone(self);
         std::thread::Builder::new()
             .name("cas-recovery".into())
-            .spawn(move || {
-                tracing::info!(
-                    "starting background recovery from {}",
-                    corrupt_path.display()
-                );
-                match recover_from_corrupt(&backend, &corrupt_path) {
-                    Ok(stats) => {
-                        tracing::info!(
-                            "recovery complete: {} paths, {} chunks, {} file_chunks, {} \
-                             directories salvaged ({} row errors skipped)",
-                            stats.paths,
-                            stats.chunks,
-                            stats.file_chunks,
-                            stats.directories,
-                            stats.errors,
-                        );
-                        // Rebuild bloom filters to include recovered data.
-                        let chunk_bloom = backend.build_chunk_bloom();
-                        *backend.chunk_bloom.lock().expect("chunk bloom lock") = chunk_bloom;
-                        let path_bloom = backend.build_path_bloom();
-                        *backend.path_bloom.lock().expect("path bloom lock") = path_bloom;
-                        // Invalidate stats so next request recomputes.
-                        backend.invalidate_stats_cache();
-                    },
-                    Err(e) => {
-                        tracing::warn!("background recovery failed: {e:#}");
-                    },
-                }
-            })
+            .spawn(move || backend.run_recovery(&source))
             .expect("failed to spawn recovery thread");
+    }
+
+    fn run_recovery(&self, source: &Path) {
+        tracing::info!("starting background recovery from {}", source.display());
+        let t = Instant::now();
+        match recover_from_corrupt(self, source) {
+            Ok(stats) => {
+                tracing::info!(
+                    "recovery complete in {:?}: {} paths, {} chunks, {} file_chunks, {} \
+                     directories copied ({} row errors skipped); {} can be deleted",
+                    t.elapsed(),
+                    stats.paths,
+                    stats.chunks,
+                    stats.file_chunks,
+                    stats.directories,
+                    stats.errors,
+                    source.display(),
+                );
+                // Done: don't resume on the next start.
+                let _ = std::fs::remove_file(recover_from_marker_path(&self.db_path));
+            },
+            Err(e) => {
+                // The marker stays, so the next start tries again.
+                tracing::warn!("background recovery failed: {e:#}");
+            },
+        }
+        // Whatever was copied is now in the live DB (and the GC indexes are
+        // back), so build the blooms and let GC run.
+        self.rebuild_blooms();
+        self.path_files_ready.store(true, Ordering::Release);
+        self.invalidate_stats_cache();
     }
 
     /// Spawn a background thread to backfill the `path_files` table from
     /// existing `cas_paths` root nodes.  Until this completes, GC eviction
     /// is skipped since the reference table is incomplete.
     pub fn spawn_backfill(self: &Arc<Self>) {
-        if self.path_files_ready.load(Ordering::Acquire) {
+        // Recovery populates path_files itself.
+        if self.path_files_ready.load(Ordering::Acquire) || self.recover_from.is_some() {
             return;
         }
         let backend = Arc::clone(self);
@@ -475,7 +561,17 @@ impl CastoreBackend {
 
     /// Write the clean-shutdown sentinel so the next startup can skip the
     /// expensive integrity check.
+    ///
+    /// Skipped while the background integrity check has not passed, so a check
+    /// interrupted by a restart runs again on the next startup.
     pub fn mark_clean_shutdown(&self) {
+        if !self.integrity_verified() {
+            tracing::warn!(
+                "integrity check has not completed — leaving shutdown marked unclean so it \
+                 re-runs next startup"
+            );
+            return;
+        }
         let db = self.db.lock().expect("mark_clean_shutdown lock");
         mark_clean(&db);
     }
@@ -506,22 +602,26 @@ impl CastoreBackend {
         &self,
         digest: &[u8; 32],
     ) -> color_eyre::Result<Option<bytes::Bytes>> {
-        // Check SQLite for zstd_level and possible inline data.
+        type ChunkLoc = (Option<i32>, Option<u32>, Option<u64>, i64);
         let db = self.acquire_reader();
-        let row: Option<(Option<i32>, Option<Vec<u8>>)> = db
-            .query_row(
-                "SELECT zstd_level, data FROM chunks WHERE digest = ?1",
-                params![digest.as_slice()],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
+        let row: Option<ChunkLoc> = db
+            .prepare_cached(
+                "SELECT zstd_level, pack_id, pack_offset, size FROM chunks WHERE digest = ?1",
+            )?
+            .query_row(params![digest.as_slice()], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })
             .ok();
         drop(db);
 
         match row {
-            // Inline chunk: data column is populated.
-            Some((_, Some(data))) => Ok(Some(bytes::Bytes::from(data))),
+            // Small chunk stored in a pack file.
+            Some((_, Some(pack_id), Some(offset), size)) => Ok(self
+                .packs
+                .read((pack_id, offset), digest, size as usize)?
+                .map(bytes::Bytes::from)),
             // On-disk chunk: zstd_level determines how to read.
-            Some((zstd_level, None)) => {
+            Some((zstd_level, ..)) => {
                 let path = self.chunk_path(&hex_encode(digest));
                 if !path.exists() {
                     return Ok(None);
@@ -539,7 +639,7 @@ impl CastoreBackend {
                         })?;
                     Ok(Some(bytes::Bytes::from(decompressed)))
                 } else {
-                    // NULL zstd_level + no inline data = incompressible raw file.
+                    // NULL zstd_level and not packed = incompressible raw file.
                     Ok(Some(bytes::Bytes::from(file_bytes)))
                 }
             },
@@ -632,6 +732,63 @@ impl CastoreBackend {
         }
     }
 
+    /// Spawn a background thread that keeps the WAL small.
+    ///
+    /// SQLite's automatic checkpoints are PASSIVE: they copy pages back into
+    /// the database but can't restart the WAL while readers are using it, so
+    /// under steady read traffic the WAL file only grows. Every few minutes
+    /// this tries a TRUNCATE checkpoint, which waits briefly for readers to
+    /// move off the WAL and then empties it.
+    pub fn spawn_wal_maintenance(self: &Arc<Self>) {
+        const INTERVAL: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+        let backend = Arc::clone(self);
+        std::thread::Builder::new()
+            .name("cas-wal".into())
+            .spawn(move || {
+                loop {
+                    std::thread::sleep(INTERVAL);
+                    backend.truncate_wal();
+                }
+            })
+            .expect("failed to spawn WAL maintenance thread");
+    }
+
+    /// Try to checkpoint and truncate the WAL. Holds the write lock while it
+    /// runs, so it waits at most 250 ms for readers before giving up until
+    /// the next attempt.
+    fn truncate_wal(&self) {
+        let mut wal_path = self.db_path.as_os_str().to_owned();
+        wal_path.push("-wal");
+        let wal_size = || std::fs::metadata(&wal_path).map_or(0, |m| m.len());
+        let before = wal_size();
+
+        let db = self.db.lock().expect("db lock");
+        let result = db.execute_batch("PRAGMA busy_timeout=250").and_then(|()| {
+            db.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+                row.get::<_, i64>(0)
+            })
+        });
+        let _ = db.execute_batch("PRAGMA busy_timeout=5000");
+        drop(db);
+
+        let after = wal_size();
+        match result {
+            Ok(0) => {
+                if before > 256 * 1024 * 1024 {
+                    tracing::info!("WAL truncated from {before} to {after} bytes");
+                }
+            },
+            Ok(_) => tracing::debug!("WAL checkpoint busy (readers active), WAL is {after} bytes"),
+            Err(e) => tracing::warn!("WAL checkpoint failed: {e}"),
+        }
+        if after > 1024 * 1024 * 1024 {
+            tracing::warn!(
+                "WAL is {after} bytes and could not be truncated — a long-running reader may be \
+                 blocking checkpoints"
+            );
+        }
+    }
+
     /// Update `last_access` for a batch of store path hashes.
     ///
     /// Deduplicates hashes within the batch so each path is updated at most
@@ -684,9 +841,8 @@ impl CastoreBackend {
         type I5 = (i64, i64, i64, i64, i64);
         let (chunks, chunk_bytes, disk_bytes, inline_chunks, compressed_chunks): I5 = db
             .query_row(
-                "SELECT COUNT(*), COALESCE(SUM(size), 0), COALESCE(SUM(disk_size), 0), COUNT(CASE \
-                 WHEN data IS NOT NULL THEN 1 END), COUNT(CASE WHEN zstd_level IS NOT NULL THEN 1 \
-                 END) FROM chunks",
+                "SELECT COUNT(*), COALESCE(SUM(size), 0), COALESCE(SUM(disk_size), 0), \
+                 COUNT(pack_id), COUNT(zstd_level) FROM chunks",
                 [],
                 |row| {
                     Ok((
@@ -945,39 +1101,73 @@ impl CastoreBackend {
             .join(format!("{hex}.chunk"))
     }
 
-    /// Store a chunk file to disk and record it in the database.
+    /// Store a single chunk and record it in the database.
     ///
-    /// When called outside a transaction (e.g. from external chunk uploads),
-    /// acquires the DB lock internally.
+    /// Used for external chunk uploads, outside any other transaction.
     fn store_chunk(&self, data: &[u8]) -> color_eyre::Result<[u8; 32]> {
-        let (digest, zstd_level, disk_size) = self.write_chunk_file(data)?;
-        let inline_data = if data.len() < INLINE_THRESHOLD {
-            Some(data)
-        } else {
-            None
-        };
         let db = self.db.lock().expect("db lock");
-        Self::insert_chunk_row(&db, &digest, data.len(), zstd_level, disk_size, inline_data)?;
+        let tx = db.unchecked_transaction()?;
+        let digest = self.insert_chunk(&tx, data)?;
+        // Pack data must be durable before the row that points at it.
+        self.packs.sync()?;
+        tx.commit()?;
+        Ok(digest)
+    }
+
+    /// Store chunk data and insert its `chunks` row using `conn` (usually a
+    /// transaction). Small chunks are appended to a pack; larger ones are
+    /// written to their own file.
+    ///
+    /// The caller must call `self.packs.sync()` before committing.
+    fn insert_chunk(&self, conn: &Connection, data: &[u8]) -> color_eyre::Result<[u8; 32]> {
+        let digest = *blake3::hash(data).as_bytes();
+
+        if data.len() < INLINE_THRESHOLD {
+            // Packs are append-only, so check first instead of relying on
+            // INSERT OR IGNORE, which would leave a dead record behind.
+            if !(self.bloom_maybe_contains(&digest) && chunk_row_exists(conn, &digest)?) {
+                let (pack_id, offset) = self.packs.append(&digest, data)?;
+                conn.prepare_cached(
+                    "INSERT OR IGNORE INTO chunks (digest, size, disk_size, pack_id, pack_offset) \
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                )?
+                .execute(params![
+                    digest.as_slice(),
+                    data.len() as i64,
+                    (pack::RECORD_OVERHEAD + data.len() as u64) as i64,
+                    pack_id,
+                    offset as i64,
+                ])?;
+            }
+        } else {
+            let (zstd_level, disk_size) = self.write_chunk_file(&digest, data)?;
+            conn.prepare_cached(
+                "INSERT OR IGNORE INTO chunks (digest, size, zstd_level, disk_size) VALUES (?1, \
+                 ?2, ?3, ?4)",
+            )?
+            .execute(params![
+                digest.as_slice(),
+                data.len() as i64,
+                zstd_level,
+                disk_size as i64,
+            ])?;
+        }
         self.bloom_insert(&digest);
         Ok(digest)
     }
 
-    /// Prepare a chunk for storage, returning its digest, zstd level, and
-    /// disk size (0 for inline chunks).
+    /// Write a chunk of at least `INLINE_THRESHOLD` bytes to its own file,
+    /// returning its zstd level and disk size.
     ///
-    /// Chunks smaller than `INLINE_THRESHOLD` are not written to disk — the
-    /// caller stores the data in SQLite. Larger chunks are compressed at the
-    /// configured zstd level. If compression doesn't reduce size, they are
-    /// stored raw and marked incompressible (`zstd_level = NULL`).
-    fn write_chunk_file(&self, data: &[u8]) -> color_eyre::Result<([u8; 32], Option<i32>, u64)> {
-        let hash = blake3::hash(data);
-        let digest = *hash.as_bytes();
-
-        if data.len() < INLINE_THRESHOLD {
-            return Ok((digest, None, 0));
-        }
-
-        let hex = hex_encode(&digest);
+    /// Chunks are compressed at the configured zstd level. If compression
+    /// doesn't reduce size, they are stored raw and marked incompressible
+    /// (`zstd_level = NULL`).
+    fn write_chunk_file(
+        &self,
+        digest: &[u8; 32],
+        data: &[u8],
+    ) -> color_eyre::Result<(Option<i32>, u64)> {
+        let hex = hex_encode(digest);
         let path = self.chunk_path(&hex);
 
         if !path.exists() {
@@ -1004,7 +1194,7 @@ impl CastoreBackend {
                     Err(e) => return Err(e.error.into()),
                 }
 
-                return Ok((digest, zstd_level, bytes_to_write.len() as u64));
+                return Ok((zstd_level, bytes_to_write.len() as u64));
             }
         }
 
@@ -1012,7 +1202,7 @@ impl CastoreBackend {
         // zstd_level is whatever was set when the chunk was first inserted;
         // INSERT OR IGNORE in the caller preserves it.
         let disk_size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-        Ok((digest, None, disk_size))
+        Ok((None, disk_size))
     }
 
     /// Compress chunk data, returning `(compressed_bytes, level_used)`.
@@ -1021,29 +1211,6 @@ impl CastoreBackend {
         let compressed = zstd::bulk::compress(data, level)
             .map_err(|e| color_eyre::eyre::eyre!("zstd compress failed: {e}"))?;
         Ok((compressed, level))
-    }
-
-    /// Insert a row into the chunks table. Caller must hold a connection.
-    fn insert_chunk_row(
-        conn: &Connection,
-        digest: &[u8; 32],
-        size: usize,
-        zstd_level: Option<i32>,
-        disk_size: u64,
-        inline_data: Option<&[u8]>,
-    ) -> color_eyre::Result<()> {
-        conn.execute(
-            "INSERT OR IGNORE INTO chunks (digest, size, ref_count, zstd_level, disk_size, data) \
-             VALUES (?1, ?2, 1, ?3, ?4, ?5)",
-            params![
-                digest.as_slice(),
-                size as i64,
-                zstd_level,
-                disk_size as i64,
-                inline_data,
-            ],
-        )?;
-        Ok(())
     }
 
     /// Insert a row into the file_chunks table. Caller must hold a connection.
@@ -1122,9 +1289,10 @@ impl CastoreBackend {
 
     /// Ingest a NarNode tree into CAS, returning the root CaNode.
     ///
-    /// Chunk files are written to disk outside the transaction (idempotent).
-    /// All DB writes (chunks, file_chunks, directories) use the provided
-    /// connection, which the caller wraps in a transaction.
+    /// Chunk files and pack records are written outside the transaction
+    /// (idempotent). All DB writes (chunks, file_chunks, directories) use the
+    /// provided connection, which the caller wraps in a transaction and must
+    /// only commit after `self.packs.sync()`.
     fn ingest_node(&self, conn: &Connection, node: &NarNode) -> color_eyre::Result<CaNode> {
         match node {
             NarNode::Regular { executable, data } => {
@@ -1135,21 +1303,7 @@ impl CastoreBackend {
 
                 for chunk in chunks {
                     let chunk_data = &data[chunk.offset..chunk.offset + chunk.length];
-                    let (digest, zstd_level, disk_size) = self.write_chunk_file(chunk_data)?;
-                    let inline = if chunk_data.len() < INLINE_THRESHOLD {
-                        Some(chunk_data)
-                    } else {
-                        None
-                    };
-                    Self::insert_chunk_row(
-                        conn,
-                        &digest,
-                        chunk_data.len(),
-                        zstd_level,
-                        disk_size,
-                        inline,
-                    )?;
-                    self.bloom_insert(&digest);
+                    let digest = self.insert_chunk(conn, chunk_data)?;
                     chunk_digests.push((digest, chunk.length as u64));
                     total_size += chunk.length as u64;
                 }
@@ -1655,6 +1809,15 @@ impl CastoreBackend {
 }
 
 impl CastoreBackend {
+    /// Build both bloom filters from the database and start using them.
+    fn rebuild_blooms(&self) {
+        let chunk_bloom = self.build_chunk_bloom();
+        *self.chunk_bloom.lock().expect("chunk bloom lock") = chunk_bloom;
+        let path_bloom = self.build_path_bloom();
+        *self.path_bloom.lock().expect("path bloom lock") = path_bloom;
+        self.bloom_ready.store(true, Ordering::Release);
+    }
+
     /// Populate a bloom filter with all chunk digests currently in the database.
     fn build_chunk_bloom(&self) -> BloomFilter {
         let db = self.acquire_reader();
@@ -1875,8 +2038,8 @@ impl StorageBackend for CastoreBackend {
         let nar_node = parse_nar(data)?;
 
         // Ingest into CAS within a single transaction.
-        // Chunk files are written to disk outside the transaction (idempotent).
-        // All DB rows (chunks, file_chunks, directories, cas_paths, path_files)
+        // Chunk files and pack records are written outside the transaction
+        // (idempotent). All DB rows (chunks, file_chunks, directories, cas_paths, path_files)
         // are written atomically — a crash mid-ingest leaves only orphan chunk
         // files on disk, not inconsistent DB state.
         let db = self.db.lock().expect("db lock");
@@ -1916,6 +2079,8 @@ impl StorageBackend for CastoreBackend {
             Self::store_metadata_with_conn(&tx, hash, &placeholder_info, &root_node)?;
         }
 
+        // Pack data must be durable before the rows that point at it.
+        self.packs.sync()?;
         tx.commit()?;
         self.path_bloom_insert(hash);
         self.invalidate_stats_cache();
@@ -2091,103 +2256,277 @@ fn open_db_reader(path: &Path) -> color_eyre::Result<Connection> {
 }
 
 /// Result of opening a database: the live connection plus an optional path to
-/// a corrupt database that was moved aside and should be recovered from.
+/// a database whose rows still need copying into it.
 struct OpenDbResult {
     conn: Connection,
-    /// When set, the corrupt DB was renamed here and background recovery should
-    /// be attempted.
-    corrupt_path: Option<PathBuf>,
+    /// When set, background recovery copies rows from this database (corrupt,
+    /// or an older schema) into the live one.
+    recover_from: Option<PathBuf>,
     /// When `true`, the `path_files` table needs to be backfilled in the
     /// background.
     needs_backfill: bool,
+    /// When `true`, the previous instance did not shut down cleanly and the
+    /// background integrity check should run.
+    needs_integrity_check: bool,
 }
 
+/// Exit status used when the background integrity check finds corruption.
+const EXIT_DB_CORRUPT: i32 = 75;
+
 /// Standard PRAGMAs applied to every writable connection.
+///
+/// `journal_size_limit` shrinks the WAL back to 64 MiB whenever it is reset,
+/// so one burst of writes doesn't leave a multi-GB WAL behind.
 const WRITER_PRAGMAS: &str = "PRAGMA journal_mode=WAL;PRAGMA synchronous=FULL;PRAGMA \
                               foreign_keys=ON;PRAGMA busy_timeout=5000;PRAGMA \
-                              cache_size=-65536;PRAGMA mmap_size=1073741824";
+                              cache_size=-65536;PRAGMA mmap_size=1073741824;PRAGMA \
+                              journal_size_limit=67108864";
 
+/// Marker file written by the background integrity check when it finds
+/// corruption. Its presence makes the next startup move the database aside.
+fn recovery_marker_path(db_path: &Path) -> PathBuf {
+    let mut p = db_path.as_os_str().to_owned();
+    p.push(".needs-recovery");
+    PathBuf::from(p)
+}
+
+/// Marker file naming a database that background recovery is copying rows
+/// from. It survives restarts, so an interrupted copy resumes on the next
+/// start, and is removed once the copy finishes.
+fn recover_from_marker_path(db_path: &Path) -> PathBuf {
+    let mut p = db_path.as_os_str().to_owned();
+    p.push(".recover-from");
+    PathBuf::from(p)
+}
+
+/// Read the pending recovery source, if any. A marker pointing at a file
+/// that no longer exists is removed.
+fn pending_recovery_source(db_path: &Path) -> Option<PathBuf> {
+    let marker = recover_from_marker_path(db_path);
+    let source = PathBuf::from(std::fs::read_to_string(&marker).ok()?.trim());
+    if source.exists() {
+        tracing::info!("resuming recovery from {}", source.display());
+        Some(source)
+    } else {
+        tracing::warn!(
+            "recovery source {} no longer exists — skipping recovery",
+            source.display()
+        );
+        let _ = std::fs::remove_file(&marker);
+        None
+    }
+}
+
+/// Move the database aside (tagging it with `label`), create a fresh one in
+/// its place, and record the old file as the recovery source.
+fn replace_with_fresh_db(path: &Path, label: &str) -> color_eyre::Result<OpenDbResult> {
+    let source = move_db_aside(path, label)?;
+    let conn = Connection::open(path)?;
+    conn.execute_batch(WRITER_PRAGMAS)?;
+    create_tables(&conn)?;
+    mark_dirty(&conn);
+    if let Some(source) = &source {
+        std::fs::write(
+            recover_from_marker_path(path),
+            source.as_os_str().as_encoded_bytes(),
+        )?;
+    }
+    Ok(OpenDbResult {
+        conn,
+        recover_from: source,
+        needs_backfill: false,
+        // Freshly created, nothing to check.
+        needs_integrity_check: false,
+    })
+}
+
+/// Schema version of an open database: 0 when it has no tables yet, 1 for
+/// databases created before versioning, otherwise `_meta.schema_version`.
+fn stored_schema_version(conn: &Connection) -> i64 {
+    let has_chunks: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'chunks')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(false);
+    if !has_chunks {
+        return 0;
+    }
+    conn.query_row(
+        "SELECT value FROM _meta WHERE key = 'schema_version'",
+        [],
+        |row| row.get(0),
+    )
+    .unwrap_or(1)
+}
+
+/// Open the database without scanning it, so startup stays fast.
+///
+/// A clean-shutdown sentinel in `_meta` records whether the previous instance
+/// exited normally. If it did not, `needs_integrity_check` is set and the
+/// caller runs `PRAGMA quick_check` in the background
+/// (`CastoreBackend::spawn_integrity_check`).
+///
+/// Two cases replace the database with a fresh one and copy the old rows
+/// back in the background: a previous check found corruption (recovery
+/// marker present), or the database uses an older schema.
 fn open_db(path: &Path) -> color_eyre::Result<OpenDbResult> {
     tracing::log::info!("Opening database at {}", path.display());
+
+    let marker = recovery_marker_path(path);
+    if marker.exists() {
+        tracing::log::warn!(
+            "recovery marker {} found — moving corrupt database aside",
+            marker.display()
+        );
+        let result = replace_with_fresh_db(path, "corrupt")?;
+        std::fs::remove_file(&marker)?;
+        return Ok(result);
+    }
+
     let conn = Connection::open(path)?;
     conn.execute_batch(WRITER_PRAGMAS)?;
 
+    let version = stored_schema_version(&conn);
+    if version > SCHEMA_VERSION {
+        return Err(color_eyre::eyre::eyre!(
+            "{} has schema version {version}, but this ekapkgs-serve only supports up to \
+             {SCHEMA_VERSION}",
+            path.display()
+        ));
+    }
+    if version == 1 {
+        tracing::log::warn!(
+            "{} uses schema v1 — copying it into a v{SCHEMA_VERSION} database in the background",
+            path.display()
+        );
+        // Bring the old file up to the last v1 layout so the copy can read it,
+        // and fold its WAL into the main file before moving it.
+        migrate_v1_columns(&conn)?;
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
+        drop(conn);
+        return replace_with_fresh_db(path, "v1");
+    }
+
     create_tables(&conn)?;
 
-    // Use a lightweight clean-shutdown sentinel instead of a full
-    // `PRAGMA quick_check` (which scans every page). The `_meta` table
-    // stores `clean_shutdown = 1` when the previous instance exited
-    // normally. If the flag is missing or 0, the previous instance
-    // crashed and we run the expensive integrity check only then.
+    // Recovery drops the GC indexes while it copies and rebuilds them at the
+    // end; building them here on a large table would stall startup.
+    let recover_from = pending_recovery_source(path);
+    if recover_from.is_none() {
+        conn.execute_batch(GC_INDEXES)?;
+    }
+
+    // A brand-new database has no rows to verify. Otherwise, a missing or
+    // zero sentinel means the previous instance crashed.
     let clean: bool = conn
         .query_row(
             "SELECT value FROM _meta WHERE key = 'clean_shutdown'",
             [],
             |row| row.get::<_, i64>(0).map(|v| v == 1),
         )
-        .unwrap_or(false);
+        .unwrap_or_else(|_| db_is_empty(&conn));
 
     if clean {
         tracing::info!("clean shutdown detected — skipping integrity check");
     } else {
-        tracing::info!("no clean-shutdown sentinel — running integrity check");
-        let integrity: String = conn.query_row("PRAGMA quick_check", [], |row| row.get(0))?;
-        if integrity != "ok" {
-            tracing::log::warn!(
-                "database corruption detected in {}: {integrity}",
-                path.display()
-            );
-
-            // Close the corrupt connection before renaming.
-            drop(conn);
-
-            // Move the corrupt database (and WAL/SHM sidecars) aside so we
-            // can start fresh, then attempt background recovery.
-            let ts = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
-            let path_str = path.as_os_str().to_string_lossy();
-            let mut corrupt_main = None;
-            for suffix in &["", "-wal", "-shm"] {
-                let src = PathBuf::from(format!("{path_str}{suffix}"));
-                if src.exists() {
-                    let dst = PathBuf::from(format!("{path_str}{suffix}.corrupt-{ts}"));
-                    tracing::log::warn!("renaming {} -> {}", src.display(), dst.display());
-                    std::fs::rename(&src, &dst)?;
-                    if suffix.is_empty() {
-                        corrupt_main = Some(dst);
-                    }
-                }
-            }
-
-            tracing::log::info!(
-                "re-creating database at {} after corruption recovery",
-                path.display()
-            );
-            let conn = Connection::open(path)?;
-            conn.execute_batch(WRITER_PRAGMAS)?;
-            create_tables(&conn)?;
-            mark_dirty(&conn);
-            return Ok(OpenDbResult {
-                conn,
-                corrupt_path: corrupt_main,
-                needs_backfill: false,
-            });
-        }
+        tracing::info!("no clean-shutdown sentinel — integrity check will run in the background");
     }
 
     // Clear the sentinel so a crash before the next clean shutdown is
     // detected on the following startup.
     mark_dirty(&conn);
 
-    let needs_backfill = path_files_needs_backfill(&conn);
+    let needs_backfill = recover_from.is_none() && path_files_needs_backfill(&conn);
 
     Ok(OpenDbResult {
         conn,
-        corrupt_path: None,
+        recover_from,
         needs_backfill,
+        needs_integrity_check: !clean,
     })
+}
+
+/// `true` when the database has no stored paths or chunks.
+fn db_is_empty(conn: &Connection) -> bool {
+    let has_rows: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM cas_paths) OR EXISTS(SELECT 1 FROM chunks)",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(true);
+    !has_rows
+}
+
+/// Rename the database and its WAL/SHM sidecars to `*.<label>-<ts>`.
+/// Returns the new path of the main database file, if it existed.
+fn move_db_aside(path: &Path, label: &str) -> color_eyre::Result<Option<PathBuf>> {
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let path_str = path.as_os_str().to_string_lossy();
+    let mut corrupt_main = None;
+    for suffix in &["", "-wal", "-shm"] {
+        let src = PathBuf::from(format!("{path_str}{suffix}"));
+        if src.exists() {
+            let dst = PathBuf::from(format!("{path_str}{suffix}.{label}-{ts}"));
+            tracing::log::warn!("renaming {} -> {}", src.display(), dst.display());
+            std::fs::rename(&src, &dst)?;
+            if suffix.is_empty() {
+                corrupt_main = Some(dst);
+            }
+        }
+    }
+    Ok(corrupt_main)
+}
+
+enum IntegrityResult {
+    Ok,
+    Corrupt(String),
+    Error(color_eyre::Report),
+}
+
+/// Run `PRAGMA quick_check` on a separate read-only connection.
+///
+/// Readers don't block the writer in WAL mode, so the server keeps serving
+/// while this runs.
+fn run_quick_check(path: &Path) -> IntegrityResult {
+    let conn = match open_db_reader(path) {
+        Ok(c) => c,
+        Err(e) => {
+            return match e.downcast::<rusqlite::Error>() {
+                Ok(e) => classify_sqlite_error(e),
+                Err(e) => IntegrityResult::Error(e),
+            };
+        },
+    };
+    // quick_check returns one row per problem (up to 100), or a single "ok".
+    let rows: rusqlite::Result<Vec<String>> = conn
+        .prepare("PRAGMA quick_check")
+        .and_then(|mut stmt| stmt.query_map([], |row| row.get(0))?.collect());
+    match rows {
+        Ok(rows) if rows.len() == 1 && rows[0] == "ok" => IntegrityResult::Ok,
+        Ok(rows) => IntegrityResult::Corrupt(rows.join("; ")),
+        Err(e) => classify_sqlite_error(e),
+    }
+}
+
+/// SQLite reports some corruption as an error rather than a check row.
+fn classify_sqlite_error(e: rusqlite::Error) -> IntegrityResult {
+    match e {
+        rusqlite::Error::SqliteFailure(err, msg)
+            if matches!(
+                err.code,
+                rusqlite::ErrorCode::DatabaseCorrupt | rusqlite::ErrorCode::NotADatabase
+            ) =>
+        {
+            IntegrityResult::Corrupt(msg.unwrap_or_else(|| err.to_string()))
+        },
+        e => IntegrityResult::Error(e.into()),
+    }
 }
 
 /// Set the clean-shutdown sentinel so the next startup skips the integrity
@@ -2216,18 +2555,63 @@ struct RecoveryStats {
     errors: u64,
 }
 
-/// Best-effort recovery: open the corrupt DB read-only, iterate each table,
-/// and copy salvageable rows into the live (empty) database. Rows on corrupt
-/// pages will fail to read and are silently skipped.
+/// Secondary indexes that only GC reads. Recovery drops them while bulk
+/// loading (maintaining them per row is most of the insert cost) and builds
+/// them once at the end; GC is held off until then via `path_files_ready`.
+const GC_INDEXES: &str = "CREATE INDEX IF NOT EXISTS idx_path_files_file_digest ON \
+                          path_files(file_digest);
+     CREATE INDEX IF NOT EXISTS idx_file_chunks_digest ON file_chunks(chunk_digest);
+     CREATE INDEX IF NOT EXISTS idx_cas_paths_last_access ON cas_paths(last_access);";
+
+/// Best-effort recovery: open the source DB (corrupt, or an older schema)
+/// read-only, iterate each table, and copy readable rows into the live
+/// database. Rows on corrupt pages fail to read and are skipped. Inserts are
+/// `OR IGNORE`, so a run interrupted by a restart can simply start over.
+///
+/// For the duration of the copy the writer connection gets a larger page
+/// cache and `synchronous=NORMAL` (still crash-safe in WAL mode; the source
+/// file is kept, so a power loss only means re-running recovery), and the
+/// GC-only indexes are dropped. All of this is undone afterwards, even if the
+/// copy fails.
 fn recover_from_corrupt(
     backend: &CastoreBackend,
-    corrupt_path: &Path,
+    source: &Path,
+) -> color_eyre::Result<RecoveryStats> {
+    {
+        let db = backend.db.lock().expect("db lock");
+        db.execute_batch(
+            "PRAGMA cache_size=-524288;
+             PRAGMA synchronous=NORMAL;
+             DROP INDEX IF EXISTS idx_path_files_file_digest;
+             DROP INDEX IF EXISTS idx_file_chunks_digest;
+             DROP INDEX IF EXISTS idx_cas_paths_last_access;",
+        )?;
+    }
+
+    let result = copy_rows_from_corrupt(backend, source);
+
+    let t = Instant::now();
+    let db = backend.db.lock().expect("db lock");
+    // A failed batch can leave its transaction open.
+    if !db.is_autocommit() {
+        let _ = db.execute_batch("ROLLBACK");
+    }
+    db.execute_batch(GC_INDEXES)?;
+    db.execute_batch(WRITER_PRAGMAS)?;
+    tracing::info!("recovery: rebuilt GC indexes in {:?}", t.elapsed());
+    result
+}
+
+fn copy_rows_from_corrupt(
+    backend: &CastoreBackend,
+    source: &Path,
 ) -> color_eyre::Result<RecoveryStats> {
     let src = Connection::open_with_flags(
-        corrupt_path,
+        source,
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )?;
-    // Don't run integrity check — we already know it's corrupt.
+    // No integrity check: a corrupt source is expected, and unreadable rows
+    // are skipped below.
     // Use a large busy timeout in case WAL recovery is in progress.
     src.execute_batch("PRAGMA busy_timeout=10000;")?;
 
@@ -2249,11 +2633,29 @@ fn recover_from_corrupt(
 
     // --- Recover chunks table ---
     // This must come first since cas_paths and file_chunks reference chunks.
-    type ChunkRow = (Vec<u8>, i64, i64, Option<i32>, i64, Option<Vec<u8>>);
+    //
+    // A v1 source keeps small chunk data in a `data` column; that data is
+    // appended to packs here. A v2 source already points into the packs,
+    // which are shared, so its pack locations are copied as-is.
+    struct ChunkRow {
+        digest: Vec<u8>,
+        size: i64,
+        ref_count: i64,
+        zstd_level: Option<i32>,
+        disk_size: i64,
+        data: Option<Vec<u8>>,
+        pack_id: Option<u32>,
+        pack_offset: Option<i64>,
+    }
 
-    if let Ok(mut stmt) =
-        src.prepare("SELECT digest, size, ref_count, zstd_level, disk_size, data FROM chunks")
-    {
+    let chunk_query = if src.prepare("SELECT data FROM chunks LIMIT 0").is_ok() {
+        "SELECT digest, size, ref_count, zstd_level, disk_size, data, NULL, NULL FROM chunks"
+    } else {
+        "SELECT digest, size, ref_count, zstd_level, disk_size, NULL, pack_id, pack_offset FROM \
+         chunks"
+    };
+
+    if let Ok(mut stmt) = src.prepare(chunk_query) {
         if let Ok(mut rows) = stmt.query([]) {
             let mut buf: Vec<ChunkRow> = Vec::with_capacity(BATCH_SIZE);
             let mut consecutive_errs = 0u32;
@@ -2273,12 +2675,16 @@ fn recover_from_corrupt(
                                     continue;
                                 },
                             };
-                            let size: i64 = row.get(1).unwrap_or(0);
-                            let ref_count: i64 = row.get(2).unwrap_or(1);
-                            let zstd_level: Option<i32> = row.get(3).unwrap_or(None);
-                            let disk_size: i64 = row.get(4).unwrap_or(0);
-                            let data: Option<Vec<u8>> = row.get(5).unwrap_or(None);
-                            buf.push((digest, size, ref_count, zstd_level, disk_size, data));
+                            buf.push(ChunkRow {
+                                digest,
+                                size: row.get(1).unwrap_or(0),
+                                ref_count: row.get(2).unwrap_or(1),
+                                zstd_level: row.get(3).unwrap_or(None),
+                                disk_size: row.get(4).unwrap_or(0),
+                                data: row.get(5).unwrap_or(None),
+                                pack_id: row.get(6).unwrap_or(None),
+                                pack_offset: row.get(7).unwrap_or(None),
+                            });
                         },
                         Ok(None) => {
                             done = true;
@@ -2302,13 +2708,48 @@ fn recover_from_corrupt(
                 if !buf.is_empty() {
                     let db = backend.db.lock().expect("db lock");
                     db.execute_batch("BEGIN")?;
-                    for (digest, size, ref_count, zstd_level, disk_size, data) in &buf {
-                        if db
-                            .execute(
-                                "INSERT OR IGNORE INTO chunks (digest, size, ref_count, \
-                                 zstd_level, disk_size, data) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                                params![digest, size, ref_count, zstd_level, disk_size, data],
-                            )
+                    let mut ins = db.prepare_cached(
+                        "INSERT OR IGNORE INTO chunks (digest, size, ref_count, zstd_level, \
+                         disk_size, pack_id, pack_offset) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    )?;
+                    for row in &buf {
+                        let mut pack_id = row.pack_id;
+                        let mut pack_offset = row.pack_offset;
+                        let mut disk_size = row.disk_size;
+                        if let Some(data) = &row.data {
+                            let Ok(digest) = <[u8; 32]>::try_from(row.digest.as_slice()) else {
+                                stats.errors += 1;
+                                continue;
+                            };
+                            // Already copied (resumed run): appending again
+                            // would only leave a dead pack record.
+                            if chunk_row_exists(&db, &digest)? {
+                                stats.chunks += 1;
+                                continue;
+                            }
+                            if blake3::hash(data).as_bytes() != &digest {
+                                tracing::debug!(
+                                    "skip chunk {}: data mismatch",
+                                    hex_encode(&digest)
+                                );
+                                stats.errors += 1;
+                                continue;
+                            }
+                            let (id, offset) = backend.packs.append(&digest, data)?;
+                            pack_id = Some(id);
+                            pack_offset = Some(offset as i64);
+                            disk_size = (pack::RECORD_OVERHEAD + data.len() as u64) as i64;
+                        }
+                        if ins
+                            .execute(params![
+                                row.digest,
+                                row.size,
+                                row.ref_count,
+                                row.zstd_level,
+                                disk_size,
+                                pack_id,
+                                pack_offset,
+                            ])
                             .is_ok()
                         {
                             stats.chunks += 1;
@@ -2316,6 +2757,9 @@ fn recover_from_corrupt(
                             stats.errors += 1;
                         }
                     }
+                    drop(ins);
+                    // Pack data must be durable before the rows that point at it.
+                    backend.packs.sync()?;
                     db.execute_batch("COMMIT")?;
                     tracing::debug!("recovery: {} chunks so far", stats.chunks);
                 }
@@ -2380,13 +2824,13 @@ fn recover_from_corrupt(
                 if !buf.is_empty() {
                     let db = backend.db.lock().expect("db lock");
                     db.execute_batch("BEGIN")?;
+                    let mut ins = db.prepare_cached(
+                        "INSERT OR IGNORE INTO file_chunks (file_digest, chunk_index, \
+                         chunk_digest, chunk_size) VALUES (?1, ?2, ?3, ?4)",
+                    )?;
                     for (file_digest, chunk_index, chunk_digest, chunk_size) in &buf {
-                        if db
-                            .execute(
-                                "INSERT OR IGNORE INTO file_chunks (file_digest, chunk_index, \
-                                 chunk_digest, chunk_size) VALUES (?1, ?2, ?3, ?4)",
-                                params![file_digest, chunk_index, chunk_digest, chunk_size],
-                            )
+                        if ins
+                            .execute(params![file_digest, chunk_index, chunk_digest, chunk_size])
                             .is_ok()
                         {
                             stats.file_chunks += 1;
@@ -2453,14 +2897,11 @@ fn recover_from_corrupt(
                 if !buf.is_empty() {
                     let db = backend.db.lock().expect("db lock");
                     db.execute_batch("BEGIN")?;
+                    let mut ins = db.prepare_cached(
+                        "INSERT OR IGNORE INTO directories (digest, data) VALUES (?1, ?2)",
+                    )?;
                     for (digest, data) in &buf {
-                        if db
-                            .execute(
-                                "INSERT OR IGNORE INTO directories (digest, data) VALUES (?1, ?2)",
-                                params![digest, data],
-                            )
-                            .is_ok()
-                        {
+                        if ins.execute(params![digest, data]).is_ok() {
                             stats.directories += 1;
                         } else {
                             stats.errors += 1;
@@ -2562,6 +3003,14 @@ fn recover_from_corrupt(
                 if !buf.is_empty() {
                     let db = backend.db.lock().expect("db lock");
                     db.execute_batch("BEGIN")?;
+                    let mut ins = db.prepare_cached(
+                        "INSERT OR IGNORE INTO cas_paths (hash, store_path, nar_hash, nar_size, \
+                         root_node, references_, signatures, ca, deriver, added_at, last_access) \
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                    )?;
+                    let mut ins_pf = db.prepare_cached(
+                        "INSERT OR IGNORE INTO path_files (path_hash, file_digest) VALUES (?1, ?2)",
+                    )?;
                     for (
                         hash,
                         store_path,
@@ -2576,26 +3025,20 @@ fn recover_from_corrupt(
                         last_access,
                     ) in &buf
                     {
-                        if db
-                            .execute(
-                                "INSERT OR IGNORE INTO cas_paths (hash, store_path, nar_hash, \
-                                 nar_size, root_node, references_, signatures, ca, deriver, \
-                                 added_at, last_access) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, \
-                                 ?9, ?10, ?11)",
-                                params![
-                                    hash,
-                                    store_path,
-                                    nar_hash,
-                                    nar_size,
-                                    root_node,
-                                    references,
-                                    signatures,
-                                    ca,
-                                    deriver,
-                                    added_at,
-                                    last_access
-                                ],
-                            )
+                        if ins
+                            .execute(params![
+                                hash,
+                                store_path,
+                                nar_hash,
+                                nar_size,
+                                root_node,
+                                references,
+                                signatures,
+                                ca,
+                                deriver,
+                                added_at,
+                                last_access
+                            ])
                             .is_ok()
                         {
                             stats.paths += 1;
@@ -2606,11 +3049,7 @@ fn recover_from_corrupt(
                                     &db, &root_ca, &mut fds,
                                 );
                                 for fd in &fds {
-                                    let _ = db.execute(
-                                        "INSERT OR IGNORE INTO path_files (path_hash, \
-                                         file_digest) VALUES (?1, ?2)",
-                                        params![hash, fd.as_slice()],
-                                    );
+                                    let _ = ins_pf.execute(params![hash, fd.as_slice()]);
                                 }
                             }
                         } else {
@@ -2626,6 +3065,9 @@ fn recover_from_corrupt(
     Ok(stats)
 }
 
+/// Create the current-schema tables if they don't exist. Only called on new
+/// or current-schema databases; v1 databases are copied, never upgraded in
+/// place. The GC indexes are created separately (`GC_INDEXES`).
 fn create_tables(conn: &Connection) -> color_eyre::Result<()> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS _meta (
@@ -2645,21 +3087,24 @@ fn create_tables(conn: &Connection) -> color_eyre::Result<()> {
             added_at     INTEGER NOT NULL,
             last_access  INTEGER NOT NULL DEFAULT 0
         );
+        -- Small chunks live in pack files (pack_id, pack_offset); larger ones
+        -- in chunks/ (zstd-compressed when zstd_level IS NOT NULL).
         CREATE TABLE IF NOT EXISTS chunks (
             digest         BLOB PRIMARY KEY,
             size           INTEGER NOT NULL,
             ref_count      INTEGER NOT NULL DEFAULT 1,
             zstd_level     INTEGER DEFAULT NULL,
             disk_size      INTEGER NOT NULL DEFAULT 0,
-            data           BLOB DEFAULT NULL
-        );
+            pack_id        INTEGER DEFAULT NULL,
+            pack_offset    INTEGER DEFAULT NULL
+        ) WITHOUT ROWID;
         CREATE TABLE IF NOT EXISTS file_chunks (
             file_digest  BLOB NOT NULL,
             chunk_index  INTEGER NOT NULL,
             chunk_digest BLOB NOT NULL,
             chunk_size   INTEGER NOT NULL,
             PRIMARY KEY (file_digest, chunk_index)
-        );
+        ) WITHOUT ROWID;
         CREATE TABLE IF NOT EXISTS directories (
             digest       BLOB PRIMARY KEY,
             data         BLOB NOT NULL
@@ -2668,26 +3113,32 @@ fn create_tables(conn: &Connection) -> color_eyre::Result<()> {
             path_hash    TEXT NOT NULL,
             file_digest  BLOB NOT NULL,
             PRIMARY KEY (path_hash, file_digest)
-        );
-        CREATE INDEX IF NOT EXISTS idx_path_files_file_digest ON path_files(file_digest);
-        CREATE INDEX IF NOT EXISTS idx_file_chunks_digest ON file_chunks(chunk_digest);
-        CREATE INDEX IF NOT EXISTS idx_cas_paths_last_access ON cas_paths(last_access);",
+        ) WITHOUT ROWID;",
     )?;
-
-    // Migration: add last_access column if missing (existing DBs).
-    let has_col: bool = conn
-        .prepare("SELECT last_access FROM cas_paths LIMIT 0")
-        .is_ok();
-    if !has_col {
-        conn.execute_batch(
-            "ALTER TABLE cas_paths ADD COLUMN last_access INTEGER NOT NULL DEFAULT 0;
-             CREATE INDEX IF NOT EXISTS idx_cas_paths_last_access ON cas_paths(last_access);",
-        )?;
-    }
-
-    ensure_compression_columns(conn)?;
-
+    conn.execute(
+        "INSERT OR IGNORE INTO _meta (key, value) VALUES ('schema_version', ?1)",
+        params![SCHEMA_VERSION],
+    )?;
     Ok(())
+}
+
+/// `true` if `conn` can see a chunk row for `digest` (including rows written
+/// earlier in its own open transaction).
+fn chunk_row_exists(conn: &Connection, digest: &[u8; 32]) -> rusqlite::Result<bool> {
+    conn.prepare_cached("SELECT EXISTS(SELECT 1 FROM chunks WHERE digest = ?1)")?
+        .query_row(params![digest.as_slice()], |row| row.get(0))
+}
+
+/// Fail unless the database at `conn` uses the current schema. For offline
+/// tools that must not touch an unmigrated database.
+pub fn require_current_schema(conn: &Connection) -> color_eyre::Result<()> {
+    match stored_schema_version(conn) {
+        SCHEMA_VERSION => Ok(()),
+        v => Err(color_eyre::eyre::eyre!(
+            "database has schema version {v}, expected {SCHEMA_VERSION}; start ekapkgs-serve once \
+             to migrate it"
+        )),
+    }
 }
 
 /// Returns `true` when the `path_files` table exists but is empty while
@@ -2705,13 +3156,27 @@ fn path_files_needs_backfill(conn: &Connection) -> bool {
     cp_count > 0
 }
 
-/// Migrate chunk compression columns to the `zstd_level` scheme.
+/// Bring a v1 database to the last v1 column layout (`last_access`,
+/// `zstd_level`, `disk_size`, `data`) so recovery can copy it with one query
+/// per table.
+fn migrate_v1_columns(conn: &Connection) -> color_eyre::Result<()> {
+    let has_last_access: bool = conn
+        .prepare("SELECT last_access FROM cas_paths LIMIT 0")
+        .is_ok();
+    if !has_last_access {
+        conn.execute_batch(
+            "ALTER TABLE cas_paths ADD COLUMN last_access INTEGER NOT NULL DEFAULT 0;",
+        )?;
+    }
+    migrate_v1_compression_columns(conn)
+}
+
+/// Migrate v1 chunk compression columns to the `zstd_level` scheme.
 ///
-/// Handles three cases:
-/// - Fresh DB: `zstd_level` already exists from CREATE TABLE.
-/// - Old DB with `storage_format`: migrate to `zstd_level`.
-/// - Very old DB with neither: add `zstd_level`, `disk_size`, `data`.
-pub fn ensure_compression_columns(conn: &Connection) -> color_eyre::Result<()> {
+/// - Already has `zstd_level`: nothing to do.
+/// - Has `storage_format`: migrate to `zstd_level`.
+/// - Has neither: add `zstd_level`, `disk_size`, `data`.
+fn migrate_v1_compression_columns(conn: &Connection) -> color_eyre::Result<()> {
     let has_zstd_level: bool = conn
         .prepare("SELECT zstd_level FROM chunks LIMIT 0")
         .is_ok();
@@ -2808,6 +3273,371 @@ mod tests {
         )
         .unwrap();
         (dir, backend)
+    }
+
+    fn read_clean_flag(dir: &Path) -> Option<i64> {
+        let conn = Connection::open(dir.join("castore.db")).unwrap();
+        conn.query_row(
+            "SELECT value FROM _meta WHERE key = 'clean_shutdown'",
+            [],
+            |row| row.get(0),
+        )
+        .ok()
+    }
+
+    fn insert_dummy_chunk(dir: &Path) {
+        let conn = Connection::open(dir.join("castore.db")).unwrap();
+        conn.execute(
+            "INSERT INTO chunks (digest, size) VALUES (?1, 1)",
+            params![vec![0u8; 32]],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn fresh_db_needs_no_integrity_check() {
+        let (dir, backend) = setup_backend();
+        assert!(backend.integrity_verified());
+        backend.mark_clean_shutdown();
+        drop(backend);
+        assert_eq!(read_clean_flag(dir.path()), Some(1));
+    }
+
+    #[test]
+    fn unclean_shutdown_defers_integrity_check() {
+        let (dir, backend) = setup_backend();
+        drop(backend); // no mark_clean_shutdown: simulates a crash
+        insert_dummy_chunk(dir.path());
+
+        let backend = Arc::new(
+            CastoreBackend::new(
+                dir.path().to_path_buf(),
+                ChunkCompressionConfig::default(),
+                false,
+            )
+            .unwrap(),
+        );
+        // Startup returned without running the check.
+        assert!(!backend.integrity_verified());
+
+        // Shutting down before the check finishes keeps the flag dirty.
+        backend.mark_clean_shutdown();
+        assert_eq!(read_clean_flag(dir.path()), Some(0));
+
+        backend.spawn_integrity_check();
+        let deadline = Instant::now() + std::time::Duration::from_secs(10);
+        while !backend.integrity_verified() {
+            assert!(Instant::now() < deadline, "integrity check did not finish");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        backend.mark_clean_shutdown();
+        assert_eq!(read_clean_flag(dir.path()), Some(1));
+    }
+
+    #[test]
+    fn recovery_marker_moves_db_aside() {
+        let (dir, backend) = setup_backend();
+        drop(backend);
+        insert_dummy_chunk(dir.path());
+        let db_path = dir.path().join("castore.db");
+        std::fs::write(recovery_marker_path(&db_path), "test").unwrap();
+
+        let backend = CastoreBackend::new(
+            dir.path().to_path_buf(),
+            ChunkCompressionConfig::default(),
+            false,
+        )
+        .unwrap();
+        let corrupt = backend.recover_from.clone().expect("db moved aside");
+        assert!(corrupt.exists());
+        assert!(!recovery_marker_path(&db_path).exists());
+        // The copy resumes after a restart until it finishes.
+        assert!(recover_from_marker_path(&db_path).exists());
+        assert!(backend.integrity_verified());
+        assert!(!backend.has_chunk(&[0u8; 32]).unwrap());
+    }
+
+    #[test]
+    fn recovery_restores_rows_indexes_and_pragmas() {
+        let (dir, backend) = setup_backend();
+        drop(backend);
+        insert_dummy_chunk(dir.path());
+        let db_path = dir.path().join("castore.db");
+        std::fs::write(recovery_marker_path(&db_path), "test").unwrap();
+
+        let backend = CastoreBackend::new(
+            dir.path().to_path_buf(),
+            ChunkCompressionConfig::default(),
+            false,
+        )
+        .unwrap();
+        // GC must wait for recovery.
+        assert!(!backend.path_files_ready());
+
+        let corrupt = backend.recover_from.clone().unwrap();
+        backend.run_recovery(&corrupt);
+        assert!(backend.has_chunk(&[0u8; 32]).unwrap());
+        assert!(backend.path_files_ready());
+        assert!(!recover_from_marker_path(&db_path).exists());
+
+        let db = backend.db.lock().unwrap();
+        let indexes: i64 = db
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name IN \
+                 ('idx_path_files_file_digest', 'idx_file_chunks_digest', \
+                 'idx_cas_paths_last_access')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(indexes, 3);
+        let sync: i64 = db
+            .query_row("PRAGMA synchronous", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(sync, 2, "synchronous should be back to FULL");
+    }
+
+    #[test]
+    fn blob_keyed_tables_are_without_rowid() {
+        let (_dir, backend) = setup_backend();
+        let db = backend.db.lock().unwrap();
+        for table in ["chunks", "file_chunks", "path_files"] {
+            let sql: String = db
+                .query_row(
+                    "SELECT sql FROM sqlite_master WHERE name = ?1",
+                    params![table],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(sql.contains("WITHOUT ROWID"), "{table}: {sql}");
+        }
+        assert_eq!(stored_schema_version(&db), SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn recovery_copies_pack_locations_from_v2_source() {
+        let (dir, backend) = setup_backend();
+        let small = b"packed before corruption";
+        let digest = backend.store_chunk(small).unwrap();
+        drop(backend);
+        let db_path = dir.path().join("castore.db");
+        std::fs::write(recovery_marker_path(&db_path), "test").unwrap();
+
+        let backend = CastoreBackend::new(
+            dir.path().to_path_buf(),
+            ChunkCompressionConfig::default(),
+            false,
+        )
+        .unwrap();
+        let source = backend.recover_from.clone().unwrap();
+        backend.run_recovery(&source);
+        assert_eq!(
+            backend.get_chunk_by_digest(&digest).unwrap().unwrap(),
+            &small[..]
+        );
+    }
+
+    /// Build a database with the v1 schema (small chunk data inline in
+    /// `chunks.data`, rowid tables, no schema_version).
+    fn create_v1_db(dir: &Path, inline: &[u8]) {
+        let conn = Connection::open(dir.join("castore.db")).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE _meta (key TEXT PRIMARY KEY, value INTEGER NOT NULL);
+             CREATE TABLE cas_paths (
+                hash TEXT PRIMARY KEY, store_path TEXT NOT NULL, nar_hash TEXT NOT NULL,
+                nar_size INTEGER NOT NULL, root_node BLOB NOT NULL,
+                references_ TEXT NOT NULL DEFAULT '', signatures TEXT NOT NULL DEFAULT '',
+                ca TEXT NOT NULL DEFAULT '', deriver TEXT NOT NULL DEFAULT '',
+                added_at INTEGER NOT NULL, last_access INTEGER NOT NULL DEFAULT 0);
+             CREATE TABLE chunks (
+                digest BLOB PRIMARY KEY, size INTEGER NOT NULL,
+                ref_count INTEGER NOT NULL DEFAULT 1, zstd_level INTEGER DEFAULT NULL,
+                disk_size INTEGER NOT NULL DEFAULT 0, data BLOB DEFAULT NULL);
+             CREATE TABLE file_chunks (
+                file_digest BLOB NOT NULL, chunk_index INTEGER NOT NULL,
+                chunk_digest BLOB NOT NULL, chunk_size INTEGER NOT NULL,
+                PRIMARY KEY (file_digest, chunk_index));
+             CREATE TABLE directories (digest BLOB PRIMARY KEY, data BLOB NOT NULL);
+             CREATE TABLE path_files (
+                path_hash TEXT NOT NULL, file_digest BLOB NOT NULL,
+                PRIMARY KEY (path_hash, file_digest));
+             INSERT INTO _meta VALUES ('clean_shutdown', 1);",
+        )
+        .unwrap();
+        let digest = blake3::hash(inline);
+        conn.execute(
+            "INSERT INTO chunks (digest, size, data) VALUES (?1, ?2, ?3)",
+            params![digest.as_bytes().as_slice(), inline.len() as i64, inline],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO file_chunks VALUES (?1, 0, ?1, ?2)",
+            params![digest.as_bytes().as_slice(), inline.len() as i64],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO cas_paths (hash, store_path, nar_hash, nar_size, root_node, added_at) \
+             VALUES ('abc', '/nix/store/abc-x', 'sha256:00', 1, x'', 0)",
+            [],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn v1_database_is_migrated_in_background() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let inline = b"small chunk from a v1 database";
+        create_v1_db(dir.path(), inline);
+        let digest = *blake3::hash(inline).as_bytes();
+        let open = || {
+            CastoreBackend::new(
+                dir.path().to_path_buf(),
+                ChunkCompressionConfig::default(),
+                false,
+            )
+            .unwrap()
+        };
+
+        let backend = open();
+        let source = backend.recover_from.clone().expect("v1 db moved aside");
+        assert!(source.to_string_lossy().contains("castore.db.v1-"));
+        assert!(!backend.path_files_ready());
+        assert!(!backend.has_chunk(&digest).unwrap());
+
+        // Restarting before the copy finishes resumes it.
+        drop(backend);
+        let backend = open();
+        assert_eq!(backend.recover_from.as_deref(), Some(source.as_path()));
+
+        backend.run_recovery(&source);
+        assert_eq!(
+            backend.get_chunk_by_digest(&digest).unwrap().unwrap(),
+            &inline[..]
+        );
+        assert_eq!(backend.total_paths().unwrap(), 1);
+        assert!(backend.path_files_ready());
+
+        // Done: the next start neither migrates nor resumes.
+        drop(backend);
+        let backend = open();
+        assert!(backend.recover_from.is_none());
+        assert_eq!(
+            backend.get_chunk_by_digest(&digest).unwrap().unwrap(),
+            &inline[..]
+        );
+        let db = backend.db.lock().unwrap();
+        assert_eq!(stored_schema_version(&db), SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn rerunning_v1_copy_does_not_duplicate_pack_records() {
+        let dir = tempfile::TempDir::new().unwrap();
+        create_v1_db(dir.path(), b"copied twice");
+        let backend = CastoreBackend::new(
+            dir.path().to_path_buf(),
+            ChunkCompressionConfig::default(),
+            false,
+        )
+        .unwrap();
+        let source = backend.recover_from.clone().unwrap();
+        recover_from_corrupt(&backend, &source).unwrap();
+        let pack = dir.path().join("packs").join("pack-000001.dat");
+        let len = std::fs::metadata(&pack).unwrap().len();
+        recover_from_corrupt(&backend, &source).unwrap();
+        assert_eq!(std::fs::metadata(&pack).unwrap().len(), len);
+    }
+
+    /// Times a v1 -> v2 copy. Run with
+    /// `CAS_BENCH_CHUNKS=1000000 cargo test --release -p ekapkgs-serve
+    /// bench_v1_migration -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "benchmark"]
+    fn bench_v1_migration() {
+        let n: u32 = std::env::var("CAS_BENCH_CHUNKS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(100_000);
+        let dir = tempfile::TempDir::new().unwrap();
+        create_v1_db(dir.path(), b"seed");
+        {
+            let conn = Connection::open(dir.path().join("castore.db")).unwrap();
+            conn.execute_batch("PRAGMA synchronous=OFF; BEGIN").unwrap();
+            let mut ins = conn
+                .prepare(
+                    "INSERT OR IGNORE INTO chunks (digest, size, zstd_level, disk_size, data) \
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                )
+                .unwrap();
+            let mut fc = conn
+                .prepare("INSERT INTO file_chunks VALUES (?1, 0, ?2, ?3)")
+                .unwrap();
+            for i in 0..n {
+                // ~40% small chunks with inline data, like the real cache.
+                let small = i % 5 < 2;
+                let data: Vec<u8> = i.to_le_bytes().repeat(75 + (i % 175) as usize);
+                let digest = if small {
+                    *blake3::hash(&data).as_bytes()
+                } else {
+                    *blake3::hash(&i.to_le_bytes()).as_bytes()
+                };
+                ins.execute(params![
+                    digest.as_slice(),
+                    if small { data.len() as i64 } else { 65536 },
+                    if small { None } else { Some(3) },
+                    if small { 0 } else { 30000 },
+                    if small { Some(data) } else { None },
+                ])
+                .unwrap();
+                let file = blake3::hash(&(i + n).to_le_bytes());
+                fc.execute(params![file.as_bytes().as_slice(), digest.as_slice(), 1])
+                    .unwrap();
+            }
+            drop((ins, fc));
+            conn.execute_batch("COMMIT").unwrap();
+        }
+        let backend = CastoreBackend::new(
+            dir.path().to_path_buf(),
+            ChunkCompressionConfig::default(),
+            false,
+        )
+        .unwrap();
+        let source = backend.recover_from.clone().unwrap();
+        let t = Instant::now();
+        let stats = recover_from_corrupt(&backend, &source).unwrap();
+        let elapsed = t.elapsed();
+        let size = |p: &Path| std::fs::metadata(p).map_or(0, |m| m.len());
+        eprintln!(
+            "copied {} chunks + {} file_chunks in {elapsed:?}; v1 db {} MB -> v2 db {} MB + packs \
+             {} MB",
+            stats.chunks,
+            stats.file_chunks,
+            size(&source) / 1_000_000,
+            size(&dir.path().join("castore.db")) / 1_000_000,
+            size(&dir.path().join("packs/pack-000001.dat")) / 1_000_000,
+        );
+    }
+
+    #[test]
+    fn truncate_wal_empties_wal() {
+        let (dir, backend) = setup_backend();
+        for i in 0..200u32 {
+            backend.store_chunk(&i.to_le_bytes()).unwrap();
+        }
+        let wal = dir.path().join("castore.db-wal");
+        assert!(std::fs::metadata(&wal).unwrap().len() > 0);
+        backend.truncate_wal();
+        assert_eq!(std::fs::metadata(&wal).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn quick_check_detects_garbage_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("bad.db");
+        std::fs::write(&path, vec![0xAB; 8192]).unwrap();
+        assert!(matches!(
+            run_quick_check(&path),
+            IntegrityResult::Corrupt(_)
+        ));
     }
 
     #[test]
@@ -3233,13 +4063,30 @@ mod tests {
     }
 
     #[test]
-    fn small_chunk_inlined_in_db() {
+    fn small_chunk_stored_in_pack() {
         let (_dir, backend) = setup_backend();
 
-        // Small data (<1K) should be inlined — no file on disk.
+        // Small data (<1K) goes into a pack — no chunk file on disk.
         let small_data = b"tiny chunk";
         let digest = backend.store_chunk(small_data).unwrap();
         assert_eq!(count_chunk_files(&backend.root), 0);
+        let pack_id: Option<i64> = backend
+            .db
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT pack_id FROM chunks WHERE digest = ?1",
+                params![digest.as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(pack_id.is_some());
+
+        // Storing it again doesn't append a second record.
+        let pack = backend.root.join("packs").join("pack-000001.dat");
+        let len = std::fs::metadata(&pack).unwrap().len();
+        backend.store_chunk(small_data).unwrap();
+        assert_eq!(std::fs::metadata(&pack).unwrap().len(), len);
 
         // Should still be readable.
         let retrieved = backend.get_chunk_by_digest(&digest).unwrap().unwrap();
