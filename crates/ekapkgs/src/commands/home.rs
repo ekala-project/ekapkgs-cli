@@ -29,24 +29,14 @@ fn resolve_home_installable(explicit: Option<&str>) -> String {
 
     // Probe the standalone attribute with a quick `nix eval`.
     tracing::debug!("Probing {HOME_INSTALLABLE_STANDALONE}...");
-    let probe = NixCommand::new(&["eval"])
-        .arg(HOME_INSTALLABLE_STANDALONE)
-        .arg("--apply")
-        .arg("_: null")
-        .output();
-
-    match probe {
-        Ok(_) => {
-            tracing::info!("Using standalone home evaluator");
-            HOME_INSTALLABLE_STANDALONE.to_owned()
-        },
-        Err(_) => {
-            tracing::debug!(
-                "{HOME_INSTALLABLE_STANDALONE} not found, falling back to \
-                 {HOME_INSTALLABLE_SYSTEM}"
-            );
-            HOME_INSTALLABLE_SYSTEM.to_owned()
-        },
+    if ekapkgs_nix::eval::is_derivation(HOME_INSTALLABLE_STANDALONE) {
+        tracing::info!("Using standalone home evaluator");
+        HOME_INSTALLABLE_STANDALONE.to_owned()
+    } else {
+        tracing::debug!(
+            "{HOME_INSTALLABLE_STANDALONE} not found, falling back to {HOME_INSTALLABLE_SYSTEM}"
+        );
+        HOME_INSTALLABLE_SYSTEM.to_owned()
     }
 }
 

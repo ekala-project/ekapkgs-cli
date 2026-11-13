@@ -7,6 +7,7 @@
 - Evaluate with [iets](https://github.com/numtide/iets) when it is installed
   - `eval`, `build`, `derivation show`, `search`, `print-dev-env` and `develop` on local flakes run as `iets nix ...`; everything else still runs `nix`
   - `system`, `home` and `deploy` builds use `--print-out-paths` instead of `--json`, so they run on iets
+  - `system` and `home` probe their default configuration with `nix eval --raw <installable>.type` instead of `--apply`, so the probe runs on iets
   - `template` prefetches source hashes with `iets prefetch`
   - `EKAPKGS_EVALUATOR=auto|iets|nix` selects the evaluator (default `auto`)
   - The Nix package wraps `ekapkgs` with iets on `PATH`, and the dev shell includes it
