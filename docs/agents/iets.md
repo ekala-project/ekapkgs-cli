@@ -47,6 +47,14 @@ attribute is a derivation with `nix eval --raw <installable>.type`
 (`ekapkgs_nix::eval::is_derivation`) rather than `--apply '_: null'`, so the
 probe runs on iets too. Both force the value to the same depth.
 
+`cache warm` evaluates the flake against each lock file with
+`--reference-lock-file` (`ekapkgs_nix::eval::derivation_closure_paths_with_lock`).
+It always passes `--no-write-lock-file` as well: nix locks the flake again
+starting from the reference file, and without that flag it writes the
+result over the flake's own `flake.lock`. `iets nix` does not accept
+`--reference-lock-file` yet (only the native `iets` commands do), so these
+evaluations run on nix.
+
 ## Selecting the evaluator
 
 `EKAPKGS_EVALUATOR` is read once per process:
