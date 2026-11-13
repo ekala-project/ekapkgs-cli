@@ -124,6 +124,8 @@ const FALLBACK_FLAGS: &[&str] = &[
     "--override-input",
     "--override-flake",
     "--update-input",
+    // Accepted by the native commands, not yet by `iets nix`.
+    "--reference-lock-file",
     "--recreate-lock-file",
     "--no-update-lock-file",
     "--no-write-lock-file",
@@ -412,6 +414,14 @@ mod tests {
             ".#default",
         ]));
         assert!(!native(&["develop", ".#default", "--phase", "build"]));
+        assert!(!native(&[
+            "derivation",
+            "show",
+            "-r",
+            ".#foo",
+            "--reference-lock-file",
+            "/tmp/flake.lock",
+        ]));
     }
 
     #[test]

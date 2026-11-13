@@ -1016,7 +1016,7 @@ fn cmd_warm(
         (old, new)
     };
 
-    // Write temporary flake.lock files for evaluation.
+    // Write the two lock files for `--reference-lock-file`.
     let temp_dir = tempfile::tempdir()?;
     let old_lock_path = temp_dir.path().join("flake.lock.old");
     let new_lock_path = temp_dir.path().join("flake.lock.new");
@@ -1024,10 +1024,11 @@ fn cmd_warm(
     std::fs::write(&new_lock_path, &new_lock_content)?;
 
     // Evaluate closures at both flake.lock versions.
+    let inst = Installable::new(installable);
     tracing::info!("Evaluating old closure...");
-    let old_closure = eval_with_lock(installable, &old_lock_path)?;
+    let old_closure = eval::derivation_closure_paths_with_lock(&inst, &old_lock_path)?;
     tracing::info!("Evaluating new closure...");
-    let new_closure = eval_with_lock(installable, &new_lock_path)?;
+    let new_closure = eval::derivation_closure_paths_with_lock(&inst, &new_lock_path)?;
 
     // Compute the diff: paths in new closure not in old closure.
     let old_set: std::collections::HashSet<&str> = old_closure.iter().map(String::as_str).collect();
@@ -1171,55 +1172,6 @@ fn git_show_file(rev: &str, path: &str) -> color_eyre::Result<String> {
     }
 
     Ok(String::from_utf8(output.stdout)?)
-}
-
-/// Evaluate a closure with a specific flake.lock file.
-///
-/// Uses `--override-input` to pin the flake's lock to the specified file.
-/// Falls back to evaluating with the lock file copied into a temp flake.
-fn eval_with_lock(
-    installable: &str,
-    lock_path: &std::path::Path,
-) -> color_eyre::Result<Vec<String>> {
-    // Create a temporary directory with the current flake source and the
-    // overridden flake.lock.
-    let temp_dir = tempfile::tempdir()?;
-
-    // Copy the current directory's flake.nix (and other files) to temp.
-    // We only need flake.nix and the lock file.
-    if std::path::Path::new("flake.nix").exists() {
-        std::fs::copy("flake.nix", temp_dir.path().join("flake.nix"))?;
-    }
-    std::fs::copy(lock_path, temp_dir.path().join("flake.lock"))?;
-
-    // Copy nix/ directory if it exists (for overlays, modules).
-    if std::path::Path::new("nix").is_dir() {
-        copy_dir_recursive(std::path::Path::new("nix"), &temp_dir.path().join("nix"))?;
-    }
-
-    // Evaluate the installable in the temp directory.
-    let inst_path = format!(
-        "path:{}#{}",
-        temp_dir.path().display(),
-        installable.trim_start_matches(".#")
-    );
-    let inst = Installable::new(&inst_path);
-    eval::derivation_closure_paths(&inst).map_err(Into::into)
-}
-
-fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
-    std::fs::create_dir_all(dst)?;
-    for entry in std::fs::read_dir(src)? {
-        let entry = entry?;
-        let ty = entry.file_type()?;
-        let dst_path = dst.join(entry.file_name());
-        if ty.is_dir() {
-            copy_dir_recursive(&entry.path(), &dst_path)?;
-        } else {
-            std::fs::copy(entry.path(), dst_path)?;
-        }
-    }
-    Ok(())
 }
 
 // --- cache management ---

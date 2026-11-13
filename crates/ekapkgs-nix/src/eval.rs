@@ -1,3 +1,5 @@
+use std::path::Path;
+
 use serde::Deserialize;
 
 use crate::command::{NixCommand, NixError};
@@ -170,10 +172,36 @@ pub fn build_out_paths(
 /// Calls `nix derivation show -r <installable>` and extracts all output
 /// store paths from the derivation graph.
 pub fn derivation_closure_paths(installable: &Installable) -> Result<Vec<String>, NixError> {
-    let show: DerivationShowOutput = NixCommand::new(&["derivation", "show"])
+    closure_paths(installable, None)
+}
+
+/// [`derivation_closure_paths`], with the root flake locked by `lock_file`
+/// instead of its own `flake.lock`.
+///
+/// Passes `--reference-lock-file`. Nix locks the flake again starting from
+/// that file and would write the result over the flake's `flake.lock`, so
+/// `--no-write-lock-file` is passed too.
+pub fn derivation_closure_paths_with_lock(
+    installable: &Installable,
+    lock_file: &Path,
+) -> Result<Vec<String>, NixError> {
+    closure_paths(installable, Some(lock_file))
+}
+
+fn closure_paths(
+    installable: &Installable,
+    lock_file: Option<&Path>,
+) -> Result<Vec<String>, NixError> {
+    let mut cmd = NixCommand::new(&["derivation", "show"])
         .arg("-r")
-        .arg(&installable.raw)
-        .json()?;
+        .arg(&installable.raw);
+    if let Some(lock_file) = lock_file {
+        cmd = cmd
+            .arg("--reference-lock-file")
+            .arg(lock_file.to_string_lossy())
+            .arg("--no-write-lock-file");
+    }
+    let show: DerivationShowOutput = cmd.json()?;
 
     Ok(collect_output_paths(&show))
 }
