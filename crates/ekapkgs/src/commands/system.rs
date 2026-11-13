@@ -485,7 +485,8 @@ fn build_system(installable: &str, extra: &[String]) -> color_eyre::Result<Strin
 
     let path = outputs
         .first()
-        .and_then(|o| o.outputs.get("out").cloned())
+        .and_then(BuildOutput::out)
+        .map(str::to_owned)
         .ok_or_else(|| color_eyre::eyre::eyre!("build produced no output"))?;
 
     tracing::info!("Built {}", path);
@@ -879,7 +880,7 @@ fn cmd_packages_add(packages: &[String], flake_override: Option<&str>) -> color_
             .arg("--json")
             .json();
         if let Ok(outputs) = outputs {
-            if let Some(store_path) = outputs.first().and_then(|o| o.outputs.get("out")) {
+            if let Some(store_path) = outputs.first().and_then(BuildOutput::out) {
                 index.add_from_build_output(name, store_path);
                 let _ = index.save();
             }
@@ -1113,8 +1114,45 @@ fn cmd_packages_import(file: &str, merge: bool) -> color_eyre::Result<()> {
 // Build output
 // ---------------------------------------------------------------------------
 
-#[derive(serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct BuildOutput {
-    outputs: std::collections::HashMap<String, String>,
+/// One entry of `nix build --json`.
+#[derive(Debug, serde::Deserialize)]
+#[serde(untagged)]
+enum BuildOutput {
+    /// A derivation installable: `{"drvPath": ..., "outputs": {...}}`.
+    Derivation {
+        outputs: std::collections::HashMap<String, String>,
+    },
+    /// A store path installable, e.g. a prebuilt system, which nix
+    /// reports as the bare path.
+    Path(String),
+}
+
+impl BuildOutput {
+    /// The `out` output's store path.
+    fn out(&self) -> Option<&str> {
+        match self {
+            Self::Derivation { outputs } => outputs.get("out").map(String::as_str),
+            Self::Path(path) => Some(path),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn build_output_of_a_derivation() {
+        let outputs: Vec<BuildOutput> = serde_json::from_str(
+            r#"[{"drvPath":"/nix/store/a.drv","outputs":{"out":"/nix/store/a"}}]"#,
+        )
+        .unwrap();
+        assert_eq!(outputs[0].out(), Some("/nix/store/a"));
+    }
+
+    #[test]
+    fn build_output_of_a_store_path() {
+        let outputs: Vec<BuildOutput> = serde_json::from_str(r#"["/nix/store/a"]"#).unwrap();
+        assert_eq!(outputs[0].out(), Some("/nix/store/a"));
+    }
 }
