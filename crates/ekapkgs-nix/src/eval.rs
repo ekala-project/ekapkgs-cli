@@ -3,12 +3,41 @@ use serde::Deserialize;
 use crate::command::{NixCommand, NixError};
 use crate::installable::Installable;
 
-/// A nix build output entry from `nix build --dry-run --json`.
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct BuildOutput {
-    pub drv_path: String,
-    pub outputs: std::collections::HashMap<String, String>,
+/// One entry of `nix build --json`, with or without `--dry-run`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(untagged)]
+pub enum BuildOutput {
+    /// A derivation installable: `{"drvPath": ..., "outputs": {...}}`.
+    #[serde(rename_all = "camelCase")]
+    Derivation {
+        drv_path: String,
+        outputs: std::collections::HashMap<String, String>,
+    },
+    /// A store path installable, e.g. `/nix/store/...-hello`, which nix
+    /// reports as the bare path.
+    Path(String),
+}
+
+impl BuildOutput {
+    /// The store path of the `out` output, or the store path itself.
+    pub fn out(&self) -> Option<&str> {
+        match self {
+            Self::Derivation { outputs, .. } => outputs.get("out").map(String::as_str),
+            Self::Path(path) => Some(path),
+        }
+    }
+
+    /// The store paths of all outputs.
+    pub fn paths(&self) -> impl Iterator<Item = &str> {
+        let (outputs, path) = match self {
+            Self::Derivation { outputs, .. } => (Some(outputs), None),
+            Self::Path(path) => (None, Some(path.as_str())),
+        };
+        outputs
+            .into_iter()
+            .flat_map(|o| o.values().map(String::as_str))
+            .chain(path)
+    }
 }
 
 /// Versioned wrapper for `nix derivation show` output (format version >= 4).
@@ -180,4 +209,40 @@ pub fn show_derivation(drv_path: &str) -> Result<DerivationInfo, NixError> {
         .ok_or(NixError::Empty {
             context: format!("nix derivation show returned no derivations for {drv_path}"),
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn build_output_of_a_derivation() {
+        let outputs: Vec<BuildOutput> = serde_json::from_str(
+            r#"[{"drvPath":"/nix/store/a.drv","outputs":{"out":"/nix/store/a","dev":"/nix/store/a-dev"}}]"#,
+        )
+        .unwrap();
+        assert_eq!(outputs[0].out(), Some("/nix/store/a"));
+        let mut paths: Vec<&str> = outputs[0].paths().collect();
+        paths.sort_unstable();
+        assert_eq!(paths, ["/nix/store/a", "/nix/store/a-dev"]);
+    }
+
+    #[test]
+    fn build_output_of_a_derivation_without_out() {
+        let outputs: Vec<BuildOutput> = serde_json::from_str(
+            r#"[{"drvPath":"/nix/store/a.drv","outputs":{"bin":"/nix/store/a-bin"}}]"#,
+        )
+        .unwrap();
+        assert_eq!(outputs[0].out(), None);
+        assert_eq!(outputs[0].paths().collect::<Vec<_>>(), ["/nix/store/a-bin"]);
+    }
+
+    #[test]
+    fn build_output_of_a_store_path() {
+        // `nix build /nix/store/...-a --json`
+        let outputs: Vec<BuildOutput> = serde_json::from_str(r#"["/nix/store/a"]"#).unwrap();
+        assert_eq!(outputs[0], BuildOutput::Path("/nix/store/a".to_owned()));
+        assert_eq!(outputs[0].out(), Some("/nix/store/a"));
+        assert_eq!(outputs[0].paths().collect::<Vec<_>>(), ["/nix/store/a"]);
+    }
 }

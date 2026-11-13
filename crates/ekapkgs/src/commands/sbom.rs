@@ -233,12 +233,8 @@ fn build_sbom_components(
 
     let root_path = outputs
         .first()
-        .and_then(|o| {
-            o.outputs
-                .get("out")
-                .or_else(|| o.outputs.values().next())
-                .cloned()
-        })
+        .and_then(|o| o.out().or_else(|| o.paths().next()))
+        .map(str::to_owned)
         .ok_or_else(|| color_eyre::eyre::eyre!("no output path for installable"))?;
 
     let manifest = manifest::load_manifest(&root_path);

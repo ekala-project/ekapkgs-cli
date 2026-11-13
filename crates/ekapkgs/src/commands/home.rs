@@ -1,5 +1,6 @@
 use std::process::Stdio;
 
+use ekapkgs_nix::eval::BuildOutput;
 use ekapkgs_nix::installable::Installable;
 use ekapkgs_nix::{NixCommand, eval};
 use yansi::Paint;
@@ -252,7 +253,8 @@ fn build_home(installable: &str, extra: &[String]) -> color_eyre::Result<String>
 
     let path = outputs
         .first()
-        .and_then(|o| o.outputs.get("out").cloned())
+        .and_then(BuildOutput::out)
+        .map(str::to_owned)
         .ok_or_else(|| color_eyre::eyre::eyre!("build produced no output"))?;
 
     tracing::info!("Built {}", path);
@@ -381,7 +383,8 @@ fn cmd_packages_add(packages: &[String], flake_override: Option<&str>) -> color_
 
         let store_path = outputs
             .first()
-            .and_then(|o| o.outputs.get("out").cloned())
+            .and_then(BuildOutput::out)
+            .map(str::to_owned)
             .ok_or_else(|| {
                 color_eyre::eyre::eyre!("nix build produced no output for {installable}")
             })?;
@@ -625,8 +628,10 @@ fn cmd_packages_import(file: &str, merge: bool) -> color_eyre::Result<()> {
             .json::<Vec<BuildOutput>>()
         {
             Ok(outputs) => {
-                if let Some(store_path) =
-                    outputs.first().and_then(|o| o.outputs.get("out").cloned())
+                if let Some(store_path) = outputs
+                    .first()
+                    .and_then(BuildOutput::out)
+                    .map(str::to_owned)
                 {
                     let _ = crate::symlink_dir::create_package_symlinks(&packages_dir, &store_path);
                     index.add_from_build_output(name, &store_path);
@@ -1155,7 +1160,8 @@ fn cmd_services_apply_quiet(dry_run: bool, silent: bool) -> color_eyre::Result<(
 
             let store_path = builds
                 .first()
-                .and_then(|b| b.outputs.get("out").cloned())
+                .and_then(BuildOutput::out)
+                .map(str::to_owned)
                 .ok_or_else(|| color_eyre::eyre::eyre!("nix build produced no output"))?;
 
             // Copy Nix-built unit files into the temp dir alongside direct ones.
@@ -1443,7 +1449,7 @@ fn resolve_command_via_nix(
             .json();
 
         if let Ok(outputs) = result {
-            if let Some(store_path) = outputs.first().and_then(|o| o.outputs.get("out")) {
+            if let Some(store_path) = outputs.first().and_then(BuildOutput::out) {
                 let bin_path = format!("{store_path}/bin/{command}");
                 if std::path::Path::new(&bin_path).exists() {
                     return Ok(bin_path);
@@ -2569,10 +2575,4 @@ fn hint_session_vars() {
          configuration for automatic setup."
             .dim()
     );
-}
-
-#[derive(serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct BuildOutput {
-    outputs: std::collections::HashMap<String, String>,
 }

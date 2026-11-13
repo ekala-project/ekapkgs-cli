@@ -824,15 +824,10 @@ fn resolve_store_paths(
                 .output()?;
             let stdout = String::from_utf8_lossy(&build_output.stdout);
 
-            #[derive(serde::Deserialize)]
-            #[serde(rename_all = "camelCase")]
-            struct BuildOutput {
-                outputs: HashMap<String, String>,
-            }
-            let outputs: Vec<BuildOutput> = serde_json::from_str(&stdout)?;
+            let outputs: Vec<ekapkgs_nix::eval::BuildOutput> = serde_json::from_str(&stdout)?;
 
-            for build in outputs {
-                for out_path in build.outputs.into_values() {
+            for build in &outputs {
+                for out_path in build.paths().map(str::to_owned) {
                     let closure_output = NixCommand::new(&["path-info", "--recursive", "--json"])
                         .arg(&out_path)
                         .output()?;

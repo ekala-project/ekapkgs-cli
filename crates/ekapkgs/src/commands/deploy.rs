@@ -1,5 +1,6 @@
 use std::process::{Command, Stdio};
 
+use ekapkgs_nix::eval::BuildOutput;
 use ekapkgs_nix::installable::Installable;
 use ekapkgs_nix::{NixCommand, NixError, eval, store};
 
@@ -45,7 +46,8 @@ pub fn execute(
 
         let path = outputs
             .first()
-            .and_then(|o| o.outputs.get("out").cloned())
+            .and_then(BuildOutput::out)
+            .map(str::to_owned)
             .ok_or_else(|| color_eyre::eyre::eyre!("build produced no output"))?;
 
         tracing::info!("Built {}", path);
@@ -156,10 +158,4 @@ fn deploy_via_nixos_rebuild(
 
     tracing::info!("Deploy complete");
     Ok(())
-}
-
-#[derive(serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct BuildOutput {
-    outputs: std::collections::HashMap<String, String>,
 }
