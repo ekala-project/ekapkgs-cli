@@ -57,13 +57,23 @@ evaluations run on nix.
 
 ## Selecting the evaluator
 
-`EKAPKGS_EVALUATOR` is read once per process:
+Set `evaluator` under `[defaults]` in `~/.config/ekapkgs/config.toml`, or
+`EKAPKGS_EVALUATOR`, which overrides it. An empty or invalid variable is
+ignored, with a warning for an invalid one, and the config's value applies.
+
+```toml
+[defaults]
+evaluator = "nix"
+```
 
 | Value            | Effect                                          |
 |------------------|-------------------------------------------------|
 | `auto` (default) | use iets when it is on `PATH`                   |
 | `iets`           | always use iets; commands fail if it is missing |
 | `nix`            | never use iets                                  |
+
+`main` passes the config's value to `ekapkgs_nix::iets::configure` before
+any command runs. The choice is made once per process.
 
 Run with `RUST_LOG=ekapkgs_nix=debug` to see which program each command used.
 
