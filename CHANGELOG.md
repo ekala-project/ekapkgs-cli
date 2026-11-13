@@ -10,7 +10,7 @@
   - `system` and `home` probe their default configuration with `nix eval --raw <installable>.type` instead of `--apply`, so the probe runs on iets
   - `template` prefetches source hashes with `iets prefetch`
 - `cache warm` evaluates against each lock with `--reference-lock-file --no-write-lock-file` instead of copying `flake.nix` and `nix/` to a temp directory, so flakes that use other files evaluate correctly
-  - `EKAPKGS_EVALUATOR=auto|iets|nix` selects the evaluator (default `auto`)
+  - `evaluator = "auto" | "iets" | "nix"` under `[defaults]` in `config.toml` selects the evaluator (default `auto`); `EKAPKGS_EVALUATOR` overrides it
   - The Nix package wraps `ekapkgs` with iets on `PATH`, and the dev shell includes it
 - Pre-rendered dev shell environments with child shell spawning for directory environments
   - Flake dev shells are rendered via `nix print-dev-env --json` and cached as sourceable scripts

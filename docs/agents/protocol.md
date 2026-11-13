@@ -16,6 +16,6 @@ Two models supported:
 
 ## Client Configuration
 
-Config at `~/.config/ekapkgs/config.toml`. Supports multiple caches with priorities and per-cache tokens.
+Config at `~/.config/ekapkgs/config.toml`. Supports multiple caches with priorities and per-cache tokens. `[defaults] evaluator` selects nix or iets ([iets](iets.md)).
 
 All TOML manifest writes (home-packages, system-packages, home-services, env manifests, trusted-envs) use atomic write-then-rename via `tempfile::NamedTempFile`. Mutation commands hold an advisory file lock (`fs2::lock_exclusive`) for the entire load-modify-save window to prevent concurrent corruption.

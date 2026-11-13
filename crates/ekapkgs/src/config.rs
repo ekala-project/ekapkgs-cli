@@ -71,6 +71,12 @@ pub struct Defaults {
     /// generation will try this URL before falling back to local
     /// nix evaluation.
     pub index_url: Option<String>,
+
+    /// Which program evaluates the `nix` commands iets implements: `auto`
+    /// (iets when it is on `PATH`), `iets` or `nix`. `EKAPKGS_EVALUATOR`
+    /// overrides it.
+    #[serde(default)]
+    pub evaluator: ekapkgs_nix::iets::Evaluator,
 }
 
 impl Default for Defaults {
@@ -80,6 +86,7 @@ impl Default for Defaults {
             channel_input: None,
             channel_url: None,
             index_url: None,
+            evaluator: ekapkgs_nix::iets::Evaluator::default(),
         }
     }
 }
@@ -1011,6 +1018,24 @@ impl TrustedEnvs {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -----------------------------------------------------------------------
+    // ClientConfig
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn client_config_evaluator() {
+        use ekapkgs_nix::iets::Evaluator;
+
+        let config: ClientConfig = toml::from_str("").unwrap();
+        assert_eq!(config.defaults.evaluator, Evaluator::Auto);
+
+        let config: ClientConfig = toml::from_str("[defaults]\nevaluator = \"nix\"\n").unwrap();
+        assert_eq!(config.defaults.evaluator, Evaluator::Nix);
+        assert_eq!(config.defaults.max_parallel_downloads, 8);
+
+        assert!(toml::from_str::<ClientConfig>("[defaults]\nevaluator = \"lix\"\n").is_err());
+    }
 
     // -----------------------------------------------------------------------
     // HomePackages
