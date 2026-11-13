@@ -1166,17 +1166,9 @@ async fn cmd_serve(cli: Cli) -> color_eyre::Result<()> {
         enable_metrics,
         request_timeout,
     )
-    .route_service("/ekapkgs.v1.CacheService/Negotiate", grpc_service.clone())
-    .route_service(
-        "/ekapkgs.v1.CacheService/NegotiateChunks",
-        grpc_service.clone(),
-    )
-    .route_service("/ekapkgs.v1.CacheService/StreamNars", grpc_service.clone())
-    .route_service(
-        "/ekapkgs.v1.CacheService/PushNegotiate",
-        grpc_service.clone(),
-    )
-    .route_service("/ekapkgs.v1.CacheService/CacheStatus", grpc_service);
+    // Route every CacheService method to tonic, so new RPCs work without
+    // touching the router. Unknown methods get a proper gRPC Unimplemented.
+    .route_service("/ekapkgs.v1.CacheService/{*method}", grpc_service);
 
     // Check for systemd socket activation.
     let inherited_listener = try_socket_activation()?;
