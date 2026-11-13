@@ -44,7 +44,7 @@ impl FileLock {
     }
 }
 
-#[derive(Debug, Deserialize, Clone, Default)]
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
 pub struct ClientConfig {
     #[serde(default)]
     pub defaults: Defaults,
@@ -52,7 +52,7 @@ pub struct ClientConfig {
     pub caches: Vec<CacheConfig>,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct Defaults {
     #[serde(default = "default_parallel")]
     pub max_parallel_downloads: usize,
@@ -96,7 +96,7 @@ fn default_parallel() -> usize {
 }
 
 #[allow(dead_code)] // trust fields used by cert verification
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct CacheConfig {
     /// Short name for the cache (e.g., "mycache").
     pub name: String,
@@ -115,7 +115,7 @@ fn default_priority() -> u32 {
     10
 }
 
-#[derive(Debug, Deserialize, Clone, Default, PartialEq)]
+#[derive(Debug, Deserialize, Serialize, Clone, Default, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum CacheProtocol {
     #[default]
@@ -1035,6 +1035,58 @@ mod tests {
         assert_eq!(config.defaults.max_parallel_downloads, 8);
 
         assert!(toml::from_str::<ClientConfig>("[defaults]\nevaluator = \"lix\"\n").is_err());
+    }
+
+    #[test]
+    fn client_config_round_trip_keeps_every_key() {
+        let input = r#"
+            [defaults]
+            max_parallel_downloads = 4
+            channel_input = "omarchy"
+            channel_url = "github:omacom/omarchy-nix-pkgs"
+            index_url = "https://index.example"
+            evaluator = "nix"
+
+            [[caches]]
+            name = "main"
+            url = "https://cache.example"
+            trusted_key = "main:abc="
+            token = "secret"
+            priority = 5
+            protocol = "grpc"
+
+            [[caches]]
+            name = "legacy"
+            url = "https://legacy.example"
+            protocol = "legacy"
+        "#;
+        let config: ClientConfig = toml::from_str(input).unwrap();
+        let written = toml::to_string_pretty(&config).unwrap();
+        let reread: ClientConfig = toml::from_str(&written).unwrap();
+
+        let d = &reread.defaults;
+        assert_eq!(d.max_parallel_downloads, 4);
+        assert_eq!(d.channel_input.as_deref(), Some("omarchy"));
+        assert_eq!(
+            d.channel_url.as_deref(),
+            Some("github:omacom/omarchy-nix-pkgs")
+        );
+        assert_eq!(d.index_url.as_deref(), Some("https://index.example"));
+        assert_eq!(d.evaluator, ekapkgs_nix::iets::Evaluator::Nix);
+
+        assert_eq!(reread.caches.len(), 2);
+        let main = &reread.caches[0];
+        assert_eq!(main.name, "main");
+        assert_eq!(main.trusted_key.as_deref(), Some("main:abc="));
+        assert_eq!(main.trust_root, None);
+        assert_eq!(main.token.as_deref(), Some("secret"));
+        assert_eq!(main.priority, 5);
+        assert_eq!(main.protocol, CacheProtocol::Grpc);
+        assert_eq!(reread.caches[1].priority, 10);
+        assert_eq!(reread.caches[1].protocol, CacheProtocol::Legacy);
+
+        // Writing it again gives the same file.
+        assert_eq!(toml::to_string_pretty(&reread).unwrap(), written);
     }
 
     // -----------------------------------------------------------------------
