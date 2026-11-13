@@ -34,7 +34,7 @@ pub enum Program {
 }
 
 /// Which program evaluates the commands iets implements.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Evaluator {
     /// iets when it is on `PATH`, otherwise nix.
@@ -47,15 +47,6 @@ pub enum Evaluator {
 }
 
 impl Evaluator {
-    /// The name used in `EKAPKGS_EVALUATOR` and the config file.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Auto => "auto",
-            Self::Iets => "iets",
-            Self::Nix => "nix",
-        }
-    }
-
     /// Parse `EKAPKGS_EVALUATOR`. Unset, empty and invalid values give
     /// `None`, the last with a warning.
     fn from_env(value: Option<OsString>) -> Option<Self> {
