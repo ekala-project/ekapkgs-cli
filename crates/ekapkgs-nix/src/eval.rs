@@ -124,6 +124,19 @@ pub fn eval_build_outputs(installable: &Installable) -> Result<Vec<BuildOutput>,
         .json()
 }
 
+/// Whether a flake installable such as `.#foo.bar` evaluates to a derivation.
+///
+/// Evaluates `<installable>.type`, which forces the value no further than
+/// `nix eval <installable> --apply '_: null'` does and builds nothing. It
+/// needs no `--apply`, so iets evaluates it.
+pub fn is_derivation(installable: &str) -> bool {
+    NixCommand::new(&["eval"])
+        .arg("--raw")
+        .arg(format!("{installable}.type"))
+        .output()
+        .is_ok_and(|output| output.stdout == b"derivation")
+}
+
 /// Build an installable and return the store paths of the outputs it built.
 ///
 /// Calls `nix build <installable> --print-out-paths <extra>`. Unlike
