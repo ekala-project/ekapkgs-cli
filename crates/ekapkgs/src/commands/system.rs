@@ -44,13 +44,7 @@ fn resolve_system_installable(explicit: Option<&str>) -> String {
     if let Some(hostname) = read_hostname() {
         let candidate = format!(".#ekaosConfigurations.{hostname}.config.system.build.toplevel");
         tracing::debug!("Probing {candidate}...");
-        let probe = NixCommand::new(&["eval"])
-            .arg(&candidate)
-            .arg("--apply")
-            .arg("_: null")
-            .output();
-
-        if probe.is_ok() {
+        if ekapkgs_nix::eval::is_derivation(&candidate) {
             tracing::info!("Using system configuration for host '{hostname}'");
             return candidate;
         }
