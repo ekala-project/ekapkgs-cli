@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use ekapkgs_nix::NixCommand;
+use ekapkgs_nix::eval::BuildOutput;
 use ekapkgs_nix::installable::Installable;
 use jiff::Timestamp;
 use yansi::Paint;
@@ -489,7 +490,8 @@ fn build_system(installable: &str, extra: &[String]) -> color_eyre::Result<Strin
 
     let path = outputs
         .first()
-        .and_then(|o| o.outputs.get("out").cloned())
+        .and_then(BuildOutput::out)
+        .map(str::to_owned)
         .ok_or_else(|| color_eyre::eyre::eyre!("build produced no output"))?;
 
     tracing::info!("Built {}", path);
@@ -883,7 +885,7 @@ fn cmd_packages_add(packages: &[String], flake_override: Option<&str>) -> color_
             .arg("--json")
             .json();
         if let Ok(outputs) = outputs {
-            if let Some(store_path) = outputs.first().and_then(|o| o.outputs.get("out")) {
+            if let Some(store_path) = outputs.first().and_then(BuildOutput::out) {
                 index.add_from_build_output(name, store_path);
                 let _ = index.save();
             }
@@ -1111,14 +1113,4 @@ fn cmd_packages_import(file: &str, merge: bool) -> color_eyre::Result<()> {
     );
 
     Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// Build output
-// ---------------------------------------------------------------------------
-
-#[derive(serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct BuildOutput {
-    outputs: std::collections::HashMap<String, String>,
 }

@@ -175,7 +175,7 @@ ekaosTest {
       assert profile() == A, f"profile {profile()}, expected {A}"
 
       with subtest("switching needs root"):
-          out = machine.fail(f"runuser -u nobody -- ekapkgs system switch {B} 2>&1")
+          out = machine.fail(f"setpriv --reuid=65534 --regid=65534 --clear-groups ekapkgs system switch {B} 2>&1")
           assert "needs root" in out, out
 
       with subtest("an unknown contract is refused before anything changes"):
