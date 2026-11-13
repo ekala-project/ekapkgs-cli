@@ -12,8 +12,8 @@
 //! and the fallback notice. These checks only save that work. iets still
 //! falls back on its own for any case they miss.
 //!
-//! `EKAPKGS_EVALUATOR` picks the mode: `auto` (the default) uses iets when it
-//! is on `PATH`, `iets` always uses it, and `nix` never does.
+//! The [`Evaluator`] comes from `EKAPKGS_EVALUATOR`, else from the client
+//! config through [`configure`], else it is `auto`.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -33,31 +33,65 @@ pub enum Program {
     Iets(&'static Path),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Mode {
+/// Which program evaluates the commands iets implements.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Evaluator {
+    /// iets when it is on `PATH`, otherwise nix.
+    #[default]
     Auto,
+    /// Always iets. Commands fail when it is missing.
     Iets,
+    /// Always nix.
     Nix,
 }
 
-impl Mode {
-    fn from_env(value: Option<OsString>) -> Self {
-        let Some(value) = value else {
-            return Self::Auto;
-        };
+impl Evaluator {
+    /// The name used in `EKAPKGS_EVALUATOR` and the config file.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Iets => "iets",
+            Self::Nix => "nix",
+        }
+    }
+
+    /// Parse `EKAPKGS_EVALUATOR`. Unset, empty and invalid values give
+    /// `None`, the last with a warning.
+    fn from_env(value: Option<OsString>) -> Option<Self> {
+        let value = value?;
         match value.to_str() {
-            Some("" | "auto") => Self::Auto,
-            Some("iets") => Self::Iets,
-            Some("nix") => Self::Nix,
+            Some("") => None,
+            Some("auto") => Some(Self::Auto),
+            Some("iets") => Some(Self::Iets),
+            Some("nix") => Some(Self::Nix),
             _ => {
                 tracing::warn!(
-                    "{EVALUATOR_ENV}={} is not one of auto, iets or nix; using auto",
+                    "ignoring {EVALUATOR_ENV}={}: expected auto, iets or nix",
                     value.to_string_lossy()
                 );
-                Self::Auto
+                None
             },
         }
     }
+}
+
+static CONFIGURED: OnceLock<Evaluator> = OnceLock::new();
+
+/// Set the evaluator chosen in the client config.
+///
+/// `EKAPKGS_EVALUATOR` takes precedence. Call this before the first
+/// [`NixCommand`](crate::NixCommand) runs: the choice is made once, and a
+/// later call has no effect.
+pub fn configure(evaluator: Evaluator) {
+    if CONFIGURED.set(evaluator).is_err() {
+        tracing::debug!("evaluator already configured; ignoring {evaluator:?}");
+    }
+}
+
+/// The evaluator in effect: the environment's, else the config's.
+fn selected(env: Option<OsString>, configured: Option<Evaluator>) -> Evaluator {
+    Evaluator::from_env(env).or(configured).unwrap_or_default()
 }
 
 /// The iets binary ekapkgs uses, or `None` when every command goes to `nix`.
@@ -66,18 +100,19 @@ impl Mode {
 pub fn binary() -> Option<&'static Path> {
     static IETS: OnceLock<Option<PathBuf>> = OnceLock::new();
     IETS.get_or_init(|| {
+        let evaluator = selected(std::env::var_os(EVALUATOR_ENV), CONFIGURED.get().copied());
         let found = which::which("iets").ok();
-        let iets = match Mode::from_env(std::env::var_os(EVALUATOR_ENV)) {
-            Mode::Nix => None,
-            Mode::Iets => Some(found.unwrap_or_else(|| {
+        let iets = match evaluator {
+            Evaluator::Nix => None,
+            Evaluator::Iets => Some(found.unwrap_or_else(|| {
                 // Run it by name anyway, so the commands fail rather than
                 // quietly use nix.
-                tracing::warn!("{EVALUATOR_ENV}=iets, but iets is not on PATH");
+                tracing::warn!("the evaluator is iets, but iets is not on PATH");
                 PathBuf::from("iets")
             })),
-            Mode::Auto => found,
+            Evaluator::Auto => found,
         };
-        tracing::debug!(iets = ?iets, "evaluator");
+        tracing::debug!(?evaluator, iets = ?iets, "evaluator");
         iets
     })
     .as_deref()
@@ -478,12 +513,33 @@ mod tests {
     }
 
     #[test]
-    fn mode_from_env() {
-        assert_eq!(Mode::from_env(None), Mode::Auto);
-        assert_eq!(Mode::from_env(Some("".into())), Mode::Auto);
-        assert_eq!(Mode::from_env(Some("auto".into())), Mode::Auto);
-        assert_eq!(Mode::from_env(Some("iets".into())), Mode::Iets);
-        assert_eq!(Mode::from_env(Some("nix".into())), Mode::Nix);
-        assert_eq!(Mode::from_env(Some("lix".into())), Mode::Auto);
+    fn evaluator_from_env() {
+        assert_eq!(Evaluator::from_env(None), None);
+        assert_eq!(Evaluator::from_env(Some("".into())), None);
+        assert_eq!(
+            Evaluator::from_env(Some("auto".into())),
+            Some(Evaluator::Auto)
+        );
+        assert_eq!(
+            Evaluator::from_env(Some("iets".into())),
+            Some(Evaluator::Iets)
+        );
+        assert_eq!(
+            Evaluator::from_env(Some("nix".into())),
+            Some(Evaluator::Nix)
+        );
+        assert_eq!(Evaluator::from_env(Some("lix".into())), None);
+    }
+
+    #[test]
+    fn environment_overrides_config() {
+        use Evaluator::{Auto, Iets, Nix};
+        assert_eq!(selected(None, None), Auto);
+        assert_eq!(selected(None, Some(Nix)), Nix);
+        assert_eq!(selected(Some("iets".into()), Some(Nix)), Iets);
+        assert_eq!(selected(Some("auto".into()), Some(Nix)), Auto);
+        // An empty or invalid variable leaves the config's choice.
+        assert_eq!(selected(Some("".into()), Some(Nix)), Nix);
+        assert_eq!(selected(Some("lix".into()), Some(Iets)), Iets);
     }
 }

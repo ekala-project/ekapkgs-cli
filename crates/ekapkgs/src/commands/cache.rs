@@ -1387,6 +1387,12 @@ fn save_config(config: &ClientConfig) -> color_eyre::Result<()> {
         "max_parallel_downloads = {}\n",
         config.defaults.max_parallel_downloads
     ));
+    if config.defaults.evaluator != ekapkgs_nix::iets::Evaluator::default() {
+        content.push_str(&format!(
+            "evaluator = {:?}\n",
+            config.defaults.evaluator.as_str()
+        ));
+    }
     content.push('\n');
 
     for cache in &config.caches {
