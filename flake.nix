@@ -7,6 +7,8 @@
     treefmt-nix.url = "github:numtide/treefmt-nix";
     fenix.url = "github:nix-community/fenix";
     fenix.inputs.nixpkgs.follows = "nixpkgs";
+    iets-src.url = "github:numtide/iets";
+    iets-src.flake = false;
   };
 
   outputs =
@@ -16,9 +18,12 @@
       utils,
       treefmt-nix,
       fenix,
+      iets-src,
     }:
     let
-      localOverlay = import ./nix/overlay.nix;
+      localOverlay = nixpkgs.lib.composeExtensions (import ./nix/overlay.nix) (
+        final: prev: { iets = prev.iets.override { inherit iets-src; }; }
+      );
     in
     utils.lib.eachDefaultSystem (system: rec {
       legacyPackages = import nixpkgs {
@@ -33,6 +38,7 @@
         default = legacyPackages.ekapkgs;
         ekapkgs = legacyPackages.ekapkgs;
         ekapkgs-serve = legacyPackages.ekapkgs-serve;
+        iets = legacyPackages.iets;
       };
       devShells.default = legacyPackages.dev-shell;
       formatter =

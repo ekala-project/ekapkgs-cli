@@ -4,4 +4,6 @@ final: prev: with final; {
   ekapkgs = callPackage ./package-client.nix { };
 
   ekapkgs-serve = callPackage ./package-server.nix { };
+
+  iets = callPackage ./iets.nix { };
 }

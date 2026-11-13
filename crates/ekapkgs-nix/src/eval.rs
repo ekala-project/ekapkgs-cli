@@ -124,6 +124,34 @@ pub fn eval_build_outputs(installable: &Installable) -> Result<Vec<BuildOutput>,
         .json()
 }
 
+/// Build an installable and return the store paths of the outputs it built.
+///
+/// Calls `nix build <installable> --print-out-paths <extra>`. Unlike
+/// `--json`, iets runs this natively. Like any `nix build` without
+/// `--no-link`, it leaves a `result` link. The list is never empty.
+pub fn build_out_paths(
+    installable: &Installable,
+    extra: &[String],
+) -> Result<Vec<String>, NixError> {
+    let output = NixCommand::new(&["build"])
+        .arg(&installable.raw)
+        .arg("--print-out-paths")
+        .args(extra)
+        .output()?;
+    let paths: Vec<String> = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_owned)
+        .collect();
+    if paths.is_empty() {
+        return Err(NixError::Empty {
+            context: format!("nix build {installable} printed no output paths"),
+        });
+    }
+    Ok(paths)
+}
+
 /// Get the full derivation closure for an installable.
 ///
 /// Calls `nix derivation show -r <installable>` and extracts all output
