@@ -42,15 +42,8 @@ pub fn execute(
         return deploy_via_nixos_rebuild(installable, target_host, build_host, mode_flag, dry_run);
     } else {
         // Local build.
-        let outputs: Vec<BuildOutput> = NixCommand::new(&["build"])
-            .arg(installable)
-            .arg("--json")
-            .json()?;
-
-        let path = outputs
-            .first()
-            .and_then(|o| o.outputs.get("out").cloned())
-            .ok_or_else(|| color_eyre::eyre::eyre!("build produced no output"))?;
+        // A system configuration has the single output `out`.
+        let path = eval::build_out_paths(&inst, &[])?.swap_remove(0);
 
         tracing::info!("Built {}", path);
         path
@@ -160,10 +153,4 @@ fn deploy_via_nixos_rebuild(
 
     tracing::info!("Deploy complete");
     Ok(())
-}
-
-#[derive(serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct BuildOutput {
-    outputs: std::collections::HashMap<String, String>,
 }

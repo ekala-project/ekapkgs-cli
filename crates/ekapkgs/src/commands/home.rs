@@ -322,16 +322,8 @@ fn build_home(installable: &str, extra: &[String]) -> color_eyre::Result<String>
 
     // Build.
     tracing::info!("Building home configuration...");
-    let outputs: Vec<BuildOutput> = NixCommand::new(&["build"])
-        .arg(installable)
-        .arg("--json")
-        .args(extra.iter().map(String::as_str))
-        .json()?;
-
-    let path = outputs
-        .first()
-        .and_then(|o| o.outputs.get("out").cloned())
-        .ok_or_else(|| color_eyre::eyre::eyre!("build produced no output"))?;
+    // A configuration has the single output `out`.
+    let path = ekapkgs_nix::eval::build_out_paths(&inst, extra)?.swap_remove(0);
 
     tracing::info!("Built {}", path);
     Ok(path)

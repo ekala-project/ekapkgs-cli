@@ -606,16 +606,8 @@ fn build_system(installable: &str, extra: &[String]) -> color_eyre::Result<Strin
 
     // Build.
     tracing::info!("Building system configuration...");
-    let outputs: Vec<BuildOutput> = NixCommand::new(&["build"])
-        .arg(installable)
-        .arg("--json")
-        .args(extra.iter().map(String::as_str))
-        .json()?;
-
-    let path = outputs
-        .first()
-        .and_then(|o| o.outputs.get("out").cloned())
-        .ok_or_else(|| color_eyre::eyre::eyre!("build produced no output"))?;
+    // A configuration has the single output `out`.
+    let path = ekapkgs_nix::eval::build_out_paths(&inst, extra)?.swap_remove(0);
 
     tracing::info!("Built {}", path);
     Ok(path)

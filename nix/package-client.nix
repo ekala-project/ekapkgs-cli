@@ -5,6 +5,7 @@
   pkg-config,
   fuse3,
   nix,
+  iets,
   makeWrapper,
 }:
 
@@ -41,9 +42,16 @@ rustPlatform.buildRustPackage {
 
   doCheck = false;
 
+  # iets evaluates the commands it implements and hands the rest to the
+  # `nix` next to it on PATH.
   postFixup = ''
     wrapProgram $out/bin/ekapkgs \
-      --prefix PATH : ${lib.makeBinPath [ nix ]}
+      --prefix PATH : ${
+        lib.makeBinPath [
+          nix
+          iets
+        ]
+      }
   '';
 
   meta = with lib; {
