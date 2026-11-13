@@ -1,6 +1,5 @@
 use std::process::{Command, Stdio};
 
-use ekapkgs_nix::eval::BuildOutput;
 use ekapkgs_nix::installable::Installable;
 use ekapkgs_nix::{NixCommand, NixError, eval, store};
 
@@ -43,16 +42,8 @@ pub fn execute(
         return deploy_via_nixos_rebuild(installable, target_host, build_host, mode_flag, dry_run);
     } else {
         // Local build.
-        let outputs: Vec<BuildOutput> = NixCommand::new(&["build"])
-            .arg(installable)
-            .arg("--json")
-            .json()?;
-
-        let path = outputs
-            .first()
-            .and_then(BuildOutput::out)
-            .map(str::to_owned)
-            .ok_or_else(|| color_eyre::eyre::eyre!("build produced no output"))?;
+        // A system configuration has the single output `out`.
+        let path = eval::build_out_paths(&inst, &[])?.swap_remove(0);
 
         tracing::info!("Built {}", path);
         path

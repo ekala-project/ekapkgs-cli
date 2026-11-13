@@ -23,6 +23,7 @@ cargo clippy --workspace -- -D warnings  # lint (warnings are errors)
 
 - [Protocol & Architecture](docs/agents/protocol.md) — negotiate RPC, signing models, client config
 - [Server Storage Backends](docs/agents/server-storage.md) — filesystem, nix-store, castore (CAS), chunk negotiation, GC, HTTP endpoints
+- [iets](docs/agents/iets.md) — which `nix` commands run on the iets evaluator, `EKAPKGS_EVALUATOR`, packaging
 
 ## Commands
 
