@@ -2,6 +2,8 @@
   lib,
   rustPlatform,
   installShellFiles,
+  pkg-config,
+  zstd,
   gitMinimal,
   # Defaults to the iets revision pinned in flake.lock, so the overlay works
   # without flakes (e.g. when ekapkgs-cli is a `flake = false` input).
@@ -16,7 +18,14 @@ rustPlatform.buildRustPackage {
 
   cargoHash = "sha256-EM2mV/cs9Isr8bgbe6QKgkDiYYmBLY9MyI8NWza/B2I=";
 
-  nativeBuildInputs = [ installShellFiles ];
+  nativeBuildInputs = [
+    installShellFiles
+    pkg-config
+  ];
+
+  # nixpkgs' cargo setup hook sets ZSTD_SYS_USE_PKG_CONFIG, so zstd-sys
+  # links the system zstd instead of building its bundled copy.
+  buildInputs = [ zstd ];
 
   env.IETS_FALLBACK_PATH = lib.makeBinPath [ gitMinimal ];
 
