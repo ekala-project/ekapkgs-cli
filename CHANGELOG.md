@@ -4,6 +4,17 @@
 
 ### Client
 
+- Evaluate with [iets](https://github.com/numtide/iets) when it is installed
+  - `eval`, `build`, `derivation show`, `search`, `print-dev-env` and `develop` on local flakes run as `iets nix ...`; everything else still runs `nix`
+  - `system`, `home` and `deploy` builds use `--print-out-paths` instead of `--json`, so they run on iets
+  - `system` and `home` probe their default configuration with `nix eval --raw <installable>.type` instead of `--apply`, so the probe runs on iets
+  - `template` prefetches source hashes with `iets prefetch`
+- `cache add`, `cache remove` and the `cache auth` commands keep every key when they rewrite `config.toml`; they dropped `channel_input`, `channel_url`, `index_url` and `evaluator` from `[defaults]`
+- `config.toml` is written atomically with mode `0600` every time it is saved; an existing file kept its old mode, so a token could be saved world-readable
+  - A symlinked `config.toml` stays a link and the file it points to is rewritten; a link into the Nix store (as home-manager makes) gives an error instead of being replaced
+- `cache warm` evaluates against each lock with `--reference-lock-file --no-write-lock-file` instead of copying `flake.nix` and `nix/` to a temp directory, so flakes that use other files evaluate correctly
+  - `evaluator = "auto" | "iets" | "nix"` under `[defaults]` in `config.toml` selects the evaluator (default `auto`); `EKAPKGS_EVALUATOR` overrides it
+  - The Nix package wraps `ekapkgs` with iets on `PATH`, and the dev shell includes it
 - Pre-rendered dev shell environments with child shell spawning for directory environments
   - Flake dev shells are rendered via `nix print-dev-env --json` and cached as sourceable scripts
   - Entering a directory with flake dev shells spawns a child shell with the full dev environment

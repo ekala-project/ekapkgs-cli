@@ -38,5 +38,12 @@ fn main() -> color_eyre::Result<()> {
     }
 
     ekapkgs_ui::logging::init(&args.verbose);
+
+    // Before any nix command runs. A config that fails to load is reported
+    // by the command that needs it.
+    if let Ok(config) = config::ClientConfig::load() {
+        ekapkgs_nix::iets::configure(config.defaults.evaluator);
+    }
+
     commands::run(args.command)
 }

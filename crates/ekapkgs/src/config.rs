@@ -17,6 +17,53 @@ fn atomic_write(path: &Path, contents: &str) -> std::io::Result<()> {
     Ok(())
 }
 
+const NIX_STORE: &str = "/nix/store";
+
+/// Follow `path` through any chain of symlinks to the file it names, which
+/// need not exist yet.
+///
+/// Unlike [`std::fs::canonicalize`], this works for a dangling link, and it
+/// resolves only the links, not the directories along the way.
+fn resolve_symlinks(path: &Path) -> std::io::Result<PathBuf> {
+    // The limit Linux uses for a path lookup (`MAXSYMLINKS`).
+    const MAX_LINKS: usize = 40;
+
+    let mut path = path.to_path_buf();
+    for _ in 0..MAX_LINKS {
+        match std::fs::symlink_metadata(&path) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                let target = std::fs::read_link(&path)?;
+                // A relative target is relative to the link's directory;
+                // `join` keeps an absolute one as it is.
+                path = path.parent().unwrap_or(Path::new(".")).join(target);
+            },
+            Ok(_) => return Ok(path),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(path),
+            Err(err) => return Err(err),
+        }
+    }
+    Err(std::io::Error::other(format!(
+        "{}: too many levels of symbolic links",
+        path.display()
+    )))
+}
+
+/// [`atomic_write`] for a file only its owner may read or write (mode
+/// `0600` on Unix), whatever mode the file it replaces had.
+fn atomic_write_private(path: &Path, contents: &str) -> std::io::Result<()> {
+    let dir = path.parent().unwrap_or(Path::new("."));
+    let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        tmp.as_file()
+            .set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    tmp.write_all(contents.as_bytes())?;
+    tmp.persist(path)?;
+    Ok(())
+}
+
 /// Guard that holds an exclusive advisory lock on a file.
 ///
 /// The lock is released when the guard is dropped.  Used to prevent
@@ -44,7 +91,7 @@ impl FileLock {
     }
 }
 
-#[derive(Debug, Deserialize, Clone, Default)]
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
 pub struct ClientConfig {
     #[serde(default)]
     pub defaults: Defaults,
@@ -52,7 +99,7 @@ pub struct ClientConfig {
     pub caches: Vec<CacheConfig>,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct Defaults {
     #[serde(default = "default_parallel")]
     pub max_parallel_downloads: usize,
@@ -71,6 +118,12 @@ pub struct Defaults {
     /// generation will try this URL before falling back to local
     /// nix evaluation.
     pub index_url: Option<String>,
+
+    /// Which program evaluates the `nix` commands iets implements: `auto`
+    /// (iets when it is on `PATH`), `iets` or `nix`. `EKAPKGS_EVALUATOR`
+    /// overrides it.
+    #[serde(default)]
+    pub evaluator: ekapkgs_nix::iets::Evaluator,
 }
 
 impl Default for Defaults {
@@ -80,6 +133,7 @@ impl Default for Defaults {
             channel_input: None,
             channel_url: None,
             index_url: None,
+            evaluator: ekapkgs_nix::iets::Evaluator::default(),
         }
     }
 }
@@ -89,7 +143,7 @@ fn default_parallel() -> usize {
 }
 
 #[allow(dead_code)] // trust fields used by cert verification
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct CacheConfig {
     /// Short name for the cache (e.g., "mycache").
     pub name: String,
@@ -108,7 +162,7 @@ fn default_priority() -> u32 {
     10
 }
 
-#[derive(Debug, Deserialize, Clone, Default, PartialEq)]
+#[derive(Debug, Deserialize, Serialize, Clone, Default, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum CacheProtocol {
     #[default]
@@ -118,18 +172,49 @@ pub enum CacheProtocol {
 }
 
 impl ClientConfig {
-    pub fn load() -> color_eyre::Result<Self> {
-        let config_dir = directories::ProjectDirs::from("", "", "ekapkgs")
+    fn path() -> PathBuf {
+        directories::ProjectDirs::from("", "", "ekapkgs")
             .map(|d| d.config_dir().to_path_buf())
-            .unwrap_or_else(|| PathBuf::from("~/.config/ekapkgs"));
+            .unwrap_or_else(|| PathBuf::from("~/.config/ekapkgs"))
+            .join("config.toml")
+    }
 
-        let config_path = config_dir.join("config.toml");
+    pub fn load() -> color_eyre::Result<Self> {
+        let config_path = Self::path();
         if config_path.exists() {
             let contents = std::fs::read_to_string(&config_path)?;
             Ok(toml::from_str(&contents)?)
         } else {
             Ok(Self::default())
         }
+    }
+
+    /// Write the config to `config.toml`.
+    ///
+    /// The file can hold push tokens, so it is written atomically with mode
+    /// `0600`, also when it already existed with a looser mode. A symlinked
+    /// `config.toml` stays a link: the file it points to is rewritten. A link
+    /// into the Nix store, as home-manager makes, is an error, since that
+    /// file is read-only and comes from the Nix configuration.
+    pub fn save(&self) -> color_eyre::Result<()> {
+        self.save_to(&Self::path())
+    }
+
+    fn save_to(&self, config_path: &Path) -> color_eyre::Result<()> {
+        let target = resolve_symlinks(config_path)?;
+        if target.starts_with(NIX_STORE) {
+            return Err(color_eyre::eyre::eyre!(
+                "{} is a link to {}, which Nix manages, so ekapkgs cannot change it; make the \
+                 change in the Nix configuration that writes it",
+                config_path.display(),
+                target.display()
+            ));
+        }
+        if let Some(dir) = target.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        atomic_write_private(&target, &toml::to_string_pretty(self)?)?;
+        Ok(())
     }
 
     /// Get the primary ekapkgs cache (first configured, or none).
@@ -1011,6 +1096,170 @@ impl TrustedEnvs {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -----------------------------------------------------------------------
+    // ClientConfig
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn client_config_evaluator() {
+        use ekapkgs_nix::iets::Evaluator;
+
+        let config: ClientConfig = toml::from_str("").unwrap();
+        assert_eq!(config.defaults.evaluator, Evaluator::Auto);
+
+        let config: ClientConfig = toml::from_str("[defaults]\nevaluator = \"nix\"\n").unwrap();
+        assert_eq!(config.defaults.evaluator, Evaluator::Nix);
+        assert_eq!(config.defaults.max_parallel_downloads, 8);
+
+        assert!(toml::from_str::<ClientConfig>("[defaults]\nevaluator = \"lix\"\n").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_write_tightens_an_existing_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "old").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        atomic_write_private(&path, "token = \"secret\"\n").unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "token = \"secret\"\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_writes_through_a_symlink() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("dotfiles/ekapkgs.toml");
+        std::fs::create_dir_all(real.parent().unwrap()).unwrap();
+        std::fs::write(&real, "").unwrap();
+        let link = dir.path().join("config.toml");
+        // A relative link, through a second link.
+        symlink("middle.toml", &link).unwrap();
+        symlink("dotfiles/ekapkgs.toml", dir.path().join("middle.toml")).unwrap();
+
+        let mut config = ClientConfig::default();
+        config.defaults.max_parallel_downloads = 3;
+        config.save_to(&link).unwrap();
+
+        assert!(link.symlink_metadata().unwrap().file_type().is_symlink());
+        let saved: ClientConfig = toml::from_str(&std::fs::read_to_string(&real).unwrap()).unwrap();
+        assert_eq!(saved.defaults.max_parallel_downloads, 3);
+        let mode = std::fs::metadata(&real).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_creates_the_target_of_a_dangling_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("elsewhere/config.toml");
+        let link = dir.path().join("config.toml");
+        symlink(&real, &link).unwrap();
+
+        ClientConfig::default().save_to(&link).unwrap();
+
+        assert!(link.symlink_metadata().unwrap().file_type().is_symlink());
+        assert!(real.is_file());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_refuses_a_link_into_the_nix_store() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let link = dir.path().join("config.toml");
+        symlink(
+            "/nix/store/00000000000000000000000000000000-config.toml",
+            &link,
+        )
+        .unwrap();
+
+        let err = ClientConfig::default().save_to(&link).unwrap_err();
+        assert!(err.to_string().contains("which Nix manages"), "{err}");
+        assert!(link.symlink_metadata().unwrap().file_type().is_symlink());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_reports_a_symlink_loop() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.toml");
+        let b = dir.path().join("b.toml");
+        symlink(&b, &a).unwrap();
+        symlink(&a, &b).unwrap();
+
+        let err = ClientConfig::default().save_to(&a).unwrap_err();
+        assert!(err.to_string().contains("too many levels"), "{err}");
+    }
+
+    #[test]
+    fn client_config_round_trip_keeps_every_key() {
+        let input = r#"
+            [defaults]
+            max_parallel_downloads = 4
+            channel_input = "omarchy"
+            channel_url = "github:omacom/omarchy-nix-pkgs"
+            index_url = "https://index.example"
+            evaluator = "nix"
+
+            [[caches]]
+            name = "main"
+            url = "https://cache.example"
+            trusted_key = "main:abc="
+            token = "secret"
+            priority = 5
+            protocol = "grpc"
+
+            [[caches]]
+            name = "legacy"
+            url = "https://legacy.example"
+            protocol = "legacy"
+        "#;
+        let config: ClientConfig = toml::from_str(input).unwrap();
+        let written = toml::to_string_pretty(&config).unwrap();
+        let reread: ClientConfig = toml::from_str(&written).unwrap();
+
+        let d = &reread.defaults;
+        assert_eq!(d.max_parallel_downloads, 4);
+        assert_eq!(d.channel_input.as_deref(), Some("omarchy"));
+        assert_eq!(
+            d.channel_url.as_deref(),
+            Some("github:omacom/omarchy-nix-pkgs")
+        );
+        assert_eq!(d.index_url.as_deref(), Some("https://index.example"));
+        assert_eq!(d.evaluator, ekapkgs_nix::iets::Evaluator::Nix);
+
+        assert_eq!(reread.caches.len(), 2);
+        let main = &reread.caches[0];
+        assert_eq!(main.name, "main");
+        assert_eq!(main.trusted_key.as_deref(), Some("main:abc="));
+        assert_eq!(main.trust_root, None);
+        assert_eq!(main.token.as_deref(), Some("secret"));
+        assert_eq!(main.priority, 5);
+        assert_eq!(main.protocol, CacheProtocol::Grpc);
+        assert_eq!(reread.caches[1].priority, 10);
+        assert_eq!(reread.caches[1].protocol, CacheProtocol::Legacy);
+
+        // Writing it again gives the same file.
+        assert_eq!(toml::to_string_pretty(&reread).unwrap(), written);
+    }
 
     // -----------------------------------------------------------------------
     // HomePackages

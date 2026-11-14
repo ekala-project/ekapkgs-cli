@@ -1,11 +1,14 @@
+use std::path::Path;
 use std::process::Command;
 
 use color_eyre::eyre::eyre;
 
 use super::types::{ExpressionInfo, Fetcher};
 
-/// Prefetch the source archive hash using `nix-prefetch-url`.
+/// Prefetch the hash of the unpacked source archive, as `fetchzip` (and so
+/// `fetchFromGitHub`/`fetchFromGitLab`) computes it.
 ///
+/// Uses `iets prefetch` when iets is installed, otherwise `nix-prefetch-url`.
 /// Returns the SRI hash string (e.g., `sha256-...`).
 pub fn prefetch_source_hash(info: &ExpressionInfo) -> color_eyre::Result<String> {
     let tag = if info.version_has_v_prefix {
@@ -48,11 +51,40 @@ pub fn prefetch_source_hash(info: &ExpressionInfo) -> color_eyre::Result<String>
 
     eprintln!("Prefetching source hash...");
 
+    if let Some(iets) = ekapkgs_nix::iets::binary() {
+        match prefetch_with_iets(iets, &url) {
+            Ok(hash) => return Ok(hash),
+            Err(err) => tracing::warn!("iets prefetch failed, trying nix-prefetch-url: {err}"),
+        }
+    }
+
+    prefetch_with_nix(&url)
+}
+
+/// `iets prefetch --unpack` prints the SRI hash and adds nothing to the store.
+fn prefetch_with_iets(iets: &Path, url: &str) -> color_eyre::Result<String> {
+    let output = Command::new(iets)
+        .arg("prefetch")
+        .arg("--unpack")
+        .arg(url)
+        .output()?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(eyre!("{}", stderr.trim()));
+    }
+
+    Ok(String::from_utf8(output.stdout)?.trim().to_owned())
+}
+
+/// `nix-prefetch-url --unpack` prints a base-32 hash, which `nix hash`
+/// converts to SRI.
+fn prefetch_with_nix(url: &str) -> color_eyre::Result<String> {
     let output = Command::new("nix-prefetch-url")
         .arg("--unpack")
         .arg("--type")
         .arg("sha256")
-        .arg(&url)
+        .arg(url)
         .output()?;
 
     if !output.status.success() {

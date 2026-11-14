@@ -1,5 +1,4 @@
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
 
 use ekapkgs_nix::installable::Installable;
 use ekapkgs_nix::{NixCommand, eval, store};
@@ -1016,7 +1015,7 @@ fn cmd_warm(
         (old, new)
     };
 
-    // Write temporary flake.lock files for evaluation.
+    // Write the two lock files for `--reference-lock-file`.
     let temp_dir = tempfile::tempdir()?;
     let old_lock_path = temp_dir.path().join("flake.lock.old");
     let new_lock_path = temp_dir.path().join("flake.lock.new");
@@ -1024,10 +1023,11 @@ fn cmd_warm(
     std::fs::write(&new_lock_path, &new_lock_content)?;
 
     // Evaluate closures at both flake.lock versions.
+    let inst = Installable::new(installable);
     tracing::info!("Evaluating old closure...");
-    let old_closure = eval_with_lock(installable, &old_lock_path)?;
+    let old_closure = eval::derivation_closure_paths_with_lock(&inst, &old_lock_path)?;
     tracing::info!("Evaluating new closure...");
-    let new_closure = eval_with_lock(installable, &new_lock_path)?;
+    let new_closure = eval::derivation_closure_paths_with_lock(&inst, &new_lock_path)?;
 
     // Compute the diff: paths in new closure not in old closure.
     let old_set: std::collections::HashSet<&str> = old_closure.iter().map(String::as_str).collect();
@@ -1173,55 +1173,6 @@ fn git_show_file(rev: &str, path: &str) -> color_eyre::Result<String> {
     Ok(String::from_utf8(output.stdout)?)
 }
 
-/// Evaluate a closure with a specific flake.lock file.
-///
-/// Uses `--override-input` to pin the flake's lock to the specified file.
-/// Falls back to evaluating with the lock file copied into a temp flake.
-fn eval_with_lock(
-    installable: &str,
-    lock_path: &std::path::Path,
-) -> color_eyre::Result<Vec<String>> {
-    // Create a temporary directory with the current flake source and the
-    // overridden flake.lock.
-    let temp_dir = tempfile::tempdir()?;
-
-    // Copy the current directory's flake.nix (and other files) to temp.
-    // We only need flake.nix and the lock file.
-    if std::path::Path::new("flake.nix").exists() {
-        std::fs::copy("flake.nix", temp_dir.path().join("flake.nix"))?;
-    }
-    std::fs::copy(lock_path, temp_dir.path().join("flake.lock"))?;
-
-    // Copy nix/ directory if it exists (for overlays, modules).
-    if std::path::Path::new("nix").is_dir() {
-        copy_dir_recursive(std::path::Path::new("nix"), &temp_dir.path().join("nix"))?;
-    }
-
-    // Evaluate the installable in the temp directory.
-    let inst_path = format!(
-        "path:{}#{}",
-        temp_dir.path().display(),
-        installable.trim_start_matches(".#")
-    );
-    let inst = Installable::new(&inst_path);
-    eval::derivation_closure_paths(&inst).map_err(Into::into)
-}
-
-fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
-    std::fs::create_dir_all(dst)?;
-    for entry in std::fs::read_dir(src)? {
-        let entry = entry?;
-        let ty = entry.file_type()?;
-        let dst_path = dst.join(entry.file_name());
-        if ty.is_dir() {
-            copy_dir_recursive(&entry.path(), &dst_path)?;
-        } else {
-            std::fs::copy(entry.path(), dst_path)?;
-        }
-    }
-    Ok(())
-}
-
 // --- cache management ---
 
 fn cmd_add(name: &str, url: &str) -> color_eyre::Result<()> {
@@ -1255,7 +1206,7 @@ fn cmd_add(name: &str, url: &str) -> color_eyre::Result<()> {
         protocol: crate::config::CacheProtocol::Auto,
     });
 
-    save_config(&config)?;
+    config.save()?;
     tracing::info!("Cache {name:?} added ({base})");
     Ok(())
 }
@@ -1287,7 +1238,7 @@ fn cmd_remove(name: &str) -> color_eyre::Result<()> {
     if config.caches.len() == before {
         tracing::info!("No cache found for {name:?}");
     } else {
-        save_config(&config)?;
+        config.save()?;
         tracing::info!("Cache {name:?} removed");
     }
     Ok(())
@@ -1333,7 +1284,7 @@ fn cmd_auth(command: AuthCommand) -> color_eyre::Result<()> {
                 )
             })?;
             entry.token = Some(token);
-            save_config(&config)?;
+            config.save()?;
             tracing::info!("Token saved for {cache}");
             Ok(())
         },
@@ -1342,7 +1293,7 @@ fn cmd_auth(command: AuthCommand) -> color_eyre::Result<()> {
             let mut config = ClientConfig::load()?;
             if let Some(entry) = config.resolve_cache_mut(&cache) {
                 entry.token = None;
-                save_config(&config)?;
+                config.save()?;
                 tracing::info!("Token removed for {cache}");
             } else {
                 tracing::info!("No cache found for {cache:?}");
@@ -1378,7 +1329,7 @@ fn cmd_auth(command: AuthCommand) -> color_eyre::Result<()> {
                 .resolve_cache_mut(&cache)
                 .ok_or_else(|| color_eyre::eyre::eyre!("cache {cache:?} not found"))?;
             entry.token = Some(token_value.clone());
-            save_config(&config)?;
+            config.save()?;
             tracing::info!("Token minted and saved for {cache}");
             Ok(())
         },
@@ -1412,58 +1363,4 @@ async fn mint_token_http(
         .and_then(|t| t.as_str())
         .map(str::to_owned)
         .ok_or_else(|| color_eyre::eyre::eyre!("no token in server response"))
-}
-
-fn save_config(config: &ClientConfig) -> color_eyre::Result<()> {
-    let config_dir = directories::ProjectDirs::from("", "", "ekapkgs")
-        .map(|d| d.config_dir().to_path_buf())
-        .unwrap_or_else(|| PathBuf::from("~/.config/ekapkgs"));
-
-    std::fs::create_dir_all(&config_dir)?;
-    let config_path = config_dir.join("config.toml");
-
-    // Serialize manually to TOML since we need serde::Serialize.
-    let mut content = String::new();
-
-    content.push_str("[defaults]\n");
-    content.push_str(&format!(
-        "max_parallel_downloads = {}\n",
-        config.defaults.max_parallel_downloads
-    ));
-    content.push('\n');
-
-    for cache in &config.caches {
-        content.push_str("[[caches]]\n");
-        content.push_str(&format!("name = {:?}\n", cache.name));
-        content.push_str(&format!("url = {:?}\n", cache.url));
-        if let Some(ref key) = cache.trusted_key {
-            content.push_str(&format!("trusted_key = {:?}\n", key));
-        }
-        if let Some(ref root) = cache.trust_root {
-            content.push_str(&format!("trust_root = {:?}\n", root));
-        }
-        if let Some(ref token) = cache.token {
-            content.push_str(&format!("token = {:?}\n", token));
-        }
-        content.push_str(&format!("priority = {}\n", cache.priority));
-        let protocol = format!("{:?}", cache.protocol).to_lowercase();
-        content.push_str(&format!("protocol = {:?}\n", protocol));
-        content.push('\n');
-    }
-
-    // Write with restrictive permissions since the file may contain tokens.
-    {
-        use std::io::Write;
-        #[cfg(unix)]
-        use std::os::unix::fs::OpenOptionsExt;
-
-        let mut opts = std::fs::OpenOptions::new();
-        opts.write(true).create(true).truncate(true);
-        #[cfg(unix)]
-        opts.mode(0o600);
-
-        let mut file = opts.open(&config_path)?;
-        file.write_all(content.as_bytes())?;
-    }
-    Ok(())
 }

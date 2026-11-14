@@ -1,3 +1,5 @@
+use std::path::Path;
+
 use serde::Deserialize;
 
 use crate::command::{NixCommand, NixError};
@@ -124,15 +126,82 @@ pub fn eval_build_outputs(installable: &Installable) -> Result<Vec<BuildOutput>,
         .json()
 }
 
+/// Whether a flake installable such as `.#foo.bar` evaluates to a derivation.
+///
+/// Evaluates `<installable>.type`, which forces the value no further than
+/// `nix eval <installable> --apply '_: null'` does and builds nothing. It
+/// needs no `--apply`, so iets evaluates it.
+pub fn is_derivation(installable: &str) -> bool {
+    NixCommand::new(&["eval"])
+        .arg("--raw")
+        .arg(format!("{installable}.type"))
+        .output()
+        .is_ok_and(|output| output.stdout == b"derivation")
+}
+
+/// Build an installable and return the store paths of the outputs it built.
+///
+/// Calls `nix build <installable> --print-out-paths <extra>`. Unlike
+/// `--json`, iets runs this natively. Like any `nix build` without
+/// `--no-link`, it leaves a `result` link. The list is never empty.
+pub fn build_out_paths(
+    installable: &Installable,
+    extra: &[String],
+) -> Result<Vec<String>, NixError> {
+    let output = NixCommand::new(&["build"])
+        .arg(&installable.raw)
+        .arg("--print-out-paths")
+        .args(extra)
+        .output()?;
+    let paths: Vec<String> = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_owned)
+        .collect();
+    if paths.is_empty() {
+        return Err(NixError::Empty {
+            context: format!("nix build {installable} printed no output paths"),
+        });
+    }
+    Ok(paths)
+}
+
 /// Get the full derivation closure for an installable.
 ///
 /// Calls `nix derivation show -r <installable>` and extracts all output
 /// store paths from the derivation graph.
 pub fn derivation_closure_paths(installable: &Installable) -> Result<Vec<String>, NixError> {
-    let show: DerivationShowOutput = NixCommand::new(&["derivation", "show"])
+    closure_paths(installable, None)
+}
+
+/// [`derivation_closure_paths`], with the root flake locked by `lock_file`
+/// instead of its own `flake.lock`.
+///
+/// Passes `--reference-lock-file`. Nix locks the flake again starting from
+/// that file and would write the result over the flake's `flake.lock`, so
+/// `--no-write-lock-file` is passed too.
+pub fn derivation_closure_paths_with_lock(
+    installable: &Installable,
+    lock_file: &Path,
+) -> Result<Vec<String>, NixError> {
+    closure_paths(installable, Some(lock_file))
+}
+
+fn closure_paths(
+    installable: &Installable,
+    lock_file: Option<&Path>,
+) -> Result<Vec<String>, NixError> {
+    let mut cmd = NixCommand::new(&["derivation", "show"])
         .arg("-r")
-        .arg(&installable.raw)
-        .json()?;
+        .arg(&installable.raw);
+    if let Some(lock_file) = lock_file {
+        cmd = cmd
+            .arg("--reference-lock-file")
+            .arg(lock_file.to_string_lossy())
+            .arg("--no-write-lock-file");
+    }
+    let show: DerivationShowOutput = cmd.json()?;
 
     Ok(collect_output_paths(&show))
 }

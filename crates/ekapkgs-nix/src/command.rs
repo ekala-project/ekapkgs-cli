@@ -3,9 +3,13 @@ use std::process::{Command, ExitStatus, Output, Stdio};
 
 use serde::de::DeserializeOwned;
 
+use crate::iets::{self, Program};
+
 /// Builder for constructing and executing nix CLI commands.
 ///
 /// Wraps `std::process::Command` with a fluent API tailored to nix subcommands.
+/// Commands that iets evaluates run as `iets nix ...` when iets is installed;
+/// see [`iets`](crate::iets).
 #[derive(Debug, Clone)]
 pub struct NixCommand {
     subcommand: Vec<String>,
@@ -46,14 +50,24 @@ impl NixCommand {
         self
     }
 
+    fn argv(&self) -> impl Iterator<Item = &str> {
+        self.subcommand.iter().chain(&self.args).map(String::as_str)
+    }
+
+    fn program(&self) -> Program {
+        iets::route(&self.argv().collect::<Vec<_>>())
+    }
+
     fn build_command(&self) -> Command {
-        let mut cmd = Command::new("nix");
-        for sub in &self.subcommand {
-            cmd.arg(sub);
-        }
-        for arg in &self.args {
-            cmd.arg(arg);
-        }
+        let mut cmd = match self.program() {
+            Program::Nix => Command::new("nix"),
+            Program::Iets(iets) => {
+                let mut cmd = Command::new(iets);
+                cmd.arg("nix");
+                cmd
+            },
+        };
+        cmd.args(self.argv());
         for (k, v) in &self.env {
             cmd.env(k, v);
         }
@@ -222,11 +236,11 @@ impl NixCommand {
 
 impl std::fmt::Display for NixCommand {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "nix")?;
-        for sub in &self.subcommand {
-            write!(f, " {sub}")?;
+        if let Program::Iets(_) = self.program() {
+            write!(f, "iets ")?;
         }
-        for arg in &self.args {
+        write!(f, "nix")?;
+        for arg in self.argv() {
             write!(f, " {arg}")?;
         }
         Ok(())
