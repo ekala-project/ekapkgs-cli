@@ -17,6 +17,37 @@ fn atomic_write(path: &Path, contents: &str) -> std::io::Result<()> {
     Ok(())
 }
 
+const NIX_STORE: &str = "/nix/store";
+
+/// Follow `path` through any chain of symlinks to the file it names, which
+/// need not exist yet.
+///
+/// Unlike [`std::fs::canonicalize`], this works for a dangling link, and it
+/// resolves only the links, not the directories along the way.
+fn resolve_symlinks(path: &Path) -> std::io::Result<PathBuf> {
+    // The limit Linux uses for a path lookup (`MAXSYMLINKS`).
+    const MAX_LINKS: usize = 40;
+
+    let mut path = path.to_path_buf();
+    for _ in 0..MAX_LINKS {
+        match std::fs::symlink_metadata(&path) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                let target = std::fs::read_link(&path)?;
+                // A relative target is relative to the link's directory;
+                // `join` keeps an absolute one as it is.
+                path = path.parent().unwrap_or(Path::new(".")).join(target);
+            },
+            Ok(_) => return Ok(path),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(path),
+            Err(err) => return Err(err),
+        }
+    }
+    Err(std::io::Error::other(format!(
+        "{}: too many levels of symbolic links",
+        path.display()
+    )))
+}
+
 /// [`atomic_write`] for a file only its owner may read or write (mode
 /// `0600` on Unix), whatever mode the file it replaces had.
 fn atomic_write_private(path: &Path, contents: &str) -> std::io::Result<()> {
@@ -161,13 +192,28 @@ impl ClientConfig {
     /// Write the config to `config.toml`.
     ///
     /// The file can hold push tokens, so it is written atomically with mode
-    /// `0600`, also when it already existed with a looser mode.
+    /// `0600`, also when it already existed with a looser mode. A symlinked
+    /// `config.toml` stays a link: the file it points to is rewritten. A link
+    /// into the Nix store, as home-manager makes, is an error, since that
+    /// file is read-only and comes from the Nix configuration.
     pub fn save(&self) -> color_eyre::Result<()> {
-        let config_path = Self::path();
-        if let Some(dir) = config_path.parent() {
+        self.save_to(&Self::path())
+    }
+
+    fn save_to(&self, config_path: &Path) -> color_eyre::Result<()> {
+        let target = resolve_symlinks(config_path)?;
+        if target.starts_with(NIX_STORE) {
+            return Err(color_eyre::eyre::eyre!(
+                "{} is a link to {}, which Nix manages, so ekapkgs cannot change it; make the \
+                 change in the Nix configuration that writes it",
+                config_path.display(),
+                target.display()
+            ));
+        }
+        if let Some(dir) = target.parent() {
             std::fs::create_dir_all(dir)?;
         }
-        atomic_write_private(&config_path, &toml::to_string_pretty(self)?)?;
+        atomic_write_private(&target, &toml::to_string_pretty(self)?)?;
         Ok(())
     }
 
@@ -1087,6 +1133,80 @@ mod tests {
             std::fs::read_to_string(&path).unwrap(),
             "token = \"secret\"\n"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_writes_through_a_symlink() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("dotfiles/ekapkgs.toml");
+        std::fs::create_dir_all(real.parent().unwrap()).unwrap();
+        std::fs::write(&real, "").unwrap();
+        let link = dir.path().join("config.toml");
+        // A relative link, through a second link.
+        symlink("middle.toml", &link).unwrap();
+        symlink("dotfiles/ekapkgs.toml", dir.path().join("middle.toml")).unwrap();
+
+        let mut config = ClientConfig::default();
+        config.defaults.max_parallel_downloads = 3;
+        config.save_to(&link).unwrap();
+
+        assert!(link.symlink_metadata().unwrap().file_type().is_symlink());
+        let saved: ClientConfig = toml::from_str(&std::fs::read_to_string(&real).unwrap()).unwrap();
+        assert_eq!(saved.defaults.max_parallel_downloads, 3);
+        let mode = std::fs::metadata(&real).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_creates_the_target_of_a_dangling_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("elsewhere/config.toml");
+        let link = dir.path().join("config.toml");
+        symlink(&real, &link).unwrap();
+
+        ClientConfig::default().save_to(&link).unwrap();
+
+        assert!(link.symlink_metadata().unwrap().file_type().is_symlink());
+        assert!(real.is_file());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_refuses_a_link_into_the_nix_store() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let link = dir.path().join("config.toml");
+        symlink(
+            "/nix/store/00000000000000000000000000000000-config.toml",
+            &link,
+        )
+        .unwrap();
+
+        let err = ClientConfig::default().save_to(&link).unwrap_err();
+        assert!(err.to_string().contains("which Nix manages"), "{err}");
+        assert!(link.symlink_metadata().unwrap().file_type().is_symlink());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_reports_a_symlink_loop() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.toml");
+        let b = dir.path().join("b.toml");
+        symlink(&b, &a).unwrap();
+        symlink(&a, &b).unwrap();
+
+        let err = ClientConfig::default().save_to(&a).unwrap_err();
+        assert!(err.to_string().contains("too many levels"), "{err}");
     }
 
     #[test]
