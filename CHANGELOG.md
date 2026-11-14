@@ -123,6 +123,10 @@
   - Request body size limits and narinfo validation on push
   - Delta cache capped at 256 MiB to prevent unbounded memory growth
 
+### Infrastructure
+
+- The iets package declares `pkg-config` and `zstd`, so it builds against nixos-unstable, whose cargo setup hook makes `zstd-sys` link the system zstd
+
 ## 0.1.0
 
 ### Client
