@@ -44,11 +44,23 @@ jobs:
       - run: nix develop --command cargo test --workspace
 
   nix-build:
-    name: Nix build
+    name: Nix build (${{ matrix.nixpkgs }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # "locked" uses flake.lock; "nixos-unstable" catches breakage from
+        # upstream nixpkgs changes (e.g. rustPlatform defaults), which is
+        # what downstream NixOS configurations consume via the overlay.
+        nixpkgs: [locked, nixos-unstable]
     steps:
       - uses: actions/checkout@v4
       - uses: DeterminateSystems/nix-installer-action@main
       - uses: DeterminateSystems/magic-nix-cache-action@main
-      - run: nix build .#ekapkgs
-      - run: nix build .#ekapkgs-serve
+      - name: Build packages
+        run: |
+          args=()
+          if [ "${{ matrix.nixpkgs }}" != locked ]; then
+            args+=(--override-input nixpkgs "github:NixOS/nixpkgs/${{ matrix.nixpkgs }}")
+          fi
+          nix build --print-build-logs "${args[@]}" .#ekapkgs .#ekapkgs-serve

@@ -4,6 +4,9 @@
   protobuf,
   pkg-config,
   fuse3,
+  aws-lc,
+  sqlite,
+  zstd,
   nix,
   makeWrapper,
 }:
@@ -37,6 +40,9 @@ rustPlatform.buildRustPackage {
 
   buildInputs = [
     fuse3
+    aws-lc
+    sqlite
+    zstd
   ];
 
   doCheck = false;
