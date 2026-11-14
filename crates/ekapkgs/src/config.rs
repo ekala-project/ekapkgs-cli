@@ -17,6 +17,22 @@ fn atomic_write(path: &Path, contents: &str) -> std::io::Result<()> {
     Ok(())
 }
 
+/// [`atomic_write`] for a file only its owner may read or write (mode
+/// `0600` on Unix), whatever mode the file it replaces had.
+fn atomic_write_private(path: &Path, contents: &str) -> std::io::Result<()> {
+    let dir = path.parent().unwrap_or(Path::new("."));
+    let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        tmp.as_file()
+            .set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    tmp.write_all(contents.as_bytes())?;
+    tmp.persist(path)?;
+    Ok(())
+}
+
 /// Guard that holds an exclusive advisory lock on a file.
 ///
 /// The lock is released when the guard is dropped.  Used to prevent
@@ -125,18 +141,34 @@ pub enum CacheProtocol {
 }
 
 impl ClientConfig {
-    pub fn load() -> color_eyre::Result<Self> {
-        let config_dir = directories::ProjectDirs::from("", "", "ekapkgs")
+    fn path() -> PathBuf {
+        directories::ProjectDirs::from("", "", "ekapkgs")
             .map(|d| d.config_dir().to_path_buf())
-            .unwrap_or_else(|| PathBuf::from("~/.config/ekapkgs"));
+            .unwrap_or_else(|| PathBuf::from("~/.config/ekapkgs"))
+            .join("config.toml")
+    }
 
-        let config_path = config_dir.join("config.toml");
+    pub fn load() -> color_eyre::Result<Self> {
+        let config_path = Self::path();
         if config_path.exists() {
             let contents = std::fs::read_to_string(&config_path)?;
             Ok(toml::from_str(&contents)?)
         } else {
             Ok(Self::default())
         }
+    }
+
+    /// Write the config to `config.toml`.
+    ///
+    /// The file can hold push tokens, so it is written atomically with mode
+    /// `0600`, also when it already existed with a looser mode.
+    pub fn save(&self) -> color_eyre::Result<()> {
+        let config_path = Self::path();
+        if let Some(dir) = config_path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        atomic_write_private(&config_path, &toml::to_string_pretty(self)?)?;
+        Ok(())
     }
 
     /// Get the primary ekapkgs cache (first configured, or none).
@@ -1035,6 +1067,26 @@ mod tests {
         assert_eq!(config.defaults.max_parallel_downloads, 8);
 
         assert!(toml::from_str::<ClientConfig>("[defaults]\nevaluator = \"lix\"\n").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_write_tightens_an_existing_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "old").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        atomic_write_private(&path, "token = \"secret\"\n").unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "token = \"secret\"\n"
+        );
     }
 
     #[test]

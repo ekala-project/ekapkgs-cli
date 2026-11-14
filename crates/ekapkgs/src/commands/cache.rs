@@ -1,5 +1,4 @@
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
 
 use ekapkgs_nix::installable::Installable;
 use ekapkgs_nix::{NixCommand, eval, store};
@@ -1207,7 +1206,7 @@ fn cmd_add(name: &str, url: &str) -> color_eyre::Result<()> {
         protocol: crate::config::CacheProtocol::Auto,
     });
 
-    save_config(&config)?;
+    config.save()?;
     tracing::info!("Cache {name:?} added ({base})");
     Ok(())
 }
@@ -1239,7 +1238,7 @@ fn cmd_remove(name: &str) -> color_eyre::Result<()> {
     if config.caches.len() == before {
         tracing::info!("No cache found for {name:?}");
     } else {
-        save_config(&config)?;
+        config.save()?;
         tracing::info!("Cache {name:?} removed");
     }
     Ok(())
@@ -1285,7 +1284,7 @@ fn cmd_auth(command: AuthCommand) -> color_eyre::Result<()> {
                 )
             })?;
             entry.token = Some(token);
-            save_config(&config)?;
+            config.save()?;
             tracing::info!("Token saved for {cache}");
             Ok(())
         },
@@ -1294,7 +1293,7 @@ fn cmd_auth(command: AuthCommand) -> color_eyre::Result<()> {
             let mut config = ClientConfig::load()?;
             if let Some(entry) = config.resolve_cache_mut(&cache) {
                 entry.token = None;
-                save_config(&config)?;
+                config.save()?;
                 tracing::info!("Token removed for {cache}");
             } else {
                 tracing::info!("No cache found for {cache:?}");
@@ -1330,7 +1329,7 @@ fn cmd_auth(command: AuthCommand) -> color_eyre::Result<()> {
                 .resolve_cache_mut(&cache)
                 .ok_or_else(|| color_eyre::eyre::eyre!("cache {cache:?} not found"))?;
             entry.token = Some(token_value.clone());
-            save_config(&config)?;
+            config.save()?;
             tracing::info!("Token minted and saved for {cache}");
             Ok(())
         },
@@ -1364,31 +1363,4 @@ async fn mint_token_http(
         .and_then(|t| t.as_str())
         .map(str::to_owned)
         .ok_or_else(|| color_eyre::eyre::eyre!("no token in server response"))
-}
-
-fn save_config(config: &ClientConfig) -> color_eyre::Result<()> {
-    let config_dir = directories::ProjectDirs::from("", "", "ekapkgs")
-        .map(|d| d.config_dir().to_path_buf())
-        .unwrap_or_else(|| PathBuf::from("~/.config/ekapkgs"));
-
-    std::fs::create_dir_all(&config_dir)?;
-    let config_path = config_dir.join("config.toml");
-
-    let content = toml::to_string_pretty(config)?;
-
-    // Write with restrictive permissions since the file may contain tokens.
-    {
-        use std::io::Write;
-        #[cfg(unix)]
-        use std::os::unix::fs::OpenOptionsExt;
-
-        let mut opts = std::fs::OpenOptions::new();
-        opts.write(true).create(true).truncate(true);
-        #[cfg(unix)]
-        opts.mode(0o600);
-
-        let mut file = opts.open(&config_path)?;
-        file.write_all(content.as_bytes())?;
-    }
-    Ok(())
 }
