@@ -9,11 +9,11 @@
         ]
       },
       "locked": {
-        "lastModified": 1794373787,
-        "narHash": "sha256-L0NfDPkhMw22pdjKPSkb95SVkpQSx15gqgZhFi3Ch1M=",
+        "lastModified": 1794620418,
+        "narHash": "sha256-O/jpBEBhvxHVeeJ6jyQwn9ZmU/1QFRq8d+pIe5Qx6bc=",
         "owner": "ekala-project",
         "repo": "corepkgs",
-        "rev": "4264feb26c46b00a1d06d8cdf68efb71be189e60",
+        "rev": "e66bd8bff814f28051e58f957037bf77f2a83c8a",
         "type": "github"
       },
       "original": {
