@@ -2,6 +2,10 @@
   lib,
   rustPlatform,
   protobuf,
+  pkg-config,
+  aws-lc,
+  sqlite,
+  zstd,
   nix,
   makeWrapper,
 }:
@@ -29,7 +33,14 @@ rustPlatform.buildRustPackage {
 
   nativeBuildInputs = [
     protobuf
+    pkg-config
     makeWrapper
+  ];
+
+  buildInputs = [
+    aws-lc
+    sqlite
+    zstd
   ];
 
   doCheck = false;
