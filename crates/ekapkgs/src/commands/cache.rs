@@ -306,7 +306,7 @@ fn cmd_push(paths: &[String], cache_name: Option<&str>) -> color_eyre::Result<()
 
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {
-        let client = reqwest::Client::new();
+        let client = push_http_client()?;
         let bar = ekapkgs_ui::progress::item_bar(store_paths.len() as u64, "paths");
 
         let results = futures::stream::iter(store_paths.iter())
@@ -317,7 +317,7 @@ fn cmd_push(paths: &[String], cache_name: Option<&str>) -> color_eyre::Result<()
                 let path = path.clone();
                 async move { push_single_path(&client, &base, token.as_deref(), &path).await }
             })
-            .buffer_unordered(8)
+            .buffer_unordered(PUSH_CONCURRENCY)
             .collect::<Vec<_>>()
             .await;
 
@@ -343,7 +343,7 @@ fn cmd_push(paths: &[String], cache_name: Option<&str>) -> color_eyre::Result<()
                     bar.inc(1);
                 },
                 Err(e) => {
-                    tracing::warn!("Push failed: {e}");
+                    tracing::warn!("Push failed: {e:#}");
                     failed += 1;
                     bar.inc(1);
                 },
@@ -446,7 +446,7 @@ fn cmd_push_sources(paths: &[String], cache_name: Option<&str>) -> color_eyre::R
 
         let rt = tokio::runtime::Runtime::new()?;
         rt.block_on(async {
-            let client = reqwest::Client::new();
+            let client = push_http_client()?;
 
             // Check which FODs are already on the server.
             let mut to_push = Vec::new();
@@ -454,7 +454,7 @@ fn cmd_push_sources(paths: &[String], cache_name: Option<&str>) -> color_eyre::R
 
             for (path, hash) in fod_paths.iter().zip(fod_hashes.iter()) {
                 let check_url = format!("{base_url}/{hash}.narinfo");
-                let resp = client.head(&check_url).send().await?;
+                let resp = send_idempotent(|| client.head(&check_url)).await?;
                 if resp.status().is_success() {
                     already_present += 1;
                 } else {
@@ -484,7 +484,7 @@ fn cmd_push_sources(paths: &[String], cache_name: Option<&str>) -> color_eyre::R
                                 push_single_path(&client, &base, token.as_deref(), &path).await
                             }
                         })
-                        .buffer_unordered(8)
+                        .buffer_unordered(PUSH_CONCURRENCY)
                         .collect::<Vec<_>>()
                         .await;
 
@@ -492,7 +492,7 @@ fn cmd_push_sources(paths: &[String], cache_name: Option<&str>) -> color_eyre::R
                     match result {
                         Ok(_) => bar.inc(1),
                         Err(e) => {
-                            tracing::warn!("FOD push failed: {e}");
+                            tracing::warn!("FOD push failed: {e:#}");
                             bar.inc(1);
                         },
                     }
@@ -558,7 +558,7 @@ async fn push_single_path(
 
     // Check if already on server.
     let check_url = format!("{base_url}/{hash}.narinfo");
-    let resp = client.head(&check_url).send().await?;
+    let resp = send_idempotent(|| client.head(&check_url)).await?;
     if resp.status().is_success() {
         return Ok(PushResult::AlreadyExists);
     }
@@ -587,19 +587,6 @@ async fn push_single_path(
         .next()
         .ok_or_else(|| color_eyre::eyre::eyre!("no path info for {store_path}"))?;
 
-    // Dump NAR.
-    let nar_output = std::process::Command::new("nix-store")
-        .arg("--dump")
-        .arg(store_path)
-        .output()?;
-
-    if !nar_output.status.success() {
-        return Err(color_eyre::eyre::eyre!(
-            "nix-store --dump failed for {store_path}"
-        ));
-    }
-
-    let nar_data = nar_output.stdout;
     let nar_url = format!("nar/{hash}.nar");
 
     // Build narinfo.
@@ -614,7 +601,8 @@ async fn push_single_path(
     narinfo.push_str(&format!("URL: {nar_url}\n"));
     narinfo.push_str("Compression: none\n");
     narinfo.push_str(&format!("FileHash: {}\n", info.nar_hash));
-    narinfo.push_str(&format!("FileSize: {}\n", nar_data.len()));
+    // Uncompressed upload: the file is the NAR itself.
+    narinfo.push_str(&format!("FileSize: {}\n", info.nar_size));
     narinfo.push_str(&format!("NarHash: {}\n", info.nar_hash));
     narinfo.push_str(&format!("NarSize: {}\n", info.nar_size));
     if !refs.is_empty() {
@@ -627,23 +615,38 @@ async fn push_single_path(
         narinfo.push_str(&format!("CA: {ca}\n"));
     }
 
-    let upload_size = nar_data.len() as u64;
+    // Stream the NAR straight from `nix-store --dump` to the server. Buffering
+    // it held a full copy of every in-flight NAR in memory, which for large
+    // outputs pushed the client to many GiB per process.
+    let mut dump = tokio::process::Command::new("nix-store")
+        .arg("--dump")
+        .arg(store_path)
+        .stdout(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()?;
+    let stdout = dump
+        .stdout
+        .take()
+        .ok_or_else(|| color_eyre::eyre::eyre!("nix-store --dump has no stdout"))?;
 
-    // Try CAS push first, fall back to full NAR upload.
-    if let Ok(true) = try_cas_push(client, base_url, token, hash, &nar_data, &narinfo).await {
-        return Ok(PushResult::Uploaded {
-            nar_size: info.nar_size,
-            upload_size,
-        });
-    }
-
-    // Full NAR upload (fallback).
     let nar_upload_url = format!("{base_url}/{nar_url}");
-    let mut req = client.put(&nar_upload_url).body(nar_data);
+    let mut req = client
+        .put(&nar_upload_url)
+        // A dump that ends early no longer matches this length, so the
+        // request fails instead of uploading a truncated NAR.
+        .header(reqwest::header::CONTENT_LENGTH, info.nar_size)
+        .body(reqwest::Body::wrap_stream(read_chunks(stdout)));
     if let Some(t) = token {
         req = req.header("Authorization", format!("Bearer {t}"));
     }
-    let resp = req.send().await?;
+    let sent = req.send().await;
+    let dump_status = dump.wait().await?;
+    if !dump_status.success() {
+        return Err(color_eyre::eyre::eyre!(
+            "nix-store --dump failed for {store_path}: {dump_status}"
+        ));
+    }
+    let resp = sent?;
     if !resp.status().is_success() {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
@@ -653,11 +656,14 @@ async fn push_single_path(
     }
 
     let narinfo_url = format!("{base_url}/{hash}.narinfo");
-    let mut req = client.put(&narinfo_url).body(narinfo);
-    if let Some(t) = token {
-        req = req.header("Authorization", format!("Bearer {t}"));
-    }
-    let resp = req.send().await?;
+    let resp = send_idempotent(|| {
+        let req = client.put(&narinfo_url).body(narinfo.clone());
+        match token {
+            Some(t) => req.header("Authorization", format!("Bearer {t}")),
+            None => req,
+        }
+    })
+    .await?;
     if !resp.status().is_success() {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
@@ -668,129 +674,68 @@ async fn push_single_path(
 
     Ok(PushResult::Uploaded {
         nar_size: info.nar_size,
-        upload_size,
+        upload_size: info.nar_size,
     })
 }
 
-/// Attempt a CAS-based push for a single path.
-///
-/// Returns `Ok(true)` if the CAS push succeeded, `Ok(false)` if the server
-/// doesn't support it (caller should fall back to full NAR upload).
-async fn try_cas_push(
-    client: &reqwest::Client,
-    base_url: &str,
-    token: Option<&str>,
-    hash: &str,
-    nar_data: &[u8],
-    narinfo: &str,
-) -> color_eyre::Result<bool> {
-    use ekapkgs_nix::decompose::decompose_nar;
-    use ekapkgs_nix::nar::parse_nar;
-    use ekapkgs_protocol::ekapkgs::v1::cache_service_client::CacheServiceClient;
-    use ekapkgs_protocol::ekapkgs::v1::{B3Digest, CaDirectoryData, PushNegotiateRequest};
+/// Read `r` to EOF as a stream of buffers, for use as a streaming request body.
+fn read_chunks<R>(r: R) -> impl futures::Stream<Item = std::io::Result<Vec<u8>>> + Send + 'static
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+{
+    const READ_BUF: usize = 256 * 1024;
+    futures::stream::try_unfold(r, |mut r| async move {
+        use tokio::io::AsyncReadExt;
+        let mut buf = vec![0u8; READ_BUF];
+        let n = r.read(&mut buf).await?;
+        if n == 0 {
+            return Ok(None);
+        }
+        buf.truncate(n);
+        Ok(Some((buf, r)))
+    })
+}
 
-    // Parse the NAR and decompose into CAS format.
-    let nar_node = parse_nar(nar_data)?;
-    let result = decompose_nar(&nar_node);
+/// How long to wait for a TCP connection to the cache. An overloaded or
+/// restarting server can leave connects hanging for the kernel's full SYN
+/// retry budget (about two minutes); fail fast and retry instead.
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
-    // Build the push negotiate request.
-    let directories = result
-        .directories
-        .iter()
-        .map(|(digest, dir)| CaDirectoryData {
-            digest: Some(B3Digest {
-                digest: digest.to_vec(),
-            }),
-            directory: Some(dir.clone()),
-        })
-        .collect();
+/// Overall timeout for small metadata requests (narinfo HEAD and PUT).
+const METADATA_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
-    let grpc_url = base_url.to_owned();
-    let mut grpc_client = match CacheServiceClient::connect(grpc_url).await {
-        Ok(c) => c
-            .max_decoding_message_size(64 * 1024 * 1024)
-            .max_encoding_message_size(64 * 1024 * 1024),
-        Err(_) => return Ok(false),
-    };
+/// Attempts for idempotent metadata requests that fail to connect or time out.
+const METADATA_ATTEMPTS: u32 = 4;
 
-    let request = tonic::Request::new(PushNegotiateRequest {
-        store_path_hash: hash.to_owned(),
-        root_node: Some(result.root_node.clone()),
-        directories,
-        file_chunk_mappings: result.file_chunk_mappings.clone(),
-    });
+/// Paths uploaded concurrently by one push. Matches the server's NAR ingest
+/// limit; more only queues on the server while it holds request bodies.
+const PUSH_CONCURRENCY: usize = 4;
 
-    let response = match grpc_client.push_negotiate(request).await {
-        Ok(r) => r.into_inner(),
-        Err(e) => {
-            if e.code() == tonic::Code::Unimplemented {
-                return Ok(false);
-            }
-            tracing::debug!("PushNegotiate failed: {e}");
-            return Ok(false);
-        },
-    };
+/// HTTP client for pushing to a cache.
+fn push_http_client() -> color_eyre::Result<reqwest::Client> {
+    Ok(reqwest::Client::builder()
+        .connect_timeout(CONNECT_TIMEOUT)
+        .build()?)
+}
 
-    if response.already_exists {
-        return Ok(true);
-    }
-
-    // Build a map from digest to chunk data for fast lookup.
-    let chunk_map: std::collections::HashMap<[u8; 32], &[u8]> = result
-        .chunks
-        .iter()
-        .map(|c| (c.digest, c.data.as_slice()))
-        .collect();
-
-    // Upload only missing chunks.
-    let missing_count = response.missing_chunks.len();
-    if missing_count > 0 {
-        tracing::debug!("Uploading {missing_count} missing chunks for {hash}");
-        for missing_digest in &response.missing_chunks {
-            let d: [u8; 32] = match missing_digest.digest.as_slice().try_into() {
-                Ok(d) => d,
-                Err(_) => continue,
-            };
-            let Some(data) = chunk_map.get(&d) else {
-                continue;
-            };
-            let hex: String = d.iter().map(|b| format!("{b:02x}")).collect();
-            let url = format!("{base_url}/cas/chunk/{hex}");
-            let mut req = client.put(&url).body(data.to_vec());
-            if let Some(t) = token {
-                req = req.header("Authorization", format!("Bearer {t}"));
-            }
-            let resp = req.send().await?;
-            if !resp.status().is_success() {
-                tracing::debug!("Chunk upload failed for {hex}, falling back to full NAR");
-                return Ok(false);
-            }
+/// Send an idempotent request, retrying with backoff when it fails to connect
+/// or times out. `build` is called once per attempt.
+async fn send_idempotent(
+    build: impl Fn() -> reqwest::RequestBuilder,
+) -> reqwest::Result<reqwest::Response> {
+    let mut delay = std::time::Duration::from_secs(1);
+    let mut attempt = 1;
+    loop {
+        match build().timeout(METADATA_TIMEOUT).send().await {
+            Err(e) if attempt < METADATA_ATTEMPTS && (e.is_connect() || e.is_timeout()) => {
+                tracing::debug!("attempt {attempt} failed, retrying in {delay:?}: {e}");
+                tokio::time::sleep(delay).await;
+                delay *= 2;
+                attempt += 1;
+            },
+            other => return other,
         }
     }
-
-    // Upload the full NAR (server will ingest it into CAS atomically).
-    let nar_url = format!("{base_url}/nar/{hash}.nar");
-    let mut req = client.put(&nar_url).body(nar_data.to_vec());
-    if let Some(t) = token {
-        req = req.header("Authorization", format!("Bearer {t}"));
-    }
-    let resp = req.send().await?;
-    if !resp.status().is_success() {
-        return Ok(false);
-    }
-
-    // Upload narinfo.
-    let narinfo_url = format!("{base_url}/{hash}.narinfo");
-    let mut req = client.put(&narinfo_url).body(narinfo.to_owned());
-    if let Some(t) = token {
-        req = req.header("Authorization", format!("Bearer {t}"));
-    }
-    let resp = req.send().await?;
-    if !resp.status().is_success() {
-        return Ok(false);
-    }
-
-    Ok(true)
 }
 
 /// Returns `(top_level_paths, all_closure_paths)`.
