@@ -48,6 +48,13 @@ v1 databases (small chunk data in `chunks.data`, rowid tables, no `schema_versio
 
 `journal_size_limit` (64 MiB) shrinks the WAL whenever it is reset, and `spawn_wal_maintenance` tries a `wal_checkpoint(TRUNCATE)` every 5 minutes, waiting at most 250 ms for readers. Automatic PASSIVE checkpoints alone can't reset the WAL while readers are active, which let it grow to several GB.
 
+The process exits without dropping `CastoreBackend` (background threads hold `Arc`s), so SQLite never gets its close-time checkpoint. Two checkpoints cover that instead:
+
+- **Shutdown:** `CastoreBackend::shutdown` (called from `on_shutdown`) sets `shutting_down`, interrupts the integrity check and pooled readers so their snapshots don't block the checkpoint, then runs `wal_checkpoint(TRUNCATE)`, waiting up to 10s, and closes the idle readers.
+- **Startup:** `open_db` runs `checkpoint_leftover_wal` before anything else, when no readers exist yet, so a WAL left by a crash is always folded back in.
+
+While starting, `ekapkgs-serve` sends systemd `EXTEND_TIMEOUT_USEC` every 10s until READY, so a slow database open isn't killed by `TimeoutStartSec`. Being killed there would leave the database unclean and make the next start slower.
+
 ### Ingest flow (`put_nar`)
 
 1. Parse incoming NAR into a `NarNode` tree (`ekapkgs-nix/src/nar.rs`)
@@ -95,7 +102,7 @@ Each tier falls back to the next on failure or if the server doesn't support it.
 
 Startup never scans the database, so systemd's start timeout can't be hit on a large cache.
 
-- `_meta.clean_shutdown` is set to `0` at startup and `1` in `on_shutdown`. The server handles SIGTERM/SIGINT by draining connections (10s cap) and then calling `on_shutdown`.
+- `_meta.clean_shutdown` is set to `0` at startup and `1` in `on_shutdown` (via `CastoreBackend::shutdown`). The server handles SIGTERM/SIGINT by draining connections (10s cap) and then calling `on_shutdown`.
 - If the previous run was unclean, `spawn_integrity_check` runs `PRAGMA quick_check` on a read-only connection in the background while the server keeps serving. `mark_clean_shutdown` is skipped until that check passes, so an interrupted check runs again on the next start.
 - If corruption is found, it writes `castore.db.needs-recovery` and exits with status 75. On restart, `open_db` sees the marker, renames the DB to `castore.db.corrupt-<ts>`, starts with an empty DB, and `spawn_recovery` copies back whatever rows it can read.
 - The copy source is recorded in `castore.db.recover-from`. If the server restarts before the copy finishes, it resumes on the next start (inserts are `OR IGNORE`, and packed chunks are checked before appending). The marker is removed when the copy completes.

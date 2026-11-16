@@ -147,6 +147,9 @@ impl DirCache {
 /// pool connections at startup. Once open, the connection is reused.
 struct LazyReader {
     inner: Mutex<Option<Connection>>,
+    /// Interrupt handle for the open connection, kept outside `inner` so a
+    /// long-running query can be cancelled without taking the slot's lock.
+    interrupt: Mutex<Option<rusqlite::InterruptHandle>>,
     db_path: PathBuf,
 }
 
@@ -154,7 +157,22 @@ impl LazyReader {
     fn new(db_path: PathBuf) -> Self {
         Self {
             inner: Mutex::new(None),
+            interrupt: Mutex::new(None),
             db_path,
+        }
+    }
+
+    /// Open the connection into an empty slot.
+    fn open_into(&self, slot: &mut Option<Connection>) {
+        match open_db_reader(&self.db_path) {
+            Ok(conn) => {
+                *self.interrupt.lock().expect("reader interrupt lock") =
+                    Some(conn.get_interrupt_handle());
+                *slot = Some(conn);
+            },
+            Err(e) => {
+                tracing::error!("failed to open reader connection: {e}");
+            },
         }
     }
 
@@ -162,12 +180,7 @@ impl LazyReader {
     fn lock(&self) -> std::sync::MutexGuard<'_, Option<Connection>> {
         let mut guard = self.inner.lock().expect("lazy reader lock");
         if guard.is_none() {
-            match open_db_reader(&self.db_path) {
-                Ok(conn) => *guard = Some(conn),
-                Err(e) => {
-                    tracing::error!("failed to open reader connection: {e}");
-                },
-            }
+            self.open_into(&mut guard);
         }
         guard
     }
@@ -176,14 +189,33 @@ impl LazyReader {
     fn try_lock(&self) -> Option<std::sync::MutexGuard<'_, Option<Connection>>> {
         let mut guard = self.inner.try_lock().ok()?;
         if guard.is_none() {
-            match open_db_reader(&self.db_path) {
-                Ok(conn) => *guard = Some(conn),
-                Err(e) => {
-                    tracing::error!("failed to open reader connection: {e}");
-                },
-            }
+            self.open_into(&mut guard);
         }
         Some(guard)
+    }
+
+    /// Cancel whatever query this connection is running, so its read
+    /// snapshot is released.
+    fn interrupt(&self) {
+        if let Some(handle) = self
+            .interrupt
+            .lock()
+            .expect("reader interrupt lock")
+            .as_ref()
+        {
+            handle.interrupt();
+        }
+    }
+
+    /// Close the connection if the slot is idle. Returns `false` if it is
+    /// still in use.
+    fn close_if_idle(&self) -> bool {
+        let Ok(mut guard) = self.inner.try_lock() else {
+            return false;
+        };
+        *self.interrupt.lock().expect("reader interrupt lock") = None;
+        *guard = None;
+        true
     }
 }
 
@@ -263,6 +295,12 @@ pub struct CastoreBackend {
     /// background integrity check passed. The clean-shutdown sentinel is only
     /// written when this is set, so an unfinished check re-runs next startup.
     integrity_verified: AtomicBool,
+    /// Set by `shutdown`. Background loops check it and stop early so their
+    /// read snapshots don't keep the final WAL checkpoint from completing.
+    shutting_down: AtomicBool,
+    /// Interrupt handle for the background integrity check's connection while
+    /// it runs, so shutdown can cancel the scan.
+    integrity_interrupt: Mutex<Option<rusqlite::InterruptHandle>>,
 }
 
 impl CastoreBackend {
@@ -328,6 +366,8 @@ impl CastoreBackend {
             recover_from,
             db_path,
             integrity_verified: AtomicBool::new(!needs_integrity_check),
+            shutting_down: AtomicBool::new(false),
+            integrity_interrupt: Mutex::new(None),
         };
 
         Ok(backend)
@@ -397,7 +437,7 @@ impl CastoreBackend {
                 tracing::info!(
                     "previous shutdown was unclean — running background integrity check"
                 );
-                match run_quick_check(&backend.db_path) {
+                match run_quick_check(&backend.db_path, Some(&backend.integrity_interrupt)) {
                     IntegrityResult::Ok => {
                         backend.integrity_verified.store(true, Ordering::Release);
                         tracing::info!("integrity check passed in {:?}", t.elapsed());
@@ -745,9 +785,15 @@ impl CastoreBackend {
         std::thread::Builder::new()
             .name("cas-wal".into())
             .spawn(move || {
-                loop {
-                    std::thread::sleep(INTERVAL);
-                    backend.truncate_wal();
+                // Sleep in short steps so shutdown doesn't wait on this thread.
+                let mut slept = std::time::Duration::ZERO;
+                while !backend.is_shutting_down() {
+                    std::thread::sleep(std::time::Duration::from_secs(1));
+                    slept += std::time::Duration::from_secs(1);
+                    if slept >= INTERVAL {
+                        slept = std::time::Duration::ZERO;
+                        backend.truncate_wal();
+                    }
                 }
             })
             .expect("failed to spawn WAL maintenance thread");
@@ -757,21 +803,11 @@ impl CastoreBackend {
     /// runs, so it waits at most 250 ms for readers before giving up until
     /// the next attempt.
     fn truncate_wal(&self) {
-        let mut wal_path = self.db_path.as_os_str().to_owned();
-        wal_path.push("-wal");
-        let wal_size = || std::fs::metadata(&wal_path).map_or(0, |m| m.len());
-        let before = wal_size();
-
-        let db = self.db.lock().expect("db lock");
-        let result = db.execute_batch("PRAGMA busy_timeout=250").and_then(|()| {
-            db.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
-                row.get::<_, i64>(0)
-            })
-        });
-        let _ = db.execute_batch("PRAGMA busy_timeout=5000");
-        drop(db);
-
-        let after = wal_size();
+        let WalCheckpoint {
+            result,
+            before,
+            after,
+        } = self.checkpoint_truncate(250);
         match result {
             Ok(0) => {
                 if before > 256 * 1024 * 1024 {
@@ -786,6 +822,92 @@ impl CastoreBackend {
                 "WAL is {after} bytes and could not be truncated — a long-running reader may be \
                  blocking checkpoints"
             );
+        }
+    }
+
+    /// Run `PRAGMA wal_checkpoint(TRUNCATE)` on the write connection, waiting
+    /// up to `busy_ms` for readers to move off the WAL.
+    fn checkpoint_truncate(&self, busy_ms: u32) -> WalCheckpoint {
+        let wal_path = wal_path(&self.db_path);
+        let before = file_len(&wal_path);
+
+        let db = self.db.lock().expect("db lock");
+        let result = db
+            .execute_batch(&format!("PRAGMA busy_timeout={busy_ms}"))
+            .and_then(|()| {
+                db.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+            });
+        let _ = db.execute_batch("PRAGMA busy_timeout=5000");
+        drop(db);
+
+        WalCheckpoint {
+            result,
+            before,
+            after: file_len(&wal_path),
+        }
+    }
+
+    /// `true` once `shutdown` has started.
+    fn is_shutting_down(&self) -> bool {
+        self.shutting_down.load(Ordering::Acquire)
+    }
+
+    /// Prepare the database for process exit.
+    ///
+    /// The process exits without dropping the backend (background threads
+    /// hold `Arc`s to it), so SQLite never gets the last-connection close that
+    /// would normally checkpoint and delete the WAL. Without this, the WAL
+    /// survives every restart, keeps growing, and the next startup has to
+    /// rebuild its index by reading the whole file before it can serve.
+    ///
+    /// This stops background scans, writes the clean-shutdown sentinel,
+    /// truncates the WAL, and closes the idle reader connections.
+    pub fn shutdown(&self) {
+        self.shutting_down.store(true, Ordering::Release);
+
+        // Long scans (integrity check, bloom builds, stats) hold read
+        // snapshots that would make the TRUNCATE checkpoint fail. Requests
+        // have drained by now, so cancel whatever is still running.
+        if let Some(handle) = self
+            .integrity_interrupt
+            .lock()
+            .expect("integrity interrupt lock")
+            .as_ref()
+        {
+            handle.interrupt();
+        }
+        for reader in &self.read_pool {
+            reader.interrupt();
+        }
+
+        self.mark_clean_shutdown();
+
+        let t = Instant::now();
+        let WalCheckpoint {
+            result,
+            before,
+            after,
+        } = self.checkpoint_truncate(SHUTDOWN_CHECKPOINT_BUSY_MS);
+        match result {
+            Ok(0) => tracing::info!(
+                "WAL checkpointed at shutdown: {before} -> {after} bytes in {:?}",
+                t.elapsed()
+            ),
+            Ok(_) => tracing::warn!(
+                "WAL checkpoint at shutdown blocked by readers; WAL left at {after} bytes"
+            ),
+            Err(e) => tracing::warn!("WAL checkpoint at shutdown failed: {e}"),
+        }
+
+        let busy = self
+            .read_pool
+            .iter()
+            .filter(|reader| !reader.close_if_idle())
+            .count();
+        if busy > 0 {
+            tracing::warn!("{busy} reader connection(s) still busy at shutdown");
         }
     }
 
@@ -1812,8 +1934,13 @@ impl CastoreBackend {
     /// Build both bloom filters from the database and start using them.
     fn rebuild_blooms(&self) {
         let chunk_bloom = self.build_chunk_bloom();
-        *self.chunk_bloom.lock().expect("chunk bloom lock") = chunk_bloom;
         let path_bloom = self.build_path_bloom();
+        // Shutdown interrupts the scans, leaving the filters incomplete. An
+        // incomplete filter gives false negatives, so never install one.
+        if self.is_shutting_down() {
+            return;
+        }
+        *self.chunk_bloom.lock().expect("chunk bloom lock") = chunk_bloom;
         *self.path_bloom.lock().expect("path bloom lock") = path_bloom;
         self.bloom_ready.store(true, Ordering::Release);
     }
@@ -2110,7 +2237,7 @@ impl StorageBackend for CastoreBackend {
     }
 
     fn on_shutdown(&self) {
-        self.mark_clean_shutdown();
+        self.shutdown();
     }
 }
 
@@ -2255,6 +2382,61 @@ fn open_db_reader(path: &Path) -> color_eyre::Result<Connection> {
     Ok(conn)
 }
 
+/// How long the shutdown checkpoint waits for readers to leave the WAL.
+/// Kept well under systemd's stop timeout.
+const SHUTDOWN_CHECKPOINT_BUSY_MS: u32 = 10_000;
+
+/// Outcome of a TRUNCATE checkpoint: SQLite's busy flag (0 = WAL reset) and
+/// the WAL size before and after.
+struct WalCheckpoint {
+    result: rusqlite::Result<i64>,
+    before: u64,
+    after: u64,
+}
+
+/// Path of the WAL file for a database.
+fn wal_path(db_path: &Path) -> PathBuf {
+    let mut p = db_path.as_os_str().to_owned();
+    p.push("-wal");
+    PathBuf::from(p)
+}
+
+/// Fold a WAL left behind by the previous instance back into the database.
+///
+/// At startup this process is the only one with the database open and no
+/// readers exist yet, so a TRUNCATE checkpoint always succeeds here. Once the
+/// server is running, readers can block the reset indefinitely. A WAL left
+/// behind usually means the previous instance crashed or was killed before
+/// its shutdown checkpoint.
+fn checkpoint_leftover_wal(conn: &Connection, db_path: &Path) {
+    let wal = wal_path(db_path);
+    let before = file_len(&wal);
+    if before == 0 {
+        return;
+    }
+    tracing::info!("checkpointing {before}-byte WAL left by the previous instance");
+    let t = Instant::now();
+    match conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+        row.get::<_, i64>(0)
+    }) {
+        Ok(0) => tracing::info!(
+            "startup WAL checkpoint: {before} -> {} bytes in {:?}",
+            file_len(&wal),
+            t.elapsed()
+        ),
+        Ok(_) => tracing::warn!(
+            "startup WAL checkpoint was blocked — is another process using {}?",
+            db_path.display()
+        ),
+        Err(e) => tracing::warn!("startup WAL checkpoint failed: {e}"),
+    }
+}
+
+/// Size of a file in bytes, or 0 if it doesn't exist.
+fn file_len(path: &Path) -> u64 {
+    std::fs::metadata(path).map_or(0, |m| m.len())
+}
+
 /// Result of opening a database: the live connection plus an optional path to
 /// a database whose rows still need copying into it.
 struct OpenDbResult {
@@ -2387,6 +2569,7 @@ fn open_db(path: &Path) -> color_eyre::Result<OpenDbResult> {
 
     let conn = Connection::open(path)?;
     conn.execute_batch(WRITER_PRAGMAS)?;
+    checkpoint_leftover_wal(&conn, path);
 
     let version = stored_schema_version(&conn);
     if version > SCHEMA_VERSION {
@@ -2493,7 +2676,14 @@ enum IntegrityResult {
 ///
 /// Readers don't block the writer in WAL mode, so the server keeps serving
 /// while this runs.
-fn run_quick_check(path: &Path) -> IntegrityResult {
+///
+/// While the check runs, its interrupt handle is stored in `interrupt` (when
+/// given) so shutdown can cancel it. A cancelled check reports `Error`, which
+/// leaves the database marked unclean so the check runs again next start.
+fn run_quick_check(
+    path: &Path,
+    interrupt: Option<&Mutex<Option<rusqlite::InterruptHandle>>>,
+) -> IntegrityResult {
     let conn = match open_db_reader(path) {
         Ok(c) => c,
         Err(e) => {
@@ -2503,15 +2693,22 @@ fn run_quick_check(path: &Path) -> IntegrityResult {
             };
         },
     };
+    if let Some(slot) = interrupt {
+        *slot.lock().expect("integrity interrupt lock") = Some(conn.get_interrupt_handle());
+    }
     // quick_check returns one row per problem (up to 100), or a single "ok".
     let rows: rusqlite::Result<Vec<String>> = conn
         .prepare("PRAGMA quick_check")
         .and_then(|mut stmt| stmt.query_map([], |row| row.get(0))?.collect());
-    match rows {
+    let result = match rows {
         Ok(rows) if rows.len() == 1 && rows[0] == "ok" => IntegrityResult::Ok,
         Ok(rows) => IntegrityResult::Corrupt(rows.join("; ")),
         Err(e) => classify_sqlite_error(e),
+    };
+    if let Some(slot) = interrupt {
+        *slot.lock().expect("integrity interrupt lock") = None;
     }
+    result
 }
 
 /// SQLite reports some corruption as an error rather than a check row.
@@ -3144,16 +3341,17 @@ pub fn require_current_schema(conn: &Connection) -> color_eyre::Result<()> {
 /// Returns `true` when the `path_files` table exists but is empty while
 /// `cas_paths` has rows — i.e. a backfill is needed.
 fn path_files_needs_backfill(conn: &Connection) -> bool {
-    let pf_count: i64 = conn
-        .query_row("SELECT COUNT(*) FROM path_files", [], |row| row.get(0))
-        .unwrap_or(0);
-    if pf_count > 0 {
-        return false;
-    }
-    let cp_count: i64 = conn
-        .query_row("SELECT COUNT(*) FROM cas_paths", [], |row| row.get(0))
-        .unwrap_or(0);
-    cp_count > 0
+    // EXISTS stops at the first row; COUNT(*) would scan the whole table on
+    // the startup path.
+    let exists = |table: &str| -> bool {
+        conn.query_row(
+            &format!("SELECT EXISTS(SELECT 1 FROM {table})"),
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(false)
+    };
+    !exists("path_files") && exists("cas_paths")
 }
 
 /// Bring a v1 database to the last v1 column layout (`last_access`,
@@ -3301,6 +3499,79 @@ mod tests {
         backend.mark_clean_shutdown();
         drop(backend);
         assert_eq!(read_clean_flag(dir.path()), Some(1));
+    }
+
+    /// Write enough rows through the backend's write connection to leave
+    /// frames in the WAL.
+    fn fill_wal(backend: &CastoreBackend) {
+        let db = backend.db.lock().unwrap();
+        for i in 0..64u8 {
+            db.execute(
+                "INSERT INTO chunks (digest, size) VALUES (?1, 1)",
+                params![vec![i; 32]],
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn shutdown_truncates_wal_without_dropping_backend() {
+        let (dir, backend) = setup_backend();
+        fill_wal(&backend);
+        // Open a pooled reader so shutdown has one to close.
+        let _ = backend.total_paths().unwrap();
+        let wal = wal_path(&dir.path().join("castore.db"));
+        assert!(file_len(&wal) > 0);
+
+        backend.shutdown();
+
+        assert_eq!(file_len(&wal), 0);
+        assert!(backend.is_shutting_down());
+        assert_eq!(read_clean_flag(dir.path()), Some(1));
+        // The real process exits without dropping the backend; mirror that.
+        std::mem::forget(backend);
+    }
+
+    #[test]
+    fn leftover_wal_is_checkpointed_at_startup() {
+        let (dir, backend) = setup_backend();
+        fill_wal(&backend);
+        // Leak instead of drop, so SQLite never gets its close-time
+        // checkpoint and the WAL is left behind, as after a crash.
+        std::mem::forget(backend);
+        let wal = wal_path(&dir.path().join("castore.db"));
+        let before = file_len(&wal);
+        assert!(before > 0);
+
+        let backend = CastoreBackend::new(
+            dir.path().to_path_buf(),
+            ChunkCompressionConfig::default(),
+            false,
+        )
+        .unwrap();
+        // Startup writes the dirty sentinel after the checkpoint, so a frame
+        // or two remain; the previous instance's frames are gone.
+        let after = file_len(&wal);
+        assert!(after < before / 4, "WAL {before} -> {after} bytes");
+        let chunks: i64 = backend
+            .acquire_reader()
+            .query_row("SELECT COUNT(*) FROM chunks", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(chunks, 64);
+    }
+
+    #[test]
+    fn backfill_needed_only_when_path_files_empty_and_paths_exist() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE path_files (x); CREATE TABLE cas_paths (x);")
+            .unwrap();
+        assert!(!path_files_needs_backfill(&conn));
+        conn.execute("INSERT INTO cas_paths VALUES (1)", [])
+            .unwrap();
+        assert!(path_files_needs_backfill(&conn));
+        conn.execute("INSERT INTO path_files VALUES (1)", [])
+            .unwrap();
+        assert!(!path_files_needs_backfill(&conn));
     }
 
     #[test]
@@ -3635,7 +3906,7 @@ mod tests {
         let path = dir.path().join("bad.db");
         std::fs::write(&path, vec![0xAB; 8192]).unwrap();
         assert!(matches!(
-            run_quick_check(&path),
+            run_quick_check(&path, None),
             IntegrityResult::Corrupt(_)
         ));
     }
