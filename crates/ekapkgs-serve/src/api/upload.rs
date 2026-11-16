@@ -123,7 +123,23 @@ pub async fn put_narinfo(
 
     let signed_content = narinfo.to_narinfo_string();
 
-    match state.storage.put_narinfo(hash, &signed_content) {
+    // Storing a narinfo takes the castore write lock, which a concurrent NAR
+    // ingest can hold for seconds. Bound how many uploads wait on it and keep
+    // the wait on the blocking pool so the async workers stay free to accept
+    // connections and answer reads.
+    let Ok(permit) = state.narinfo_write_semaphore.clone().acquire_owned().await else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "server shutting down").into_response();
+    };
+    let st = Arc::clone(&state);
+    let hash_owned = hash.to_owned();
+    let result = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        st.storage.put_narinfo(&hash_owned, &signed_content)
+    })
+    .await
+    .unwrap_or_else(|e| Err(color_eyre::eyre::eyre!("spawn_blocking join: {e}")));
+
+    match result {
         Ok(true) => {
             state.metrics.push_narinfo_total.inc();
             // Register with GC tracker if present.
@@ -157,13 +173,26 @@ pub async fn put_nar(
     }
 
     // Acquire a push semaphore permit to bound concurrent ingestion memory.
-    let Ok(_permit) = state.push_semaphore.acquire().await else {
+    let Ok(permit) = state.push_semaphore.clone().acquire_owned().await else {
         return (StatusCode::SERVICE_UNAVAILABLE, "server shutting down").into_response();
     };
 
     let nar_path = format!("nar/{file}");
 
-    match state.storage.put_nar(&nar_path, &body) {
+    // Ingest parses, chunks, compresses and writes the whole NAR while holding
+    // the castore write lock. Run it on the blocking pool: on an async worker
+    // it stalls that worker for the whole ingest, and enough concurrent
+    // uploads stall every worker, including the one accepting connections.
+    let st = Arc::clone(&state);
+    let ingest_body = body.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        st.storage.put_nar(&nar_path, &ingest_body)
+    })
+    .await
+    .unwrap_or_else(|e| Err(color_eyre::eyre::eyre!("spawn_blocking join: {e}")));
+
+    match result {
         Ok(true) => {
             state.metrics.push_nar_total.inc();
             state.metrics.push_nar_bytes_total.inc_by(body.len() as u64);

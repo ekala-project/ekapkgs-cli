@@ -534,50 +534,54 @@ impl CacheService for NegotiateService {
         }
 
         let req = request.into_inner();
-        let hash = &req.store_path_hash;
 
-        // Check if the server already has this path.
-        match self.state.storage.has_narinfo(hash) {
-            Ok(true) => {
-                return Ok(Response::new(PushNegotiateResponse {
-                    missing_chunks: Vec::new(),
-                    already_exists: true,
-                }));
-            },
-            Ok(false) => {},
-            Err(e) => {
-                return Err(Status::internal(format!(
-                    "failed to check narinfo for {hash}: {e}"
-                )));
-            },
-        }
+        // The existence checks below query SQLite once per chunk; run them on
+        // the blocking pool so they never stall the async workers.
+        // Returns `Ok(None)` when the path already exists, otherwise the
+        // chunks the server is missing.
+        let state = Arc::clone(&self.state);
+        let checked = tokio::task::spawn_blocking(move || {
+            let hash = &req.store_path_hash;
 
-        // Collect all chunk digests from the client's tree metadata.
-        let mut all_chunk_digests = Vec::new();
-        for mapping in &req.file_chunk_mappings {
-            for chunk in &mapping.chunks {
-                if let Some(digest) = &chunk.digest {
-                    all_chunk_digests.push(digest.clone());
+            // Check if the server already has this path.
+            match state.storage.has_narinfo(hash) {
+                Ok(true) => return Ok(None),
+                Ok(false) => {},
+                Err(e) => return Err(format!("failed to check narinfo for {hash}: {e}")),
+            }
+
+            // Check which of the client's chunks the server is missing.
+            let mut missing = Vec::new();
+            for digest in req
+                .file_chunk_mappings
+                .iter()
+                .flat_map(|m| &m.chunks)
+                .filter_map(|c| c.digest.as_ref())
+            {
+                let Ok(d) = <[u8; 32]>::try_from(digest.digest.as_slice()) else {
+                    continue;
+                };
+                match state.storage.has_chunk(&d) {
+                    Ok(true) => {},
+                    Ok(false) | Err(_) => missing.push(digest.clone()),
                 }
             }
-        }
 
-        // Check which chunks the server already has.
-        let mut missing = Vec::new();
-        for digest in &all_chunk_digests {
-            let d: [u8; 32] = match digest.digest.as_slice().try_into() {
-                Ok(d) => d,
-                Err(_) => continue,
-            };
-            match self.state.storage.has_chunk(&d) {
-                Ok(true) => {},
-                Ok(false) | Err(_) => missing.push(digest.clone()),
-            }
-        }
+            Ok(Some(missing))
+        })
+        .await
+        .map_err(|e| Status::internal(format!("spawn_blocking join: {e}")))?
+        .map_err(Status::internal)?;
 
-        Ok(Response::new(PushNegotiateResponse {
-            missing_chunks: missing,
-            already_exists: false,
+        Ok(Response::new(match checked {
+            None => PushNegotiateResponse {
+                missing_chunks: Vec::new(),
+                already_exists: true,
+            },
+            Some(missing) => PushNegotiateResponse {
+                missing_chunks: missing,
+                already_exists: false,
+            },
         }))
     }
 
