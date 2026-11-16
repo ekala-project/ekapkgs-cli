@@ -896,6 +896,7 @@ fn cmd_compress_chunks(
 }
 
 async fn cmd_serve(cli: Cli) -> color_eyre::Result<()> {
+    spawn_startup_timeout_extender();
     let bind_addr: String;
     let storage_backend: Box<dyn StorageBackend>;
     let signer: NarInfoSigner;
@@ -1339,9 +1340,43 @@ where
 }
 
 fn notify_ready() {
+    STARTUP_DONE.store(true, std::sync::atomic::Ordering::Release);
     if let Err(e) = sd_notify::notify(false, &[sd_notify::NotifyState::Ready]) {
         tracing::warn!("sd_notify READY=1 failed (non-fatal): {e}");
     }
+}
+
+/// Set once READY=1 has been sent; stops the startup timeout extender.
+static STARTUP_DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// How often the startup extender pings systemd, and how much time each ping
+/// asks for. Each ping grants more than the interval, so the deadline never
+/// lapses between pings.
+const STARTUP_EXTEND_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+const STARTUP_EXTEND_BY: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Keep systemd from killing the service while startup is still working.
+///
+/// Opening a large database (rebuilding the WAL index, checkpointing a WAL
+/// left by a crash) can take longer than `TimeoutStartSec`. Being killed
+/// mid-start leaves the database unclean, so the next start does even more
+/// work. While startup runs, this sends EXTEND_TIMEOUT_USEC so systemd keeps
+/// waiting as long as the process is alive and making progress.
+fn spawn_startup_timeout_extender() {
+    if std::env::var_os("NOTIFY_SOCKET").is_none() {
+        return;
+    }
+    let usec = u32::try_from(STARTUP_EXTEND_BY.as_micros()).unwrap_or(u32::MAX);
+    std::thread::Builder::new()
+        .name("sd-startup".into())
+        .spawn(move || {
+            while !STARTUP_DONE.load(std::sync::atomic::Ordering::Acquire) {
+                let _ =
+                    sd_notify::notify(false, &[sd_notify::NotifyState::ExtendTimeoutUsec(usec)]);
+                std::thread::sleep(STARTUP_EXTEND_INTERVAL);
+            }
+        })
+        .expect("failed to spawn startup timeout extender");
 }
 
 /// Spawn a watchdog thread that pings systemd at half the configured interval.
