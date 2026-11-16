@@ -27,6 +27,11 @@ pub struct ServerConfig {
     /// Client request timeout in seconds. Default: 30.
     #[serde(default = "default_request_timeout")]
     pub client_request_timeout_secs: u64,
+    /// Timeout in seconds for NAR and chunk uploads, which can take minutes:
+    /// they wait for an ingest slot, then transfer and ingest up to 8 GiB.
+    /// Default: 3600.
+    #[serde(default = "default_upload_request_timeout")]
+    pub upload_request_timeout_secs: u64,
     /// Expose /metrics endpoint. Default: true.
     /// Set to false to disable the metrics endpoint entirely.
     /// Consider binding to a separate internal address or using a reverse proxy
@@ -45,6 +50,10 @@ fn default_priority() -> u32 {
 
 fn default_request_timeout() -> u64 {
     30
+}
+
+fn default_upload_request_timeout() -> u64 {
+    3600
 }
 
 #[derive(Debug, Deserialize)]

@@ -157,12 +157,15 @@ pub async fn put_narinfo(
     }
 }
 
+/// Largest NAR accepted by `PUT /nar/{file}`.
+pub const NAR_BODY_LIMIT: usize = 8 * 1024 * 1024 * 1024;
+
 /// PUT /nar/{file}
 pub async fn put_nar(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path(file): Path<String>,
-    body: Bytes,
+    body: axum::body::Body,
 ) -> Response {
     if let Err(e) = check_auth(&state, &headers).await {
         return e;
@@ -173,8 +176,25 @@ pub async fn put_nar(
     }
 
     // Acquire a push semaphore permit to bound concurrent ingestion memory.
+    // Take it before reading the body: queued uploads then wait with their
+    // data still on the socket, rather than each holding a full NAR in memory.
     let Ok(permit) = state.push_semaphore.clone().acquire_owned().await else {
         return (StatusCode::SERVICE_UNAVAILABLE, "server shutting down").into_response();
+    };
+
+    let body = match axum::body::to_bytes(body, NAR_BODY_LIMIT).await {
+        Ok(body) => body,
+        Err(e) => {
+            // to_bytes reports an over-limit body as a length-limit error in
+            // its source chain.
+            let too_large = std::error::Error::source(&e)
+                .is_some_and(<dyn std::error::Error>::is::<http_body_util::LengthLimitError>);
+            if too_large {
+                return (StatusCode::PAYLOAD_TOO_LARGE, "NAR too large").into_response();
+            }
+            tracing::debug!("failed to read NAR body for {file}: {e}");
+            return (StatusCode::BAD_REQUEST, "failed to read request body").into_response();
+        },
     };
 
     let nar_path = format!("nar/{file}");
