@@ -361,18 +361,49 @@ async fn metrics_handler(
     )
 }
 
+/// Time budgets for HTTP requests, measured until the response headers.
+#[derive(Clone, Copy)]
+struct RequestTimeouts {
+    /// Every request except uploads.
+    request: std::time::Duration,
+    /// NAR and chunk uploads. These wait for an ingest slot, then transfer
+    /// and ingest the body, which for a large NAR takes minutes; the general
+    /// timeout failed them with 408 while they were still queued.
+    upload: std::time::Duration,
+}
+
+/// Fail a request with 408 once its time budget runs out.
+async fn apply_request_timeout(
+    axum::extract::State(timeouts): axum::extract::State<RequestTimeouts>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+
+    let path = req.uri().path();
+    let is_upload = req.method() == axum::http::Method::PUT
+        && (path.starts_with("/nar/") || path.starts_with("/cas/chunk/"));
+    let budget = if is_upload {
+        timeouts.upload
+    } else {
+        timeouts.request
+    };
+    match tokio::time::timeout(budget, next.run(req)).await {
+        Ok(resp) => resp,
+        Err(_) => axum::http::StatusCode::REQUEST_TIMEOUT.into_response(),
+    }
+}
+
 fn build_http_router(
     state: Arc<AppState>,
     compression_config: config::CompressionConfig,
     enable_metrics: bool,
-    request_timeout: std::time::Duration,
+    timeouts: RequestTimeouts,
 ) -> Router {
     use axum::extract::DefaultBodyLimit;
 
     // 1 MiB limit for narinfo metadata uploads.
     const NARINFO_BODY_LIMIT: usize = 1024 * 1024;
-    // 8 GiB limit for NAR file uploads.
-    const NAR_BODY_LIMIT: usize = 8 * 1024 * 1024 * 1024;
     // 16 MiB limit for CAS chunk uploads.
     const CHUNK_BODY_LIMIT: usize = 16 * 1024 * 1024;
 
@@ -397,7 +428,7 @@ fn build_http_router(
             "/nar/{file}",
             get(api::compat::get_nar)
                 .put(api::upload::put_nar)
-                .layer(DefaultBodyLimit::max(NAR_BODY_LIMIT)),
+                .layer(DefaultBodyLimit::max(api::upload::NAR_BODY_LIMIT)),
         )
         .route("/serve/{hash}/{*tail}", get(api::serve::get_serve))
         .route("/log/{drv}", get(api::logs::get_log))
@@ -431,9 +462,9 @@ fn build_http_router(
             state.metrics.http_request_duration_seconds.clone(),
         ))
         .layer(tower::limit::ConcurrencyLimitLayer::new(max_concurrent))
-        .layer(tower_http::timeout::TimeoutLayer::with_status_code(
-            axum::http::StatusCode::REQUEST_TIMEOUT,
-            request_timeout,
+        .layer(axum::middleware::from_fn_with_state(
+            timeouts,
+            apply_request_timeout,
         ))
         .layer(axum::middleware::map_response(security_headers))
         .with_state(state);
@@ -914,6 +945,7 @@ async fn cmd_serve(cli: Cli) -> color_eyre::Result<()> {
     let tls_key_path: Option<PathBuf>;
     let mut enable_metrics: bool = true;
     let mut request_timeout_secs: u64 = 30;
+    let mut upload_timeout_secs: u64 = 3600;
     let mut priority: u32 = 30;
     let mut store_dir: String = "/nix/store".to_owned();
     let token_store_path: PathBuf;
@@ -1062,6 +1094,7 @@ async fn cmd_serve(cli: Cli) -> color_eyre::Result<()> {
         tls_key_path = config.server.tls_key_path;
         enable_metrics = config.server.enable_metrics;
         request_timeout_secs = config.server.client_request_timeout_secs;
+        upload_timeout_secs = config.server.upload_request_timeout_secs;
         priority = config.server.priority;
     } else {
         bind_addr = cli.bind.unwrap_or_else(|| "127.0.0.1:8080".to_owned());
@@ -1169,12 +1202,15 @@ async fn cmd_serve(cli: Cli) -> color_eyre::Result<()> {
     .max_decoding_message_size(64 * 1024 * 1024)
     .max_encoding_message_size(64 * 1024 * 1024);
 
-    let request_timeout = std::time::Duration::from_secs(request_timeout_secs);
+    let timeouts = RequestTimeouts {
+        request: std::time::Duration::from_secs(request_timeout_secs),
+        upload: std::time::Duration::from_secs(upload_timeout_secs),
+    };
     let app = build_http_router(
         Arc::clone(&state),
         compression_config,
         enable_metrics,
-        request_timeout,
+        timeouts,
     )
     // Route every CacheService method to tonic, so new RPCs work without
     // touching the router. Unknown methods get a proper gRPC Unimplemented.
