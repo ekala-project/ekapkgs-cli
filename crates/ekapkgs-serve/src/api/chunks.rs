@@ -59,21 +59,25 @@ pub async fn put_chunk(
         return (StatusCode::BAD_REQUEST, "digest mismatch").into_response();
     }
 
-    // Store the chunk via the CastoreBackend.
-    if let Some(castore) = state
-        .storage
-        .as_any()
-        .downcast_ref::<crate::storage::castore::CastoreBackend>()
-    {
-        match castore.store_chunk_external(&body) {
-            Ok(_) => (StatusCode::OK, "ok").into_response(),
-            Err(e) => {
-                tracing::error!("chunk store failed: {e}");
-                (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
-            },
-        }
-    } else {
-        (StatusCode::NOT_FOUND, "CAS not available").into_response()
+    // Store the chunk via the CastoreBackend. Storing takes the castore write
+    // lock, so run it on the blocking pool rather than an async worker.
+    let st = Arc::clone(&state);
+    let stored = tokio::task::spawn_blocking(move || {
+        st.storage
+            .as_any()
+            .downcast_ref::<crate::storage::castore::CastoreBackend>()
+            .map(|castore| castore.store_chunk_external(&body))
+    })
+    .await
+    .unwrap_or_else(|e| Some(Err(color_eyre::eyre::eyre!("spawn_blocking join: {e}"))));
+
+    match stored {
+        Some(Ok(_)) => (StatusCode::OK, "ok").into_response(),
+        Some(Err(e)) => {
+            tracing::error!("chunk store failed: {e}");
+            (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
+        },
+        None => (StatusCode::NOT_FOUND, "CAS not available").into_response(),
     }
 }
 
