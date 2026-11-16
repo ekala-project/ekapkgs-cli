@@ -393,7 +393,14 @@ pub async fn get_narinfo(
         }
     }
 
-    let narinfo = match state.storage.get_narinfo(hash) {
+    // Storage lookups hit SQLite and may block on disk; keep them off the
+    // async workers so a slow lookup never stalls connection handling.
+    let st = Arc::clone(&state);
+    let hash_owned = hash.to_owned();
+    let lookup = tokio::task::spawn_blocking(move || st.storage.get_narinfo(&hash_owned))
+        .await
+        .unwrap_or_else(|e| Err(color_eyre::eyre::eyre!("spawn_blocking join: {e}")));
+    let narinfo = match lookup {
         Ok(Some(mut ni)) => {
             // Re-sign with our key if the narinfo doesn't already have our sig.
             let fingerprint = crate::signing::NarInfoSigner::fingerprint(

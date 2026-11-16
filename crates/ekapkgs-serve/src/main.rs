@@ -162,6 +162,10 @@ pub struct AppState {
     /// in-flight compression buffers. Without a bound, concurrent
     /// pushes can exhaust memory and trigger OOM kills.
     pub push_semaphore: Arc<tokio::sync::Semaphore>,
+    /// Semaphore limiting concurrent narinfo uploads waiting on the storage
+    /// write lock. Each waiter occupies a blocking-pool thread; without a
+    /// bound, a burst of pushes can fill the pool behind one long NAR ingest.
+    pub narinfo_write_semaphore: Arc<tokio::sync::Semaphore>,
     /// Path to the history snapshot database (None when no writable storage).
     pub history_db_path: Option<PathBuf>,
 }
@@ -1126,6 +1130,9 @@ async fn cmd_serve(cli: Cli) -> color_eyre::Result<()> {
         // full NAR body plus chunk compression buffers; 4 concurrent
         // uploads cap push memory at ~4 × 200 MiB typical.
         push_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
+        // Narinfo writes are small but serialize on the castore write lock.
+        // Bound the waiters so they cannot fill the blocking pool.
+        narinfo_write_semaphore: Arc::new(tokio::sync::Semaphore::new(16)),
         history_db_path: history_db_path.clone(),
     });
 
