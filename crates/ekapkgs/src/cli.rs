@@ -98,6 +98,12 @@ pub enum Command {
         dry_run: bool,
     },
 
+    /// Lend this machine's Nix builder, or build on a lent one, for a while.
+    Lease {
+        #[command(subcommand)]
+        command: LeaseCommand,
+    },
+
     /// Flake introspection and management.
     Flake {
         #[command(subcommand)]
@@ -234,6 +240,63 @@ pub enum Command {
         /// Shell to generate completions for.
         #[arg(value_enum)]
         shell: clap_complete::Shell,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum LeaseCommand {
+    /// Lend this machine's Nix builder and print a one-time ticket.
+    ///
+    /// The borrower's builds run here as an untrusted Nix user, in the Nix
+    /// sandbox. Until the lease ends, the borrower can also read any path in
+    /// this machine's Nix store. Runs until the lease expires or Ctrl-C.
+    Grant {
+        /// How long the lease lasts (e.g. 30m, 2h, 1d).
+        #[arg(long, default_value = "1h")]
+        ttl: String,
+
+        /// Builds the borrower may run here at once (default: this
+        /// machine's `max-jobs`).
+        #[arg(long, short)]
+        jobs: Option<u32>,
+
+        /// System types to offer (default: `system` and `extra-platforms`).
+        #[arg(long, value_delimiter = ',')]
+        systems: Vec<String>,
+
+        /// System features to offer (default: `system-features`).
+        #[arg(long, value_delimiter = ',')]
+        features: Vec<String>,
+
+        /// Don't use relays; the borrower must reach this machine directly
+        /// (same LAN, VPN, or a forwarded port).
+        #[arg(long)]
+        no_relay: bool,
+    },
+
+    /// Redeem a lease ticket and build on the lender.
+    ///
+    /// With a command after `--`, runs it with the lease as Nix's builder
+    /// and ends the lease when it exits. Without one, prints a `--builders`
+    /// argument and keeps the lease open until Ctrl-C.
+    Connect {
+        /// The ticket from `ekapkgs lease grant`. Omit it or pass `-` to
+        /// read it from stdin, which keeps it out of the process list.
+        ticket: Option<String>,
+
+        /// Unix socket to expose the lease on (default:
+        /// `$XDG_RUNTIME_DIR/ekapkgs/lease-<lender>.sock`).
+        #[arg(long)]
+        socket: Option<std::path::PathBuf>,
+
+        /// Don't use relays; connect to the lender's direct addresses only.
+        #[arg(long)]
+        no_relay: bool,
+
+        /// Command to run with the lease as its builder (e.g.
+        /// `nix build .#foo`).
+        #[arg(last = true, allow_hyphen_values = true)]
+        command: Vec<String>,
     },
 }
 
