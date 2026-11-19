@@ -12,6 +12,7 @@ mod flake;
 mod fuse;
 mod home;
 mod home_units;
+mod lease;
 mod log;
 mod registry;
 mod run;
@@ -48,6 +49,7 @@ pub fn run(command: Command) -> color_eyre::Result<()> {
             dry_run,
         ),
         Command::Home { command } => home::execute(command),
+        Command::Lease { command } => lease::execute(command),
         Command::System { command } => system::execute(command),
         Command::Search { command } => search::execute(command),
         Command::Cache { command } => cache::execute(command),
