@@ -103,6 +103,11 @@ impl BloomFilter {
     pub fn num_hashes(&self) -> u32 {
         self.num_hashes
     }
+
+    /// Size of the bit vector in bytes (the filter's heap footprint).
+    pub fn size_bytes(&self) -> usize {
+        self.bits.len()
+    }
 }
 
 /// Extract two independent u64 hash values from a 32-byte blake3 digest.

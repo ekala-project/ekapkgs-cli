@@ -6,8 +6,8 @@ use ekapkgs_protocol::ekapkgs::v1::{
     B3Digest, CaDirectoryData, CaPathMapping, CacheHistoryRequest, CacheHistoryResponse,
     CacheHistorySnapshot, CacheStatusRequest, CacheStatusResponse, ChunkDownload, ChunkMeta,
     ChunkNegotiateRequest, ChunkNegotiateResponse, Compression, DownloadBatch, DownloadPlan,
-    FileChunkMapping, NarChunk, NegotiateRequest, NegotiateResponse, PathManifestEntry,
-    PushNegotiateRequest, PushNegotiateResponse, StreamNarsRequest,
+    FileChunkMapping, MemoryStats, NarChunk, NegotiateRequest, NegotiateResponse,
+    PathManifestEntry, PushNegotiateRequest, PushNegotiateResponse, StreamNarsRequest,
 };
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
@@ -628,6 +628,8 @@ impl CacheService for NegotiateService {
         resp.gc_paths_evicted = metrics.gc_paths_evicted_total.get();
         resp.gc_bytes_freed = metrics.gc_bytes_freed_total.get();
 
+        resp.memory = Some(memory_stats(&self.state));
+
         Ok(Response::new(resp))
     }
 
@@ -671,6 +673,72 @@ impl CacheService for NegotiateService {
         Ok(Response::new(CacheHistoryResponse {
             snapshots: proto_snapshots,
         }))
+    }
+}
+
+/// Process memory totals plus the sizes of the server's large in-memory
+/// structures.
+fn memory_stats(state: &AppState) -> MemoryStats {
+    use crate::memstats::{ProcessMemory, component, limit};
+
+    let process = ProcessMemory::read();
+    let mut components = Vec::new();
+
+    if let Some(cas) = state
+        .storage
+        .as_any()
+        .downcast_ref::<crate::storage::castore::CastoreBackend>()
+    {
+        components.extend(cas.memory_components());
+    }
+
+    let (entries, bytes) = state.narinfo_cache.usage();
+    components.push(component(
+        "narinfo cache",
+        bytes,
+        entries,
+        format!("capacity {}", crate::NARINFO_CACHE_CAPACITY),
+    ));
+    let (entries, bytes) = state.delta_cache.usage();
+    components.push(component(
+        "delta cache",
+        bytes,
+        entries,
+        format!(
+            "capacity {}",
+            ekapkgs_ui::format::format_bytes(crate::DELTA_CACHE_MAX_BYTES as u64)
+        ),
+    ));
+
+    // In-flight transfers hold whole NARs in memory, but their sizes aren't
+    // tracked, so only the counts are reported.
+    for (name, sem, total) in [
+        (
+            "in-flight NAR serves",
+            &state.nar_semaphore,
+            crate::NAR_PERMITS,
+        ),
+        (
+            "in-flight uploads",
+            &state.push_semaphore,
+            crate::PUSH_PERMITS,
+        ),
+    ] {
+        let in_use = total.saturating_sub(sem.available_permits()) as u64;
+        components.push(limit(
+            name,
+            0,
+            in_use,
+            format!("{in_use} of {total} in use; each may hold a full NAR"),
+        ));
+    }
+
+    MemoryStats {
+        rss_bytes: process.rss,
+        rss_anon_bytes: process.rss_anon,
+        rss_file_bytes: process.rss_file,
+        peak_rss_bytes: process.peak_rss,
+        components,
     }
 }
 

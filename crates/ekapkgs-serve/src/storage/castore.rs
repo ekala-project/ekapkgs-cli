@@ -20,7 +20,7 @@ use ekapkgs_nix::bloom::BloomFilter;
 use ekapkgs_nix::nar::{ChunkReader, NarDirectoryEntry, NarNode, parse_nar, write_nar_streaming};
 use ekapkgs_protocol::ekapkgs::v1::{
     B3Digest, CaDirectory, CaDirectoryEntry, CaDirectoryNode, CaFileNode, CaNode, CaSymlinkNode,
-    ChunkMeta,
+    ChunkMeta, MemoryComponent,
 };
 use prost::Message;
 use rusqlite::{Connection, params};
@@ -48,6 +48,9 @@ const INLINE_THRESHOLD: usize = 1024;
 /// `zstd_level = NULL` means the chunk is either in a pack (`pack_id IS NOT
 /// NULL`) or an incompressible raw file — never attempt compression again.
 const DEFAULT_CHUNK_LEVEL: i32 = 3;
+
+/// How often long-running background tasks log their progress.
+const PROGRESS_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Current database schema. Version 2 moved small chunk data into pack files
 /// and made the blob-keyed tables `WITHOUT ROWID`. Older databases are copied
@@ -310,7 +313,8 @@ impl CastoreBackend {
         chunk_config: ChunkCompressionConfig,
         compress_nars: bool,
     ) -> color_eyre::Result<Self> {
-        tracing::log::info!("Creating CAS store at directory {}", root.display());
+        let started = Instant::now();
+        tracing::info!("Creating CAS store at directory {}", root.display());
         std::fs::create_dir_all(root.join("chunks"))?;
 
         let db_path = root.join("castore.db");
@@ -320,12 +324,21 @@ impl CastoreBackend {
             needs_backfill,
             needs_integrity_check,
         } = open_db(&db_path)?;
+
+        let t = Instant::now();
         let packs = PackStore::open(root.join("packs"))?;
+        tracing::info!(
+            "Opened pack store ({} existing packs) in {:?}",
+            packs.pack_count(),
+            t.elapsed()
+        );
 
         // Migrate: move any existing on-disk directories into SQLite.
         let dirs_path = root.join("dirs");
         if dirs_path.is_dir() {
+            let t = Instant::now();
             migrate_dirs_to_db(&conn, &dirs_path)?;
+            tracing::info!("Directory migration finished in {:?}", t.elapsed());
         }
 
         // Create a pool of lazy read-only connection slots.
@@ -344,6 +357,19 @@ impl CastoreBackend {
             chunk_config.enabled,
             chunk_config.level,
             compress_nars,
+        );
+
+        let pending = |yes: bool| if yes { "pending" } else { "not needed" };
+        tracing::info!(
+            "CAS store opened in {:?} ({num_readers} reader connections, opened on first use); \
+             background tasks: integrity check {}, recovery {}, path_files backfill {}",
+            started.elapsed(),
+            pending(needs_integrity_check),
+            recover_from.as_ref().map_or_else(
+                || "not needed".to_owned(),
+                |p| format!("from {}", p.display())
+            ),
+            pending(needs_backfill && recover_from.is_none()),
         );
 
         let backend = Self {
@@ -389,19 +415,32 @@ impl CastoreBackend {
             .name("cas-warmup".into())
             .spawn(move || {
                 let t = Instant::now();
+                tracing::info!("Background warmup started (bloom filters, storage stats)");
 
                 // During recovery the blooms stay bypassed so recovered rows
                 // are visible as soon as they land; recovery builds them when
                 // it finishes.
                 if backend.recover_from.is_none() {
                     backend.rebuild_blooms();
+                } else {
+                    tracing::info!("Bloom filters deferred until recovery finishes");
                 }
 
                 // Best-effort stats warmup; failures are harmless since
                 // cache_stats() will recompute on demand.
-                if let Ok(stats) = backend.compute_stats() {
-                    *backend.stats_cache.lock().expect("stats cache lock") =
-                        (Instant::now(), stats);
+                let stats_t = Instant::now();
+                match backend.compute_stats() {
+                    Ok(stats) => {
+                        tracing::info!(
+                            "Computed storage stats in {:?}: {} paths, {} chunks",
+                            stats_t.elapsed(),
+                            stats.paths,
+                            stats.chunks
+                        );
+                        *backend.stats_cache.lock().expect("stats cache lock") =
+                            (Instant::now(), stats);
+                    },
+                    Err(e) => tracing::warn!("Computing storage stats failed: {e:#}"),
                 }
 
                 tracing::info!("Background warmup completed in {:?}", t.elapsed());
@@ -537,6 +576,7 @@ impl CastoreBackend {
                 const BATCH_SIZE: usize = 1_000;
                 let mut offset: usize = 0;
                 let mut total: usize = 0;
+                let mut last_log = Instant::now();
 
                 loop {
                     // Read a batch of paths from a reader connection.
@@ -584,6 +624,13 @@ impl CastoreBackend {
 
                     total += batch.len();
                     offset += batch.len();
+                    if last_log.elapsed() >= PROGRESS_INTERVAL {
+                        tracing::info!(
+                            "path_files backfill: {total} paths so far ({:?})",
+                            t.elapsed()
+                        );
+                        last_log = Instant::now();
+                    }
 
                     if batch.len() < BATCH_SIZE {
                         break;
@@ -1027,6 +1074,93 @@ impl CastoreBackend {
         let mut cached = self.stats_cache.lock().expect("stats cache lock");
         // Set timestamp to epoch-equivalent so elapsed() > TTL.
         cached.0 = Instant::now() - CACHE_STATS_TTL;
+    }
+
+    /// Sizes of the large in-memory structures this backend holds, for
+    /// `CacheStatus`. Never blocks: a structure whose lock is held is
+    /// reported as busy instead of waited on.
+    pub fn memory_components(&self) -> Vec<MemoryComponent> {
+        use crate::memstats::{component, limit};
+
+        let mut out = Vec::new();
+
+        // SQLite allocates page cache lazily, up to `cache_size` per
+        // connection. Reads inside the mmap window mostly bypass it.
+        let (writer_cap, writer_detail) = match self.db.try_lock() {
+            Ok(db) => (page_cache_limit(&db), String::new()),
+            Err(_) => (None, "busy, assuming default".to_owned()),
+        };
+        out.push(limit(
+            "SQLite writer page cache",
+            writer_cap.unwrap_or(WRITER_CACHE_BYTES),
+            1,
+            writer_detail,
+        ));
+
+        let (mut open, mut busy, mut reader_cap) = (0u64, 0u64, 0u64);
+        for reader in &self.read_pool {
+            match reader.inner.try_lock() {
+                Ok(slot) => {
+                    if let Some(conn) = slot.as_ref() {
+                        open += 1;
+                        reader_cap += page_cache_limit(conn).unwrap_or(READER_CACHE_BYTES);
+                    }
+                },
+                // Locked readers are in use, so they are open.
+                Err(_) => {
+                    open += 1;
+                    busy += 1;
+                    reader_cap += READER_CACHE_BYTES;
+                },
+            }
+        }
+        out.push(limit(
+            "SQLite reader page caches",
+            reader_cap,
+            open,
+            format!(
+                "{open} of {} connections open, {busy} busy",
+                self.read_pool.len()
+            ),
+        ));
+
+        if let Some(rss) = crate::memstats::mapped_file_rss(&self.db_path) {
+            out.push(component(
+                "castore.db mmap (file-backed)",
+                rss,
+                0,
+                "resident pages of the mmapped database; reclaimable".to_owned(),
+            ));
+        }
+
+        let ready = self.bloom_ready.load(Ordering::Acquire);
+        for (name, bloom) in [
+            ("chunk bloom filter", &self.chunk_bloom),
+            ("path bloom filter", &self.path_bloom),
+        ] {
+            let (bytes, detail) = match bloom.try_lock() {
+                Ok(b) if ready => (b.size_bytes() as u64, String::new()),
+                Ok(b) => (b.size_bytes() as u64, "not built yet".to_owned()),
+                Err(_) => (0, "busy".to_owned()),
+            };
+            out.push(component(name, bytes, 0, detail));
+        }
+
+        let (entries, bytes, detail) = match self.dir_cache.try_lock() {
+            Ok(cache) => {
+                // Keys appear in both the map and the LRU order.
+                let bytes: usize = cache.map.values().map(|d| d.encoded_len() + 2 * 32).sum();
+                (
+                    cache.map.len() as u64,
+                    bytes as u64,
+                    format!("approximate, capacity {}", cache.capacity),
+                )
+            },
+            Err(_) => (0, 0, "busy".to_owned()),
+        };
+        out.push(component("directory cache", bytes, entries, detail));
+
+        out
     }
 
     /// Evict a store path and its exclusively-referenced data.
@@ -1947,6 +2081,7 @@ impl CastoreBackend {
 
     /// Populate a bloom filter with all chunk digests currently in the database.
     fn build_chunk_bloom(&self) -> BloomFilter {
+        let t = Instant::now();
         let db = self.acquire_reader();
         let count: i64 = db
             .query_row("SELECT COUNT(*) FROM chunks", [], |row| row.get(0))
@@ -1972,12 +2107,17 @@ impl CastoreBackend {
             }
         }
 
-        tracing::info!("Built chunk bloom filter with {loaded} entries");
+        tracing::info!(
+            "Built chunk bloom filter with {loaded} entries ({} bytes) in {:?}",
+            bloom.size_bytes(),
+            t.elapsed()
+        );
         bloom
     }
 
     /// Build a bloom filter from all store path hashes in cas_paths.
     fn build_path_bloom(&self) -> BloomFilter {
+        let t = Instant::now();
         let db = self.acquire_reader();
         let count: i64 = db
             .query_row("SELECT COUNT(*) FROM cas_paths", [], |row| row.get(0))
@@ -2002,7 +2142,11 @@ impl CastoreBackend {
             loaded += 1;
         }
 
-        tracing::info!("Built path bloom filter with {loaded} entries");
+        tracing::info!(
+            "Built path bloom filter with {loaded} entries ({} bytes) in {:?}",
+            bloom.size_bytes(),
+            t.elapsed()
+        );
         bloom
     }
 
@@ -2464,6 +2608,27 @@ const WRITER_PRAGMAS: &str = "PRAGMA journal_mode=WAL;PRAGMA synchronous=FULL;PR
                               cache_size=-65536;PRAGMA mmap_size=1073741824;PRAGMA \
                               journal_size_limit=67108864";
 
+/// Page cache limit set by `WRITER_PRAGMAS` (`cache_size=-65536`).
+const WRITER_CACHE_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Page cache limit set by `open_db_reader` (`cache_size=-131072`).
+const READER_CACHE_BYTES: u64 = 128 * 1024 * 1024;
+
+/// The page cache limit of `conn` in bytes, from `PRAGMA cache_size`
+/// (negative values are KiB, positive values are pages).
+fn page_cache_limit(conn: &Connection) -> Option<u64> {
+    let size: i64 = conn
+        .query_row("PRAGMA cache_size", [], |row| row.get(0))
+        .ok()?;
+    if size < 0 {
+        return Some(size.unsigned_abs() * 1024);
+    }
+    let page_size: i64 = conn
+        .query_row("PRAGMA page_size", [], |row| row.get(0))
+        .ok()?;
+    Some(size.unsigned_abs() * page_size.unsigned_abs())
+}
+
 /// Marker file written by the background integrity check when it finds
 /// corruption. Its presence makes the next startup move the database aside.
 fn recovery_marker_path(db_path: &Path) -> PathBuf {
@@ -2512,6 +2677,13 @@ fn replace_with_fresh_db(path: &Path, label: &str) -> color_eyre::Result<OpenDbR
             recover_from_marker_path(path),
             source.as_os_str().as_encoded_bytes(),
         )?;
+        tracing::info!(
+            "Created a fresh database at {}; rows from {} will be copied in the background",
+            path.display(),
+            source.display()
+        );
+    } else {
+        tracing::info!("Created a fresh database at {}", path.display());
     }
     Ok(OpenDbResult {
         conn,
@@ -2554,11 +2726,11 @@ fn stored_schema_version(conn: &Connection) -> i64 {
 /// back in the background: a previous check found corruption (recovery
 /// marker present), or the database uses an older schema.
 fn open_db(path: &Path) -> color_eyre::Result<OpenDbResult> {
-    tracing::log::info!("Opening database at {}", path.display());
+    log_db_file_sizes(path);
 
     let marker = recovery_marker_path(path);
     if marker.exists() {
-        tracing::log::warn!(
+        tracing::warn!(
             "recovery marker {} found — moving corrupt database aside",
             marker.display()
         );
@@ -2567,11 +2739,15 @@ fn open_db(path: &Path) -> color_eyre::Result<OpenDbResult> {
         return Ok(result);
     }
 
+    // SQLite reads all of a WAL left by the previous instance while opening.
+    let t = Instant::now();
     let conn = Connection::open(path)?;
     conn.execute_batch(WRITER_PRAGMAS)?;
+    tracing::info!("Opened database in {:?}", t.elapsed());
     checkpoint_leftover_wal(&conn, path);
 
     let version = stored_schema_version(&conn);
+    tracing::info!("Database schema version {version} (current {SCHEMA_VERSION})");
     if version > SCHEMA_VERSION {
         return Err(color_eyre::eyre::eyre!(
             "{} has schema version {version}, but this ekapkgs-serve only supports up to \
@@ -2580,25 +2756,49 @@ fn open_db(path: &Path) -> color_eyre::Result<OpenDbResult> {
         ));
     }
     if version == 1 {
-        tracing::log::warn!(
+        tracing::warn!(
             "{} uses schema v1 — copying it into a v{SCHEMA_VERSION} database in the background",
             path.display()
         );
         // Bring the old file up to the last v1 layout so the copy can read it,
         // and fold its WAL into the main file before moving it.
+        let t = Instant::now();
         migrate_v1_columns(&conn)?;
+        tracing::info!("v1 migration: updated columns in {:?}", t.elapsed());
+        let t = Instant::now();
         conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
+        tracing::info!(
+            "v1 migration: checkpointed WAL into the old database in {:?}",
+            t.elapsed()
+        );
         drop(conn);
         return replace_with_fresh_db(path, "v1");
     }
 
+    let t = Instant::now();
     create_tables(&conn)?;
+    tracing::debug!("Ensured tables exist in {:?}", t.elapsed());
 
     // Recovery drops the GC indexes while it copies and rebuilds them at the
     // end; building them here on a large table would stall startup.
     let recover_from = pending_recovery_source(path);
     if recover_from.is_none() {
+        let missing = if db_is_empty(&conn) {
+            Vec::new()
+        } else {
+            missing_gc_indexes(&conn)
+        };
+        if !missing.is_empty() {
+            tracing::info!(
+                "Building missing GC indexes ({}) — this reads the whole table",
+                missing.join(", ")
+            );
+        }
+        let t = Instant::now();
         conn.execute_batch(GC_INDEXES)?;
+        if !missing.is_empty() {
+            tracing::info!("Built GC indexes in {:?}", t.elapsed());
+        }
     }
 
     // A brand-new database has no rows to verify. Otherwise, a missing or
@@ -2622,6 +2822,9 @@ fn open_db(path: &Path) -> color_eyre::Result<OpenDbResult> {
     mark_dirty(&conn);
 
     let needs_backfill = recover_from.is_none() && path_files_needs_backfill(&conn);
+    if needs_backfill {
+        tracing::info!("path_files is empty — it will be backfilled in the background");
+    }
 
     Ok(OpenDbResult {
         conn,
@@ -2656,7 +2859,7 @@ fn move_db_aside(path: &Path, label: &str) -> color_eyre::Result<Option<PathBuf>
         let src = PathBuf::from(format!("{path_str}{suffix}"));
         if src.exists() {
             let dst = PathBuf::from(format!("{path_str}{suffix}.{label}-{ts}"));
-            tracing::log::warn!("renaming {} -> {}", src.display(), dst.display());
+            tracing::warn!("renaming {} -> {}", src.display(), dst.display());
             std::fs::rename(&src, &dst)?;
             if suffix.is_empty() {
                 corrupt_main = Some(dst);
@@ -2744,6 +2947,48 @@ fn mark_dirty(conn: &Connection) {
     );
 }
 
+/// Logs how far the copy of one table has got, at most every
+/// `PROGRESS_INTERVAL`.
+struct TableProgress {
+    table: &'static str,
+    started: Instant,
+    last_log: Instant,
+}
+
+impl TableProgress {
+    fn start(table: &'static str) -> Self {
+        tracing::info!("recovery: copying {table}");
+        let now = Instant::now();
+        Self {
+            table,
+            started: now,
+            last_log: now,
+        }
+    }
+
+    /// Called after each committed batch with the running totals.
+    fn batch(&mut self, rows: u64, errors: u64) {
+        if self.last_log.elapsed() < PROGRESS_INTERVAL {
+            return;
+        }
+        let secs = self.started.elapsed().as_secs_f64().max(1.0);
+        tracing::info!(
+            "recovery: {}: {rows} rows copied so far ({:.0} rows/s, {errors} errors)",
+            self.table,
+            rows as f64 / secs,
+        );
+        self.last_log = Instant::now();
+    }
+
+    fn finish(self, rows: u64) {
+        tracing::info!(
+            "recovery: copied {rows} {} rows in {:?}",
+            self.table,
+            self.started.elapsed()
+        );
+    }
+}
+
 struct RecoveryStats {
     paths: u64,
     chunks: u64,
@@ -2760,6 +3005,49 @@ const GC_INDEXES: &str = "CREATE INDEX IF NOT EXISTS idx_path_files_file_digest 
      CREATE INDEX IF NOT EXISTS idx_file_chunks_digest ON file_chunks(chunk_digest);
      CREATE INDEX IF NOT EXISTS idx_cas_paths_last_access ON cas_paths(last_access);";
 
+/// Names of the `GC_INDEXES` that don't exist yet.
+fn missing_gc_indexes(conn: &Connection) -> Vec<&'static str> {
+    [
+        "idx_path_files_file_digest",
+        "idx_file_chunks_digest",
+        "idx_cas_paths_last_access",
+    ]
+    .into_iter()
+    .filter(|name| {
+        !conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?1)",
+                params![name],
+                |row| row.get::<_, bool>(0),
+            )
+            .unwrap_or(true)
+    })
+    .collect()
+}
+
+/// Log the sizes of the database and its WAL before opening them. A large WAL
+/// left by an unclean shutdown is read on open and then checkpointed.
+fn log_db_file_sizes(path: &Path) {
+    let size = |p: &Path| std::fs::metadata(p).ok().map(|m| m.len());
+    let wal = wal_path(path);
+    let fb = ekapkgs_ui::format::format_bytes;
+    match size(path) {
+        Some(db) => tracing::info!(
+            "Opening database at {} ({}, WAL {})",
+            path.display(),
+            fb(db),
+            size(&wal).map_or_else(|| "absent".to_owned(), fb)
+        ),
+        None => tracing::info!("Opening database at {} (new)", path.display()),
+    }
+    if size(&wal).is_some_and(|w| w > 256 * 1024 * 1024) {
+        tracing::warn!(
+            "WAL is large; SQLite reads all of it while opening, which can take minutes on slow \
+             disks"
+        );
+    }
+}
+
 /// Best-effort recovery: open the source DB (corrupt, or an older schema)
 /// read-only, iterate each table, and copy readable rows into the live
 /// database. Rows on corrupt pages fail to read and are skipped. Inserts are
@@ -2774,6 +3062,10 @@ fn recover_from_corrupt(
     backend: &CastoreBackend,
     source: &Path,
 ) -> color_eyre::Result<RecoveryStats> {
+    tracing::info!(
+        "recovery: dropping GC indexes and raising the writer page cache to 512 MiB until the \
+         copy finishes"
+    );
     {
         let db = backend.db.lock().expect("db lock");
         db.execute_batch(
@@ -2793,6 +3085,7 @@ fn recover_from_corrupt(
     if !db.is_autocommit() {
         let _ = db.execute_batch("ROLLBACK");
     }
+    tracing::info!("recovery: rebuilding GC indexes");
     db.execute_batch(GC_INDEXES)?;
     db.execute_batch(WRITER_PRAGMAS)?;
     tracing::info!("recovery: rebuilt GC indexes in {:?}", t.elapsed());
@@ -2852,6 +3145,7 @@ fn copy_rows_from_corrupt(
          chunks"
     };
 
+    let mut progress = TableProgress::start("chunks");
     if let Ok(mut stmt) = src.prepare(chunk_query) {
         if let Ok(mut rows) = stmt.query([]) {
             let mut buf: Vec<ChunkRow> = Vec::with_capacity(BATCH_SIZE);
@@ -2958,15 +3252,17 @@ fn copy_rows_from_corrupt(
                     // Pack data must be durable before the rows that point at it.
                     backend.packs.sync()?;
                     db.execute_batch("COMMIT")?;
-                    tracing::debug!("recovery: {} chunks so far", stats.chunks);
+                    progress.batch(stats.chunks, stats.errors);
                 }
             }
         }
     }
+    progress.finish(stats.chunks);
 
     // --- Recover file_chunks table ---
     type FileChunkRow = (Vec<u8>, i64, Vec<u8>, i64);
 
+    let mut progress = TableProgress::start("file_chunks");
     if let Ok(mut stmt) =
         src.prepare("SELECT file_digest, chunk_index, chunk_digest, chunk_size FROM file_chunks")
     {
@@ -3036,14 +3332,17 @@ fn copy_rows_from_corrupt(
                         }
                     }
                     db.execute_batch("COMMIT")?;
+                    progress.batch(stats.file_chunks, stats.errors);
                 }
             }
         }
     }
+    progress.finish(stats.file_chunks);
 
     // --- Recover directories table ---
     type DirRow = (Vec<u8>, Vec<u8>);
 
+    let mut progress = TableProgress::start("directories");
     if let Ok(mut stmt) = src.prepare("SELECT digest, data FROM directories") {
         if let Ok(mut rows) = stmt.query([]) {
             let mut buf: Vec<DirRow> = Vec::with_capacity(BATCH_SIZE);
@@ -3105,10 +3404,12 @@ fn copy_rows_from_corrupt(
                         }
                     }
                     db.execute_batch("COMMIT")?;
+                    progress.batch(stats.directories, stats.errors);
                 }
             }
         }
     }
+    progress.finish(stats.directories);
 
     // --- Recover cas_paths table ---
     #[allow(clippy::type_complexity)]
@@ -3126,6 +3427,7 @@ fn copy_rows_from_corrupt(
         i64,
     );
 
+    let mut progress = TableProgress::start("cas_paths");
     if let Ok(mut stmt) = src.prepare(
         "SELECT hash, store_path, nar_hash, nar_size, root_node, references_, signatures, ca, \
          deriver, added_at, last_access FROM cas_paths",
@@ -3254,10 +3556,12 @@ fn copy_rows_from_corrupt(
                         }
                     }
                     db.execute_batch("COMMIT")?;
+                    progress.batch(stats.paths, stats.errors);
                 }
             }
         }
     }
+    progress.finish(stats.paths);
 
     Ok(stats)
 }
@@ -3490,6 +3794,56 @@ mod tests {
             params![vec![0u8; 32]],
         )
         .unwrap();
+    }
+
+    #[test]
+    fn page_cache_limits_match_pragmas() {
+        let (dir, _backend) = setup_backend();
+        let db_path = dir.path().join("castore.db");
+        let writer = Connection::open(&db_path).unwrap();
+        writer.execute_batch(WRITER_PRAGMAS).unwrap();
+        assert_eq!(page_cache_limit(&writer), Some(WRITER_CACHE_BYTES));
+        let reader = open_db_reader(&db_path).unwrap();
+        assert_eq!(page_cache_limit(&reader), Some(READER_CACHE_BYTES));
+    }
+
+    #[test]
+    fn memory_components_report_caches_and_blooms() {
+        let (_dir, backend) = setup_backend();
+        let components = backend.memory_components();
+        let get = |name: &str| {
+            components
+                .iter()
+                .find(|c| c.name == name)
+                .unwrap_or_else(|| panic!("missing component {name}"))
+        };
+        let writer = get("SQLite writer page cache");
+        assert!(writer.is_limit);
+        assert_eq!(writer.bytes, WRITER_CACHE_BYTES);
+        // No reader has been used yet, so none are open.
+        assert_eq!(get("SQLite reader page caches").bytes, 0);
+        assert!(get("chunk bloom filter").bytes > 0);
+        assert_eq!(get("directory cache").entries, 0);
+    }
+
+    #[test]
+    fn backfill_check_uses_row_existence() {
+        let conn = Connection::open_in_memory().unwrap();
+        create_tables(&conn).unwrap();
+        assert!(!path_files_needs_backfill(&conn));
+        conn.execute(
+            "INSERT INTO cas_paths (hash, store_path, nar_hash, nar_size, root_node, added_at) \
+             VALUES ('h', '/nix/store/h-x', 'sha256:x', 1, x'00', 0)",
+            [],
+        )
+        .unwrap();
+        assert!(path_files_needs_backfill(&conn));
+        conn.execute(
+            "INSERT INTO path_files (path_hash, file_digest) VALUES ('h', x'00')",
+            [],
+        )
+        .unwrap();
+        assert!(!path_files_needs_backfill(&conn));
     }
 
     #[test]
