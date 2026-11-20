@@ -32,7 +32,7 @@ pub struct GrantOptions {
     pub jobs: Option<u32>,
     pub systems: Vec<String>,
     pub features: Vec<String>,
-    pub relay: bool,
+    pub relays: super::Relays,
 }
 
 /// The program each borrower session runs, fed the session's bytes on
@@ -160,8 +160,8 @@ pub fn execute(opts: GrantOptions) -> color_eyre::Result<()> {
 
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {
-        let endpoint = super::bind_endpoint(opts.relay, vec![wire::ALPN.to_vec()]).await?;
-        super::wait_for_address(&endpoint, opts.relay).await;
+        let endpoint = super::bind_endpoint(&opts.relays, vec![wire::ALPN.to_vec()]).await?;
+        super::wait_for_address(&endpoint, &opts.relays).await;
 
         let secret = generate_secret()?;
         // A few spare sessions for the queries Nix makes besides builds.

@@ -17,14 +17,15 @@ use tokio::net::UnixListener;
 use tokio::task::JoinSet;
 
 use super::ticket::Ticket;
-use super::wire;
+use super::{Relays, wire};
 
 /// What `ekapkgs lease connect` was asked for.
 pub struct ConnectOptions {
     /// The ticket, or `None`/`-` to read it from stdin.
     pub ticket: Option<String>,
     pub socket: Option<PathBuf>,
-    pub relay: bool,
+    /// Relays to use, or `None` for the ones in the ticket.
+    pub relays: Option<Relays>,
     /// Command to run with the lease as its Nix builder.
     pub command: Vec<String>,
 }
@@ -44,9 +45,11 @@ pub fn execute(opts: ConnectOptions) -> color_eyre::Result<()> {
         None => default_socket_path(&ticket)?,
     };
 
+    let relays = opts.relays.unwrap_or_else(|| ticket_relays(&ticket));
+
     let rt = tokio::runtime::Runtime::new()?;
     let status = rt.block_on(async {
-        let endpoint = super::bind_endpoint(opts.relay, Vec::new()).await?;
+        let endpoint = super::bind_endpoint(&relays, Vec::new()).await?;
         tracing::info!("Connecting to lender {}...", ticket.addr.id.fmt_short());
         let conn = endpoint
             .connect(ticket.addr.clone(), wire::ALPN)
@@ -163,6 +166,18 @@ async fn proxy(
     result
 }
 
+/// The relays the lender is reachable through, so the borrower doesn't
+/// need to pass the lender's `--relay` again. A lender without relays
+/// can only be reached directly.
+fn ticket_relays(ticket: &Ticket) -> Relays {
+    let urls: Vec<_> = ticket.addr.relay_urls().cloned().collect();
+    if urls.is_empty() {
+        Relays::Disabled
+    } else {
+        Relays::Custom(urls)
+    }
+}
+
 fn read_ticket(arg: Option<&str>) -> color_eyre::Result<String> {
     match arg {
         Some(ticket) if ticket != "-" => Ok(ticket.to_owned()),
@@ -227,5 +242,36 @@ fn warn_if_untrusted() {
             "You are not a trusted Nix user here, so the daemon will ignore the lease's \
              `builders` setting. Add yourself to `trusted-users` to build on the lease."
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use iroh::{EndpointAddr, RelayUrl, SecretKey};
+
+    use super::*;
+
+    fn ticket(addr: EndpointAddr) -> Ticket {
+        Ticket {
+            addr,
+            secret: String::new(),
+            expires_at: 0,
+            systems: Vec::new(),
+            features: Vec::new(),
+            jobs: 1,
+        }
+    }
+
+    #[test]
+    fn borrower_uses_the_ticket_relays() {
+        let id = SecretKey::from_bytes(&[2u8; 32]).public();
+        assert_eq!(
+            ticket_relays(&ticket(EndpointAddr::new(id))),
+            Relays::Disabled
+        );
+
+        let url: RelayUrl = "https://relay.example.com".parse().unwrap();
+        let addr = EndpointAddr::new(id).with_relay_url(url.clone());
+        assert_eq!(ticket_relays(&ticket(addr)), Relays::Custom(vec![url]));
     }
 }
