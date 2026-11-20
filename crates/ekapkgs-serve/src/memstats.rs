@@ -115,8 +115,16 @@ mod tests {
 
     #[test]
     fn parses_proc_status() {
-        let status = "Name:\tekapkgs-serve\nVmHWM:\t  204800 kB\nVmRSS:\t  102400 kB\nRssAnon:\t   81920 \
-             kB\nRssFile:\t   20480 kB\nRssShmem:\t       0 kB\n";
+        let status = [
+            "Name:\tekapkgs-serve",
+            "VmHWM:\t  204800 kB",
+            "VmRSS:\t  102400 kB",
+            "RssAnon:\t   81920 kB",
+            "RssFile:\t   20480 kB",
+            "RssShmem:\t       0 kB",
+        ]
+        .join("\n");
+        let status = status.as_str();
         assert_eq!(
             ProcessMemory::parse_status(status),
             ProcessMemory {
