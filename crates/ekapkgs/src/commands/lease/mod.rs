@@ -15,8 +15,8 @@ mod wire;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use color_eyre::eyre::{bail, eyre};
-use iroh::Endpoint;
 use iroh::endpoint::{RelayMode, presets};
+use iroh::{Endpoint, RelayUrl};
 
 use crate::cli::LeaseCommand;
 
@@ -27,38 +27,78 @@ pub fn execute(command: LeaseCommand) -> color_eyre::Result<()> {
             jobs,
             systems,
             features,
+            relays,
             no_relay,
         } => grant::execute(grant::GrantOptions {
             ttl: parse_duration(&ttl)?,
             jobs,
             systems,
             features,
-            relay: !no_relay,
+            relays: Relays::from_args(&relays, no_relay)?.unwrap_or(Relays::Default),
         }),
         LeaseCommand::Connect {
             ticket,
             socket,
+            relays,
             no_relay,
             command,
         } => connect::execute(connect::ConnectOptions {
             ticket,
             socket,
-            relay: !no_relay,
+            relays: Relays::from_args(&relays, no_relay)?,
             command,
         }),
     }
 }
 
+/// Which relay servers an endpoint uses to get through NAT.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Relays {
+    /// The public n0 relays.
+    Default,
+    /// No relays: direct addresses only.
+    Disabled,
+    /// These relays, e.g. a self-hosted `iroh-relay`.
+    Custom(Vec<RelayUrl>),
+}
+
+impl Relays {
+    /// The relays chosen on the command line, or `None` if neither
+    /// `--relay` nor `--no-relay` was given.
+    fn from_args(urls: &[String], no_relay: bool) -> color_eyre::Result<Option<Self>> {
+        if no_relay {
+            return Ok(Some(Self::Disabled));
+        }
+        if urls.is_empty() {
+            return Ok(None);
+        }
+        let urls = urls
+            .iter()
+            .map(|url| {
+                url.parse::<RelayUrl>()
+                    .map_err(|e| eyre!("invalid relay URL `{url}`: {e}"))
+            })
+            .collect::<color_eyre::Result<_>>()?;
+        Ok(Some(Self::Custom(urls)))
+    }
+
+    fn enabled(&self) -> bool {
+        *self != Self::Disabled
+    }
+
+    fn mode(&self) -> RelayMode {
+        match self {
+            Self::Default => RelayMode::Default,
+            Self::Disabled => RelayMode::Disabled,
+            Self::Custom(urls) => RelayMode::custom(urls.iter().cloned()),
+        }
+    }
+}
+
 /// Bind an iroh endpoint. It never publishes its address to a discovery
-/// service: the lender's address travels in the ticket. With `relay`, it
-/// uses the default relays to get through NAT.
-async fn bind_endpoint(relay: bool, alpns: Vec<Vec<u8>>) -> color_eyre::Result<Endpoint> {
-    let relay_mode = if relay {
-        RelayMode::Default
-    } else {
-        RelayMode::Disabled
-    };
-    let mut builder = Endpoint::builder(presets::Minimal).relay_mode(relay_mode);
+/// service: the lender's address travels in the ticket.
+async fn bind_endpoint(relays: &Relays, alpns: Vec<Vec<u8>>) -> color_eyre::Result<Endpoint> {
+    let mut builder = Endpoint::builder(presets::Minimal).relay_mode(relays.mode());
     if !alpns.is_empty() {
         builder = builder.alpns(alpns);
     }
@@ -70,9 +110,9 @@ async fn bind_endpoint(relay: bool, alpns: Vec<Vec<u8>>) -> color_eyre::Result<E
 
 /// Wait until the endpoint knows enough addresses to be worth putting in a
 /// ticket: a relay when relays are on, otherwise a direct address.
-async fn wait_for_address(endpoint: &Endpoint, relay: bool) {
+async fn wait_for_address(endpoint: &Endpoint, relays: &Relays) {
     const TIMEOUT: Duration = Duration::from_secs(20);
-    if relay {
+    if relays.enabled() {
         if tokio::time::timeout(TIMEOUT, endpoint.online())
             .await
             .is_err()
@@ -154,10 +194,10 @@ mod tests {
 
     /// A lender whose sessions run `cat`, so each stream echoes.
     async fn echo_lender(secret: [u8; 32], ttl: Duration) -> (Endpoint, Arc<Lease>) {
-        let endpoint = bind_endpoint(false, vec![wire::ALPN.to_vec()])
+        let endpoint = bind_endpoint(&Relays::Disabled, vec![wire::ALPN.to_vec()])
             .await
             .unwrap();
-        wait_for_address(&endpoint, false).await;
+        wait_for_address(&endpoint, &Relays::Disabled).await;
         let session = SessionCommand {
             program: "cat".into(),
             args: Vec::new(),
@@ -184,13 +224,13 @@ mod tests {
         }));
 
         // A wrong secret is refused and doesn't use up the lease.
-        let intruder = bind_endpoint(false, Vec::new()).await.unwrap();
+        let intruder = bind_endpoint(&Relays::Disabled, Vec::new()).await.unwrap();
         let conn = intruder.connect(addr.clone(), wire::ALPN).await.unwrap();
         let err = wire::redeem(&conn, &[0u8; 32]).await.unwrap_err();
         assert!(err.to_string().contains("rejected"), "{err}");
 
         // The borrower redeems it and runs two sessions at once.
-        let borrower = bind_endpoint(false, Vec::new()).await.unwrap();
+        let borrower = bind_endpoint(&Relays::Disabled, Vec::new()).await.unwrap();
         let conn = borrower.connect(addr.clone(), wire::ALPN).await.unwrap();
         wire::redeem(&conn, &secret).await.unwrap();
         let (a, b) = tokio::join!(echo(&conn, b"first session"), echo(&conn, b"second"));
@@ -203,7 +243,7 @@ mod tests {
         assert_eq!(echo(&again, b"reconnected").await, b"reconnected");
 
         // Another machine holding the same ticket may not.
-        let other = bind_endpoint(false, Vec::new()).await.unwrap();
+        let other = bind_endpoint(&Relays::Disabled, Vec::new()).await.unwrap();
         let conn = other.connect(addr, wire::ALPN).await.unwrap();
         let err = wire::redeem(&conn, &secret).await.unwrap_err();
         assert!(err.to_string().contains("already redeemed"), "{err}");
@@ -219,7 +259,7 @@ mod tests {
         let addr = lender.addr();
         let server = tokio::spawn(serve(lender, lease, std::future::pending()));
 
-        let borrower = bind_endpoint(false, Vec::new()).await.unwrap();
+        let borrower = bind_endpoint(&Relays::Disabled, Vec::new()).await.unwrap();
         let conn = borrower.connect(addr, wire::ALPN).await.unwrap();
         wire::redeem(&conn, &secret).await.unwrap();
 
@@ -235,6 +275,21 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(5), conn.closed())
             .await
             .expect("connection still open after the lease ended");
+    }
+
+    #[test]
+    fn relay_args() {
+        assert_eq!(Relays::from_args(&[], false).unwrap(), None);
+        assert_eq!(
+            Relays::from_args(&[], true).unwrap(),
+            Some(Relays::Disabled)
+        );
+        let url = "https://relay.example.com".to_owned();
+        assert_eq!(
+            Relays::from_args(std::slice::from_ref(&url), false).unwrap(),
+            Some(Relays::Custom(vec![url.parse().unwrap()]))
+        );
+        assert!(Relays::from_args(&["not a url".to_owned()], false).is_err());
     }
 
     #[test]

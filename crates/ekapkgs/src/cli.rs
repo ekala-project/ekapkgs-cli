@@ -268,6 +268,12 @@ pub enum LeaseCommand {
         #[arg(long, value_delimiter = ',')]
         features: Vec<String>,
 
+        /// Relay server to use instead of the public n0 relays, e.g. a
+        /// self-hosted `iroh-relay`. Repeat for more than one. The ticket
+        /// carries them, so the borrower uses them too.
+        #[arg(long = "relay", value_name = "URL", conflicts_with = "no_relay")]
+        relays: Vec<String>,
+
         /// Don't use relays; the borrower must reach this machine directly
         /// (same LAN, VPN, or a forwarded port).
         #[arg(long)]
@@ -288,6 +294,11 @@ pub enum LeaseCommand {
         /// `$XDG_RUNTIME_DIR/ekapkgs/lease-<lender>.sock`).
         #[arg(long)]
         socket: Option<std::path::PathBuf>,
+
+        /// Relay server to use (default: the relays listed in the ticket).
+        /// Repeat for more than one.
+        #[arg(long = "relay", value_name = "URL", conflicts_with = "no_relay")]
+        relays: Vec<String>,
 
         /// Don't use relays; connect to the lender's direct addresses only.
         #[arg(long)]
