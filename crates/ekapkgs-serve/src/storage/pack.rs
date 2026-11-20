@@ -74,6 +74,11 @@ impl PackStore {
         })
     }
 
+    /// Number of packs created so far (ids are sequential from 1).
+    pub fn pack_count(&self) -> u32 {
+        self.writer.lock().expect("pack writer lock").next_id - 1
+    }
+
     fn pack_path(&self, id: u32) -> PathBuf {
         pack_path(&self.dir, id)
     }

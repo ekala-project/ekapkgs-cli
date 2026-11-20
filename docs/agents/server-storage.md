@@ -100,13 +100,23 @@ Each tier falls back to the next on failure or if the server doesn't support it.
 
 ### Startup integrity and crash recovery
 
-Startup never scans the database, so systemd's start timeout can't be hit on a large cache.
+Startup never scans the database, so systemd's start timeout can't be hit on a large cache. Startup checks use `EXISTS` instead of `COUNT(*)`; the only slow steps left are SQLite reading a large WAL on open and building a missing GC index, and both are logged with their size or duration.
 
 - `_meta.clean_shutdown` is set to `0` at startup and `1` in `on_shutdown` (via `CastoreBackend::shutdown`). The server handles SIGTERM/SIGINT by draining connections (10s cap) and then calling `on_shutdown`.
 - If the previous run was unclean, `spawn_integrity_check` runs `PRAGMA quick_check` on a read-only connection in the background while the server keeps serving. `mark_clean_shutdown` is skipped until that check passes, so an interrupted check runs again on the next start.
 - If corruption is found, it writes `castore.db.needs-recovery` and exits with status 75. On restart, `open_db` sees the marker, renames the DB to `castore.db.corrupt-<ts>`, starts with an empty DB, and `spawn_recovery` copies back whatever rows it can read.
 - The copy source is recorded in `castore.db.recover-from`. If the server restarts before the copy finishes, it resumes on the next start (inserts are `OR IGNORE`, and packed chunks are checked before appending). The marker is removed when the copy completes.
 - While recovery runs: the GC-only indexes (`GC_INDEXES`) are dropped and rebuilt at the end, the writer uses a 512 MiB cache and `synchronous=NORMAL`, the bloom filters stay bypassed so recovered rows are served immediately, and `path_files_ready` stays `false` so GC and the `path_files` backfill don't run.
+
+### Startup logging
+
+Each step of `CastoreBackend::new`/`open_db` logs at info level: database and WAL size, open time, schema version, missing GC indexes being built, clean-shutdown state, pack count, and a summary of which background tasks will run. Background tasks (warmup, integrity check, backfill, recovery) log when they start and finish. Backfill and recovery also log progress every 30 s (`PROGRESS_INTERVAL`, `TableProgress`).
+
+### Memory introspection
+
+`CacheStatus` returns `MemoryStats`, and `ekapkgs cache status` prints it. It has process totals from `/proc/self/status` (RSS, anonymous, file-backed, peak) and one `MemoryComponent` per large structure (`CastoreBackend::memory_components` plus the narinfo/delta caches and in-flight semaphore counts in `api/negotiate.rs`). Locks are only `try_lock`ed, so a busy structure shows as busy instead of blocking the RPC.
+
+`unsafe_code` is forbidden, so SQLite's own allocator stats (`sqlite3_db_status`) aren't available. SQLite page caches are reported as their `PRAGMA cache_size` limits (`is_limit`): 64 MiB for the writer (512 MiB during recovery) and 128 MiB for each reader connection that has been opened. The mmapped database's resident pages come from `/proc/self/smaps`.
 
 ### GC support
 

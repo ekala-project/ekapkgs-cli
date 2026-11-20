@@ -140,6 +140,36 @@ message CacheStatusResponse {
   uint64 gc_runs = 8;
   uint64 gc_paths_evicted = 9;
   uint64 gc_bytes_freed = 10;
+
+  // Server memory usage, for diagnosing high RSS.
+  MemoryStats memory = 18;
+}
+
+message MemoryStats {
+  // Process totals from /proc/self/status (0 when unavailable).
+  // Resident set size.
+  uint64 rss_bytes = 1;
+  // Anonymous memory (heap, thread stacks, SQLite page caches).
+  uint64 rss_anon_bytes = 2;
+  // File-backed pages (mmapped database, binary). Reclaimable by the kernel.
+  uint64 rss_file_bytes = 3;
+  // Peak resident set size since start.
+  uint64 peak_rss_bytes = 4;
+  // Large in-memory structures held by the server.
+  repeated MemoryComponent components = 5;
+}
+
+message MemoryComponent {
+  // Human-readable name, e.g. "chunk bloom filter".
+  string name = 1;
+  // Bytes used, or the upper bound when `is_limit` is set.
+  uint64 bytes = 2;
+  // Number of entries or items, when meaningful (0 otherwise).
+  uint64 entries = 3;
+  // `bytes` is a configured maximum, not a measurement.
+  bool is_limit = 4;
+  // Extra context, e.g. "3 of 16 connections open".
+  string detail = 5;
 }
 
 message CacheHistoryRequest {}

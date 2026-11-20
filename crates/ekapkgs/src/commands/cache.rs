@@ -184,7 +184,56 @@ fn cmd_status(cache_name: Option<&str>) -> color_eyre::Result<()> {
         );
     }
 
+    if let Some(memory) = &response.memory {
+        println!();
+        print_memory(memory);
+    }
+
     Ok(())
+}
+
+/// Print the server's memory totals and per-structure breakdown.
+fn print_memory(memory: &ekapkgs_protocol::ekapkgs::v1::MemoryStats) {
+    let fb = ekapkgs_ui::format::format_bytes;
+
+    println!("Server memory:");
+    if memory.rss_bytes > 0 {
+        println!(
+            "  Resident: {} (anonymous {}, file-backed {}), peak {}",
+            fb(memory.rss_bytes),
+            fb(memory.rss_anon_bytes),
+            fb(memory.rss_file_bytes),
+            fb(memory.peak_rss_bytes),
+        );
+    }
+
+    let width = memory
+        .components
+        .iter()
+        .map(|c| c.name.len())
+        .max()
+        .unwrap_or(0);
+    for c in &memory.components {
+        let size = match (c.bytes, c.is_limit) {
+            (0, true) => String::new(),
+            (b, true) => format!("up to {}", fb(b)),
+            (b, false) => fb(b),
+        };
+        let mut notes = Vec::new();
+        // Limits explain their counts in `detail`.
+        if c.entries > 0 && !c.is_limit {
+            notes.push(format!("{} entries", c.entries));
+        }
+        if !c.detail.is_empty() {
+            notes.push(c.detail.clone());
+        }
+        let notes = if notes.is_empty() {
+            String::new()
+        } else {
+            format!("  ({})", notes.join("; "))
+        };
+        println!("  {:<width$}  {size:>18}{notes}", c.name);
+    }
 }
 
 // --- history ---

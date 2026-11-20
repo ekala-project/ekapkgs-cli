@@ -4,6 +4,7 @@ mod config;
 mod gc;
 mod history;
 mod http_metrics;
+mod memstats;
 pub mod metrics;
 mod signing;
 mod storage;
@@ -170,6 +171,12 @@ pub struct AppState {
     pub history_db_path: Option<PathBuf>,
 }
 
+/// Concurrent NAR-serving operations (`AppState::nar_semaphore`).
+pub const NAR_PERMITS: usize = 8;
+
+/// Concurrent NAR uploads (`AppState::push_semaphore`).
+pub const PUSH_PERMITS: usize = 4;
+
 /// Cache for computed delta NARs, keyed by (base_hash, target_hash).
 ///
 /// Populated during negotiate when the server finds a suitable delta candidate,
@@ -198,7 +205,7 @@ struct DeltaCacheInner {
 }
 
 /// Maximum total bytes stored in the delta cache.
-const DELTA_CACHE_MAX_BYTES: usize = 64 * 1024 * 1024;
+pub const DELTA_CACHE_MAX_BYTES: usize = 64 * 1024 * 1024;
 
 /// Maximum size of a single delta entry (16 MiB). Deltas larger than this
 /// are not worth caching — they consume disproportionate memory for
@@ -255,6 +262,12 @@ impl DeltaCache {
         inner.map.insert(key, delta);
     }
 
+    /// `(entries, bytes of delta data)` currently cached.
+    pub fn usage(&self) -> (u64, u64) {
+        let inner = self.inner.lock().expect("delta cache lock");
+        (inner.map.len() as u64, inner.total_bytes as u64)
+    }
+
     pub fn get(&self, base_hash: &str, target_hash: &str) -> Option<Arc<[u8]>> {
         let inner = self.inner.lock().expect("delta cache lock");
         let key = (base_hash.to_owned(), target_hash.to_owned());
@@ -290,7 +303,7 @@ struct NarInfoCacheInner {
     capacity: usize,
 }
 
-const NARINFO_CACHE_CAPACITY: usize = 8192;
+pub const NARINFO_CACHE_CAPACITY: usize = 8192;
 
 impl NarInfoCache {
     pub fn new() -> Self {
@@ -301,6 +314,16 @@ impl NarInfoCache {
                 capacity: NARINFO_CACHE_CAPACITY,
             }),
         }
+    }
+
+    /// `(entries, approximate bytes of keys and text)` currently cached.
+    pub fn usage(&self) -> (u64, u64) {
+        let Ok(inner) = self.inner.lock() else {
+            return (0, 0);
+        };
+        // Keys appear in both the map and the LRU order.
+        let bytes: usize = inner.map.iter().map(|(k, v)| 2 * k.len() + v.len()).sum();
+        (inner.map.len() as u64, bytes as u64)
     }
 
     pub fn get(&self, hash: &str) -> Option<Arc<str>> {
@@ -962,6 +985,7 @@ async fn cmd_serve(cli: Cli) -> color_eyre::Result<()> {
 
     if let Some(config_path) = &cli.config {
         let config = Config::load(config_path)?;
+        tracing::info!("Loaded config from {}", config_path.display());
         let signing_key_file_path = cli
             .signing_key
             .as_ref()
@@ -969,6 +993,7 @@ async fn cmd_serve(cli: Cli) -> color_eyre::Result<()> {
         bind_addr = cli.bind.unwrap_or(config.server.bind);
         warn_insecure_key_permissions(&config.signing.secret_key_file);
         signer = NarInfoSigner::from_file(signing_key_file_path)?;
+        tracing::info!("Loaded signing key {}", signing_key_file_path.display());
         cert_signer = if let Some(ref cert_config) = config.signing.certificate {
             warn_insecure_key_permissions(&cert_config.private_key_file);
             Some(signing::CertSigner::from_files(
@@ -987,6 +1012,12 @@ async fn cmd_serve(cli: Cli) -> color_eyre::Result<()> {
             )?);
         }
         threshold = config.signing.threshold.unwrap_or(0);
+        if cert_signer.is_some() || !extra_signers.is_empty() {
+            tracing::info!(
+                "Loaded {} signing certificates (threshold {threshold})",
+                usize::from(cert_signer.is_some()) + extra_signers.len()
+            );
+        }
         storage_backend = match config.storage {
             config::StorageConfig::Filesystem { path, gc } => {
                 let gc_t = if let Some(gc_raw) = gc {
@@ -1002,15 +1033,18 @@ async fn cmd_serve(cli: Cli) -> color_eyre::Result<()> {
                         target_size,
                         gc_interval: std::time::Duration::from_secs(gc_raw.gc_interval_secs),
                     };
+                    log_gc_config(&gc_config);
                     Some(gc::init(&path, gc_config, Some(gc_metrics.clone()))?)
                 } else {
                     None
                 };
                 gc_tracker = gc_t;
+                tracing::info!("Using filesystem storage at {}", path.display());
                 storage_root = Some(path.clone());
                 Box::new(storage::filesystem::FilesystemBackend::new(path))
             },
             config::StorageConfig::NixStore => {
+                tracing::info!("Serving from the local nix store");
                 gc_tracker = None;
                 Box::new(storage::nix_store::NixStoreBackend::new())
             },
@@ -1056,6 +1090,7 @@ async fn cmd_serve(cli: Cli) -> color_eyre::Result<()> {
                 backend.spawn_integrity_check();
                 backend.spawn_recovery();
                 backend.spawn_backfill();
+                tracing::info!("Started CAS background tasks");
                 let gc_t = if let Some(gc_raw) = gc {
                     let max_size = gc::parse_byte_size(&gc_raw.max_size)?;
                     let target_size = gc_raw
@@ -1069,6 +1104,7 @@ async fn cmd_serve(cli: Cli) -> color_eyre::Result<()> {
                         target_size,
                         gc_interval: std::time::Duration::from_secs(gc_raw.gc_interval_secs),
                     };
+                    log_gc_config(&gc_config);
                     Some(gc::init_cas(
                         Arc::clone(&backend),
                         gc_config,
@@ -1088,6 +1124,11 @@ async fn cmd_serve(cli: Cli) -> color_eyre::Result<()> {
         if let Some(auth) = config.auth {
             all_tokens.extend(auth.write_tokens);
         }
+        tracing::info!(
+            "Loaded {} write tokens ({})",
+            all_tokens.len(),
+            token_store_path.display()
+        );
         write_tokens = Arc::new(RwLock::new(all_tokens));
         compression_config = config.compression;
         tls_cert_path = config.server.tls_cert_path;
@@ -1158,11 +1199,11 @@ async fn cmd_serve(cli: Cli) -> color_eyre::Result<()> {
         // Allow a limited number of concurrent NAR-serving operations.
         // Each may hold a full NAR in memory; 8 concurrent × ~200 MiB
         // average ≈ 1.6 GiB worst-case from NAR serving alone.
-        nar_semaphore: Arc::new(tokio::sync::Semaphore::new(8)),
+        nar_semaphore: Arc::new(tokio::sync::Semaphore::new(NAR_PERMITS)),
         // Limit concurrent NAR upload ingestion. Each upload holds the
         // full NAR body plus chunk compression buffers; 4 concurrent
         // uploads cap push memory at ~4 × 200 MiB typical.
-        push_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
+        push_semaphore: Arc::new(tokio::sync::Semaphore::new(PUSH_PERMITS)),
         // Narinfo writes are small but serialize on the castore write lock.
         // Bound the waiters so they cannot fill the blocking pool.
         narinfo_write_semaphore: Arc::new(tokio::sync::Semaphore::new(16)),
@@ -1170,7 +1211,8 @@ async fn cmd_serve(cli: Cli) -> color_eyre::Result<()> {
     });
 
     if let Some(root) = &storage_root {
-        history::spawn_history_loop(Arc::clone(&state), root);
+        let path = history::spawn_history_loop(Arc::clone(&state), root);
+        tracing::info!("Recording hourly cache history to {}", path.display());
     }
 
     // Validate TLS config consistency.
@@ -1297,6 +1339,16 @@ async fn cmd_serve(cli: Cli) -> color_eyre::Result<()> {
     state.storage.on_shutdown();
 
     Ok(())
+}
+
+fn log_gc_config(config: &gc::GcConfig) {
+    let fb = ekapkgs_ui::format::format_bytes;
+    tracing::info!(
+        "GC enabled: max size {}, target {}, every {:?}",
+        fb(config.max_size),
+        fb(config.target_size),
+        config.gc_interval
+    );
 }
 
 /// Warn if a key file has world/group-readable permissions.
