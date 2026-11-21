@@ -4,6 +4,10 @@
 
 ### Client
 
+- `lease grant` and `lease connect` lend a machine's Nix builder to another machine for a fixed time, over iroh, without SSH or open ports
+  - `lease grant` prints a one-time ticket; the borrower's builds run there as an untrusted Nix client in the sandbox
+  - `lease connect -- <command>` runs the command with the lease as its builder; without a command it prints a `--builders` argument
+  - `--relay` picks the relay servers (e.g. a self-hosted `iroh-relay`) and `--no-relay` turns them off; the ticket carries the lender's relays to the borrower
 - Evaluate with [iets](https://github.com/numtide/iets) when it is installed
   - `eval`, `build`, `derivation show`, `search`, `print-dev-env` and `develop` on local flakes run as `iets nix ...`; everything else still runs `nix`
   - `system`, `home` and `deploy` builds use `--print-out-paths` instead of `--json`, so they run on iets
