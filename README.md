@@ -364,6 +364,100 @@ ekapkgs deploy .#nixosConfigurations.prod --target-host prod-server --dry-run
 If remote activation fails, `deploy` prints the SSH command to roll back
 the target host to its previous configuration.
 
+### Build leases
+
+Lend a machine's Nix builder to someone else for a fixed time, or build on a
+machine someone lent you. Neither side needs SSH access, open ports or a
+shared account. The lender prints a ticket, the borrower redeems it, and the
+two machines connect over [iroh](https://www.iroh.computer/): directly when
+they can, and through a relay server when they can't.
+
+On the machine lending its builder:
+
+```
+ekapkgs lease grant                        # lend for 1 hour (the default)
+ekapkgs lease grant --ttl 4h --jobs 8      # lend for 4 hours, 8 builds at once
+```
+
+`grant` prints a ticket starting with `ekalease1` and keeps running until
+the lease expires or you press Ctrl-C. Send the ticket to the borrower
+privately: whoever has it can redeem the lease.
+
+On the borrowing machine, run a command with the lease as Nix's builder:
+
+```
+ekapkgs lease connect -- nix build .#foo   # prompts for the ticket
+ekapkgs lease connect - -- nix build .#foo --max-jobs 0 < ticket.txt
+```
+
+`connect` sets `builders` (and `builders-use-substitutes`) for the command
+through `NIX_CONFIG`, and closes the connection when the command exits,
+passing on its exit status. Nix still builds locally when the lease has no
+free slot or can't build a derivation. Add `--max-jobs 0` to send every
+build to the lender. Reading the ticket from stdin (omit it, or pass `-`)
+keeps it out of the process list and shell history.
+
+Without a command, `connect` prints a `--builders` argument to pass to Nix
+yourself and keeps the lease open until Ctrl-C or until it expires:
+
+```
+$ ekapkgs lease connect
+Paste the lease ticket and press Enter:
+...
+--builders 'unix:///run/user/1000/ekapkgs/lease-1a2b3c4d5e.sock x86_64-linux - 8 1 big-parallel,kvm -'
+```
+
+Then, from another terminal: `nix build .#foo --builders '...'`.
+
+#### What each side needs
+
+- **Lender:** a Nix that supports `nix daemon --stdio --force-untrusted
+  --process-ops`. `lease grant` checks this before printing a ticket and
+  stops with an error if the local Nix can't. The experimental features it
+  needs are turned on for that command only.
+- **Borrower:** be in `trusted-users` on your own machine. The Nix daemon
+  ignores `builders` from users it doesn't trust, and `lease connect` warns
+  if you aren't trusted.
+
+#### What the borrower can do on the lender
+
+The borrower's builds run on the lender as an untrusted Nix client, the same
+as builds from any unprivileged local user. They run in the Nix sandbox, and
+the lender refuses unsigned input-addressed paths from the borrower. Until the lease
+ends, the borrower can also read any path in the lender's Nix store. Don't
+lend a machine whose store holds secrets.
+
+#### How a lease ends
+
+- At the time set by `--ttl`. The lender cuts off any build still running,
+  and a command run by `connect` fails with "the lease expired".
+- When the lender presses Ctrl-C.
+- For the borrower, when `connect` exits. A ticket can be redeemed only
+  once, by one `connect` run. That run may reconnect after a network change,
+  but running `connect` again with the same ticket is refused, so ask the
+  lender for a new one.
+
+#### Options
+
+| `lease grant` | Default | |
+|---|---|---|
+| `--ttl` | `1h` | How long the lease lasts: `90s`, `30m`, `2h`, `1d` (a bare number means minutes) |
+| `--jobs`, `-j` | this machine's `max-jobs` | Builds the borrower may run at once |
+| `--systems` | `system` and `extra-platforms` | System types to offer, comma-separated |
+| `--features` | `system-features` | System features to offer, comma-separated |
+| `--relay URL` | the public n0 relays | Use this relay server instead, e.g. a self-hosted `iroh-relay`. Repeat for more than one |
+| `--no-relay` | | Don't use relays. The borrower must reach this machine directly (same LAN, VPN or a forwarded port) |
+
+| `lease connect` | Default | |
+|---|---|---|
+| `TICKET` | read from stdin | The ticket from `lease grant`, or `-` for stdin |
+| `--socket PATH` | `$XDG_RUNTIME_DIR/ekapkgs/lease-<lender>.sock` | Unix socket Nix connects to for the lease |
+| `--relay URL` | the relays in the ticket | Use this relay server instead. Repeat for more than one |
+| `--no-relay` | | Don't use relays; connect to the lender's direct addresses only |
+
+The ticket carries the lender's relays, so a borrower normally needs no relay
+options.
+
 ### System diagnostics
 
 ```
